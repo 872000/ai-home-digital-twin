@@ -1,0 +1,56 @@
+// Jest setup for client tests
+// Runtime: extends expect with jest-dom matchers
+// Types: the triple-slash directive augments global jest.Matchers
+/// <reference types="@testing-library/jest-dom" />
+import '@testing-library/jest-dom/jest-globals';
+
+// Suppress i18next promo messages and other noisy info output in tests.
+import { jest } from '@jest/globals';
+
+jest.spyOn(console, 'info').mockImplementation(() => undefined);
+
+// Initialize i18next with English translations for the test environment.
+// This ensures components using useTranslation() render translated strings
+// rather than raw translation keys.
+import '../i18n/index.js';
+
+// Polyfill TextEncoder/TextDecoder for jsdom (required by react-router)
+import { TextEncoder, TextDecoder } from 'node:util';
+
+Object.defineProperties(globalThis, {
+  TextEncoder: { value: TextEncoder },
+  TextDecoder: { value: TextDecoder },
+});
+
+// Polyfill window.matchMedia for jsdom (not implemented in jsdom by default).
+// ThemeContext uses this to detect the OS dark-mode preference.
+// We default to light mode (matches: false) so tests run with the light theme.
+if (typeof window !== 'undefined' && !window.matchMedia) {
+  Object.defineProperty(window, 'matchMedia', {
+    writable: true,
+    value: (query: string): MediaQueryList => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }),
+  });
+}
+
+// Polyfill ResizeObserver for jsdom (not implemented in jsdom by default).
+// PhotoAnnotator uses ResizeObserver to track image layout changes.
+if (typeof window !== 'undefined' && !window.ResizeObserver) {
+  class ResizeObserverPolyfill {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  Object.defineProperty(window, 'ResizeObserver', {
+    writable: true,
+    value: ResizeObserverPolyfill,
+  });
+}

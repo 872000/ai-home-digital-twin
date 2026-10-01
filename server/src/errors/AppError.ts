@@ -1,0 +1,379 @@
+import type { ErrorCode } from '@cornerstone/shared';
+
+/**
+ * Base application error with a typed error code and HTTP status.
+ * All known application errors should extend this class.
+ */
+export class AppError extends Error {
+  readonly code: ErrorCode;
+  readonly statusCode: number;
+  readonly details?: Record<string, unknown>;
+  readonly suppressDetails: boolean;
+
+  constructor(
+    code: ErrorCode,
+    statusCode: number,
+    message: string,
+    details?: Record<string, unknown>,
+    suppressDetails = false,
+  ) {
+    super(message);
+    this.name = 'AppError';
+    this.code = code;
+    this.statusCode = statusCode;
+    this.details = details;
+    this.suppressDetails = suppressDetails;
+  }
+}
+
+export class NotFoundError extends AppError {
+  constructor(message = 'Resource not found', details?: Record<string, unknown>) {
+    super('NOT_FOUND', 404, message, details);
+    this.name = 'NotFoundError';
+  }
+}
+
+export class ValidationError extends AppError {
+  constructor(message = 'Validation failed', details?: Record<string, unknown>) {
+    super('VALIDATION_ERROR', 400, message, details);
+    this.name = 'ValidationError';
+  }
+}
+
+export class UnauthorizedError extends AppError {
+  constructor(message = 'Unauthorized', details?: Record<string, unknown>) {
+    super('UNAUTHORIZED', 401, message, details);
+    this.name = 'UnauthorizedError';
+  }
+}
+
+export class ForbiddenError extends AppError {
+  constructor(message = 'Forbidden', details?: Record<string, unknown>) {
+    super('FORBIDDEN', 403, message, details);
+    this.name = 'ForbiddenError';
+  }
+}
+
+export class ConflictError extends AppError {
+  constructor(message = 'Resource conflict', details?: Record<string, unknown>) {
+    super('CONFLICT', 409, message, details);
+    this.name = 'ConflictError';
+  }
+}
+
+export class CategoryInUseError extends AppError {
+  constructor(
+    message = 'Budget category is in use and cannot be deleted',
+    details?: Record<string, unknown>,
+  ) {
+    super('CATEGORY_IN_USE', 409, message, details, true);
+    this.name = 'CategoryInUseError';
+  }
+}
+
+export class VendorInUseError extends AppError {
+  constructor(
+    message = 'Vendor is in use and cannot be deleted',
+    details?: { invoiceCount: number; budgetLineCount: number },
+  ) {
+    super('VENDOR_IN_USE', 409, message, details, true);
+    this.name = 'VendorInUseError';
+  }
+}
+
+export class BudgetSourceInUseError extends AppError {
+  constructor(
+    message = 'Budget source is in use and cannot be deleted',
+    details?: { budgetLineCount: number },
+  ) {
+    super('BUDGET_SOURCE_IN_USE', 409, message, details, true);
+    this.name = 'BudgetSourceInUseError';
+  }
+}
+
+export class SubsidyProgramInUseError extends AppError {
+  constructor(
+    message = 'Subsidy program is in use and cannot be deleted',
+    details?: { workItemCount: number },
+  ) {
+    super('SUBSIDY_PROGRAM_IN_USE', 409, message, details, true);
+    this.name = 'SubsidyProgramInUseError';
+  }
+}
+
+export class BudgetLineInUseError extends AppError {
+  constructor(
+    message = 'Budget line has linked invoices and cannot be deleted',
+    details?: { invoiceCount: number },
+  ) {
+    super('BUDGET_LINE_IN_USE', 409, message, details, true);
+    this.name = 'BudgetLineInUseError';
+  }
+}
+
+export class CircularDependencyError extends AppError {
+  constructor(
+    message = 'Circular dependency detected in the dependency graph',
+    details?: { cycle: string[] },
+  ) {
+    super('CIRCULAR_DEPENDENCY', 409, message, details);
+    this.name = 'CircularDependencyError';
+  }
+}
+
+export class MutuallyExclusiveBudgetLinkError extends AppError {
+  constructor(
+    message = 'An invoice can only be linked to one budget line (work item or household item, not both)',
+    details?: Record<string, unknown>,
+  ) {
+    super('MUTUALLY_EXCLUSIVE_BUDGET_LINK', 400, message, details);
+    this.name = 'MutuallyExclusiveBudgetLinkError';
+  }
+}
+
+export class BudgetLineAlreadyLinkedError extends AppError {
+  constructor(
+    message = 'Budget line is already linked to a different invoice',
+    details?: Record<string, unknown>,
+  ) {
+    super('BUDGET_LINE_ALREADY_LINKED', 409, message, details);
+    this.name = 'BudgetLineAlreadyLinkedError';
+  }
+}
+
+export class BudgetLineAlreadyAssignedError extends AppError {
+  constructor(
+    message = 'Budget line is already assigned to a parent item',
+    details?: Record<string, unknown>,
+  ) {
+    super('BUDGET_LINE_ALREADY_ASSIGNED', 409, message, details);
+    this.name = 'BudgetLineAlreadyAssignedError';
+  }
+}
+
+export class ItemizedSumExceedsInvoiceError extends AppError {
+  constructor(
+    message = 'Sum of itemized amounts would exceed the invoice total',
+    details?: Record<string, unknown>,
+  ) {
+    super('ITEMIZED_SUM_EXCEEDS_INVOICE', 400, message, details);
+    this.name = 'ItemizedSumExceedsInvoiceError';
+  }
+}
+
+export class DiscretionarySourceError extends AppError {
+  constructor(
+    message = 'The Discretionary Funding source cannot be deleted',
+    details?: Record<string, unknown>,
+  ) {
+    super('DISCRETIONARY_SOURCE', 409, message, details);
+    this.name = 'DiscretionarySourceError';
+  }
+}
+
+export class AccountLockedError extends AppError {
+  constructor(lockedUntil: string) {
+    super(
+      'ACCOUNT_LOCKED',
+      423,
+      'Account is temporarily locked due to too many failed login attempts',
+      { lockedUntil },
+    );
+    this.name = 'AccountLockedError';
+  }
+}
+
+export class InvalidMetadataError extends AppError {
+  constructor(message = 'Metadata does not match schema for the entry type') {
+    super('INVALID_METADATA', 400, message);
+    this.name = 'InvalidMetadataError';
+  }
+}
+
+export class ImmutableEntryError extends AppError {
+  constructor(message = 'Automatic diary entries cannot be modified') {
+    super('IMMUTABLE_ENTRY', 403, message);
+    this.name = 'ImmutableEntryError';
+  }
+}
+
+export class InvalidEntryTypeError extends AppError {
+  constructor(message = 'Entry type must be a manual type for user-created entries') {
+    super('INVALID_ENTRY_TYPE', 400, message);
+    this.name = 'InvalidEntryTypeError';
+  }
+}
+
+export class AlreadySavedError extends AppError {
+  constructor(message = 'Cannot promote an entry that is already saved') {
+    super('ALREADY_SAVED', 400, message);
+    this.name = 'AlreadySavedError';
+  }
+}
+
+export class AreaInUseError extends AppError {
+  constructor(
+    message = 'Area is in use and cannot be deleted',
+    details?: { workItemCount: number; householdItemCount: number },
+  ) {
+    super('AREA_IN_USE', 409, message, details, true);
+    this.name = 'AreaInUseError';
+  }
+}
+
+export class TradeInUseError extends AppError {
+  constructor(
+    message = 'Trade is in use and cannot be deleted',
+    details?: { vendorCount: number },
+  ) {
+    super('TRADE_IN_USE', 409, message, details, true);
+    this.name = 'TradeInUseError';
+  }
+}
+
+export class BackupNotConfiguredError extends AppError {
+  constructor(message = 'Backup is not configured. Set BACKUP_DIR environment variable.') {
+    super('BACKUP_NOT_CONFIGURED', 503, message);
+    this.name = 'BackupNotConfiguredError';
+  }
+}
+
+export class BackupInProgressError extends AppError {
+  constructor(message = 'A backup or restore operation is already in progress') {
+    super('BACKUP_IN_PROGRESS', 409, message);
+    this.name = 'BackupInProgressError';
+  }
+}
+
+export class BackupNotFoundError extends AppError {
+  constructor(filename: string) {
+    super('BACKUP_NOT_FOUND', 404, `Backup not found: ${filename}`);
+    this.name = 'BackupNotFoundError';
+  }
+}
+
+export class RestoreFailedError extends AppError {
+  constructor(message = 'Restore operation failed', details?: Record<string, unknown>) {
+    super('RESTORE_FAILED', 500, message, details);
+    this.name = 'RestoreFailedError';
+  }
+}
+
+export class BackupFailedError extends AppError {
+  constructor(message = 'Backup operation failed', details?: Record<string, unknown>) {
+    super('BACKUP_FAILED', 500, message, details);
+    this.name = 'BackupFailedError';
+  }
+}
+
+export class SameSourceError extends AppError {
+  constructor(message = 'Source and target budget source must be different') {
+    super('SAME_SOURCE', 400, message);
+    this.name = 'SameSourceError';
+  }
+}
+
+export class EmptySelectionError extends AppError {
+  constructor(message = 'At least one budget line ID must be provided') {
+    super('EMPTY_SELECTION', 400, message);
+    this.name = 'EmptySelectionError';
+  }
+}
+
+export class StaleOwnershipError extends AppError {
+  constructor(
+    message = 'One or more budget line IDs do not exist or do not belong to the specified source',
+  ) {
+    super('STALE_OWNERSHIP', 409, message);
+    this.name = 'StaleOwnershipError';
+  }
+}
+
+export class InvoicesNotClaimableError extends AppError {
+  constructor(
+    message = 'One or more invoices are not in a claimable state',
+    details?: Record<string, unknown>,
+  ) {
+    super('INVOICES_NOT_CLAIMABLE', 409, message, details);
+    this.name = 'InvoicesNotClaimableError';
+  }
+}
+
+export class DepositsExceedInvoiceTotalError extends AppError {
+  constructor(
+    message = 'Sum of deposit amounts would exceed the invoice total',
+    details?: Record<string, unknown>,
+  ) {
+    super('DEPOSITS_EXCEED_INVOICE_TOTAL', 400, message, details);
+    this.name = 'DepositsExceedInvoiceTotalError';
+  }
+}
+
+export class InvalidDepositStatusTransitionError extends AppError {
+  constructor(
+    message = 'Deposit status transition is not allowed',
+    details?: Record<string, unknown>,
+  ) {
+    super('INVALID_DEPOSIT_STATUS_TRANSITION', 400, message, details);
+    this.name = 'InvalidDepositStatusTransitionError';
+  }
+}
+
+export class InvalidDepositDateForStatusError extends AppError {
+  constructor(
+    message = 'Date field cannot be set for the current deposit status',
+    details?: Record<string, unknown>,
+  ) {
+    super('INVALID_DEPOSIT_DATE_FOR_STATUS', 400, message, details);
+    this.name = 'InvalidDepositDateForStatusError';
+  }
+}
+
+export class RefundExceedsInvoiceError extends AppError {
+  constructor(
+    message = 'Sum of refund amounts would exceed the invoice total',
+    details?: Record<string, unknown>,
+  ) {
+    super('REFUND_EXCEEDS_INVOICE', 400, message, details);
+    this.name = 'RefundExceedsInvoiceError';
+  }
+}
+
+export class PayloadTooLargeError extends AppError {
+  constructor(message = 'Payload too large') {
+    super('PAYLOAD_TOO_LARGE', 413, message);
+    this.name = 'PayloadTooLargeError';
+  }
+}
+
+// LLM errors carry diagnostic context (underlying fetch error, response body,
+// parse error) in `details` for the server log. `suppressDetails: true` keeps
+// `details` out of the API response — the response body can echo prompts
+// (vendor names, amounts from OCR) so we never want it leaving the host.
+export class LlmUnreachableError extends AppError {
+  constructor(message = 'LLM provider is unreachable', details?: Record<string, unknown>) {
+    super('LLM_UNREACHABLE', 502, message, details, true);
+    this.name = 'LlmUnreachableError';
+  }
+}
+
+export class LlmInvalidResponseError extends AppError {
+  constructor(message = 'LLM returned an invalid response', details?: Record<string, unknown>) {
+    super('LLM_INVALID_RESPONSE', 502, message, details, true);
+    this.name = 'LlmInvalidResponseError';
+  }
+}
+
+export class LlmUpstreamError extends AppError {
+  constructor(message = 'LLM upstream error', details?: Record<string, unknown>) {
+    super('LLM_UPSTREAM_ERROR', 502, message, details, true);
+    this.name = 'LlmUpstreamError';
+  }
+}
+
+export class LlmNotConfiguredError extends AppError {
+  constructor(message = 'LLM gateway is not configured', details?: Record<string, unknown>) {
+    super('LLM_NOT_CONFIGURED', 503, message, details);
+    this.name = 'LlmNotConfiguredError';
+  }
+}

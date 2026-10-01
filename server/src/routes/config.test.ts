@@ -1,0 +1,290 @@
+/**
+ * Integration tests for GET /api/config route.
+ *
+ * Tests cover:
+ * - GET /api/config returns 200 with expected shape
+ * - Default currency is EUR
+ * - Response Content-Type is application/json
+ * - Endpoint is accessible without authentication
+ * - CURRENCY env var is reflected in the response
+ * - VAT_RATE env var is reflected in the response (Story #1807)
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { buildApp } from '../app.js';
+import type { FastifyInstance } from 'fastify';
+import type { AppConfigResponse } from '@cornerstone/shared';
+
+describe('Config Routes', () => {
+  let app: FastifyInstance;
+  let tempDir: string;
+  let originalEnv: NodeJS.ProcessEnv;
+
+  beforeEach(async () => {
+    originalEnv = { ...process.env };
+
+    tempDir = mkdtempSync(join(tmpdir(), 'cornerstone-config-route-test-'));
+    process.env.DATABASE_URL = join(tempDir, 'test.db');
+    process.env.SECURE_COOKIES = 'false';
+
+    app = await buildApp();
+  });
+
+  afterEach(async () => {
+    if (app) {
+      await app.close();
+    }
+
+    process.env = originalEnv;
+
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  describe('GET /api/config', () => {
+    it('returns 200 with currency field', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/config',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json<AppConfigResponse>();
+      expect(body).toHaveProperty('currency');
+    });
+
+    it('returns EUR as the default currency when CURRENCY env is not set', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/config',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json<AppConfigResponse>();
+      expect(body.currency).toBe('EUR');
+    });
+
+    it('returns application/json Content-Type', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/config',
+      });
+
+      expect(response.headers['content-type']).toMatch(/application\/json/);
+    });
+
+    it('is accessible without an authentication cookie (no 401)', async () => {
+      // No cookie in request — endpoint must be publicly accessible
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/config',
+      });
+
+      expect(response.statusCode).not.toBe(401);
+      expect(response.statusCode).toBe(200);
+    });
+
+    it('reflects CURRENCY env var in the response', async () => {
+      // Must create a custom app instance AFTER setting the env var so the
+      // config plugin reads the overridden value.
+      process.env.CURRENCY = 'CHF';
+      const customApp = await buildApp();
+
+      try {
+        const response = await customApp.inject({
+          method: 'GET',
+          url: '/api/config',
+        });
+
+        expect(response.statusCode).toBe(200);
+        const body = response.json<AppConfigResponse>();
+        expect(body.currency).toBe('CHF');
+      } finally {
+        await customApp.close();
+        delete process.env.CURRENCY;
+      }
+    });
+
+    // ─── Story #1807: VAT_RATE ─────────────────────────────────────────────
+
+    it('returns 200 with vatRate field, defaulting to 0.19', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/config',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json<AppConfigResponse>();
+      expect(body).toHaveProperty('vatRate');
+      expect(body.vatRate).toBe(0.19);
+    });
+
+    it('reflects VAT_RATE env var in the response', async () => {
+      // Must create a custom app instance AFTER setting the env var so the
+      // config plugin reads the overridden value.
+      process.env.VAT_RATE = '0.20';
+      const customApp = await buildApp();
+
+      try {
+        const response = await customApp.inject({
+          method: 'GET',
+          url: '/api/config',
+        });
+
+        expect(response.statusCode).toBe(200);
+        const body = response.json<AppConfigResponse>();
+        expect(body.vatRate).toBe(0.2);
+      } finally {
+        await customApp.close();
+        delete process.env.VAT_RATE;
+      }
+    });
+
+    it('returns the exact AppConfigResponse shape with no extra fields', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/config',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json<AppConfigResponse>();
+      // Fields present per the API contract: currency + vatRate (Story #1807) +
+      // autoItemizeEnabled (Story #1546) + llmEnabled (Story #1901, alias)
+      expect(Object.keys(body).sort()).toEqual([
+        'autoItemizeEnabled',
+        'currency',
+        'llmEnabled',
+        'vatRate',
+      ]);
+    });
+
+    it('returns autoItemizeEnabled: false when LLM env vars are not set', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/config',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json<AppConfigResponse>();
+      expect(body).toHaveProperty('autoItemizeEnabled');
+      expect(body.autoItemizeEnabled).toBe(false);
+    });
+
+    it('returns autoItemizeEnabled: true when all LLM env vars are set', async () => {
+      // Must create a custom app instance AFTER setting the env vars so the
+      // config plugin reads the overridden values.
+      process.env.LLM_BASE_URL = 'https://api.openai.com/v1';
+      process.env.LLM_API_KEY = 'sk-test-key-do-not-log';
+      process.env.LLM_MODEL = 'gpt-4o';
+      const customApp = await buildApp();
+
+      try {
+        const response = await customApp.inject({
+          method: 'GET',
+          url: '/api/config',
+        });
+
+        expect(response.statusCode).toBe(200);
+        const body = response.json<AppConfigResponse>();
+        expect(body.autoItemizeEnabled).toBe(true);
+      } finally {
+        await customApp.close();
+        delete process.env.LLM_BASE_URL;
+        delete process.env.LLM_API_KEY;
+        delete process.env.LLM_MODEL;
+      }
+    });
+
+    // ─── Story #1901: llmEnabled (alias of autoItemizeEnabled) ───────────────
+
+    it('returns llmEnabled: false when LLM env vars are not set', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/config',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json<AppConfigResponse>();
+      expect(body).toHaveProperty('llmEnabled');
+      expect(body.llmEnabled).toBe(false);
+    });
+
+    it('returns llmEnabled: true when all LLM env vars are set', async () => {
+      process.env.LLM_BASE_URL = 'https://api.openai.com/v1';
+      process.env.LLM_API_KEY = 'sk-test-key-do-not-log';
+      process.env.LLM_MODEL = 'gpt-4o';
+      const customApp = await buildApp();
+
+      try {
+        const response = await customApp.inject({
+          method: 'GET',
+          url: '/api/config',
+        });
+
+        expect(response.statusCode).toBe(200);
+        const body = response.json<AppConfigResponse>();
+        expect(body.llmEnabled).toBe(true);
+      } finally {
+        await customApp.close();
+        delete process.env.LLM_BASE_URL;
+        delete process.env.LLM_API_KEY;
+        delete process.env.LLM_MODEL;
+      }
+    });
+
+    it('llmEnabled always equals autoItemizeEnabled (alias parity)', async () => {
+      process.env.LLM_BASE_URL = 'https://api.openai.com/v1';
+      process.env.LLM_API_KEY = 'sk-test-key-do-not-log';
+      process.env.LLM_MODEL = 'gpt-4o';
+      const customApp = await buildApp();
+
+      try {
+        const response = await customApp.inject({
+          method: 'GET',
+          url: '/api/config',
+        });
+
+        const body = response.json<AppConfigResponse>();
+        expect(body.llmEnabled).toBe(body.autoItemizeEnabled);
+      } finally {
+        await customApp.close();
+        delete process.env.LLM_BASE_URL;
+        delete process.env.LLM_API_KEY;
+        delete process.env.LLM_MODEL;
+      }
+    });
+
+    it('response does NOT expose llmApiKey, llmBaseUrl, or llmModel values', async () => {
+      // Security: LLM credentials must never be returned in the config response
+      process.env.LLM_BASE_URL = 'https://api.openai.com/v1';
+      process.env.LLM_API_KEY = 'sk-super-secret-key';
+      process.env.LLM_MODEL = 'gpt-4o';
+      const customApp = await buildApp();
+
+      try {
+        const response = await customApp.inject({
+          method: 'GET',
+          url: '/api/config',
+        });
+
+        expect(response.statusCode).toBe(200);
+        const rawBody = response.body;
+        // Ensure the secret key value is not present in the response body
+        expect(rawBody).not.toContain('sk-super-secret-key');
+        expect(rawBody).not.toContain('api.openai.com');
+        expect(rawBody).not.toContain('gpt-4o');
+      } finally {
+        await customApp.close();
+        delete process.env.LLM_BASE_URL;
+        delete process.env.LLM_API_KEY;
+        delete process.env.LLM_MODEL;
+      }
+    });
+  });
+});

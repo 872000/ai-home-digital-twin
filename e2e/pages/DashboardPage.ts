@@ -1,0 +1,231 @@
+/**
+ * Page Object Model for the Project Overview / Dashboard page (/project/overview)
+ *
+ * The Dashboard page displays a grid of cards showing budget, timeline,
+ * invoice, and subsidy information with card hide/show customization.
+ */
+
+import type { Page, Locator } from '@playwright/test';
+
+export const DASHBOARD_ROUTE = '/project/overview';
+
+/** Card IDs as used in data-testid attributes. These match the DashboardCardId type in shared. */
+export type DashboardCardId =
+  | 'budget-summary'
+  | 'source-utilization'
+  | 'upcoming-milestones'
+  | 'work-item-progress'
+  | 'critical-path'
+  | 'mini-gantt'
+  | 'invoice-pipeline'
+  | 'subsidy-pipeline'
+  | 'recent-diary'
+  | 'quick-actions';
+
+/** Expected visible card titles in order. */
+export const CARD_TITLES = [
+  'Budget Summary',
+  'Source Utilization',
+  'Upcoming Milestones',
+  'Work Item Progress',
+  'Critical Path',
+  'Mini Gantt',
+  'Invoice Pipeline',
+  'Subsidy Pipeline',
+  'Recent Diary',
+  'Quick Actions',
+] as const;
+
+export class DashboardPage {
+  readonly page: Page;
+
+  readonly heading: Locator;
+  readonly cardGrid: Locator;
+  readonly mobileSections: Locator;
+  readonly customizeButton: Locator;
+  readonly customizeDropdown: Locator;
+  readonly projectSubNav: Locator;
+
+  /** The consolidated "Add" dropdown trigger button (data-testid="dashboard-add-button"). */
+  readonly addButton: Locator;
+
+  /** "New Diary Entry" menu item in the Add dropdown (data-testid="dashboard-add-diary-entry"). */
+  readonly addDiaryEntryButton: Locator;
+
+  /** "New Invoice" menu item in the Add dropdown (data-testid="dashboard-add-invoice"). */
+  readonly addInvoiceButton: Locator;
+
+  constructor(page: Page) {
+    this.page = page;
+
+    this.heading = page.getByRole('heading', {
+      level: 1,
+      name: 'Project',
+      exact: true,
+    });
+
+    // Desktop/tablet grid — role="region" labeled "Dashboard overview"
+    this.cardGrid = page.getByRole('region', { name: 'Dashboard overview' }).first();
+
+    // Mobile sections container (data-testid on the component)
+    this.mobileSections = page.getByTestId('dashboard-mobile-sections');
+
+    // Customize button (only visible when cards are hidden)
+    this.customizeButton = page.getByRole('button', { name: 'Customize' });
+
+    // Customize dropdown menu
+    this.customizeDropdown = page.getByRole('menu');
+
+    // Project sub-navigation
+    this.projectSubNav = page.getByRole('navigation', { name: 'Project section navigation' });
+
+    // Consolidated "Add" dropdown button (replaces the 3 individual add buttons)
+    this.addButton = page.getByTestId('dashboard-add-button');
+
+    // New menu items added in issue #1735
+    this.addDiaryEntryButton = page.getByTestId('dashboard-add-diary-entry');
+    this.addInvoiceButton = page.getByTestId('dashboard-add-invoice');
+  }
+
+  async goto(): Promise<void> {
+    await this.page.goto(DASHBOARD_ROUTE);
+    await this.heading.waitFor({ state: 'visible' });
+  }
+
+  /**
+   * Waits for all card loading skeletons to disappear, indicating data has loaded.
+   * Uses aria-busy on the loading skeleton elements.
+   */
+  async waitForCardsLoaded(): Promise<void> {
+    // Wait for all busy status elements to disappear
+    const skeletons = this.page.locator('[aria-busy="true"]');
+    await skeletons
+      .first()
+      .waitFor({ state: 'hidden' })
+      .catch(() => {
+        // If no skeleton was ever visible, that's fine — cards loaded instantly or were empty
+      });
+  }
+
+  /**
+   * Returns the article element for a specific card by its card title.
+   */
+  card(title: string): Locator {
+    return this.page
+      .getByRole('article')
+      .filter({ has: this.page.getByRole('heading', { name: title, level: 2 }) });
+  }
+
+  /**
+   * Returns the dismiss button for a specific card.
+   */
+  dismissButton(title: string): Locator {
+    return this.card(title).getByRole('button', { name: `Hide ${title} card` });
+  }
+
+  /**
+   * Dismisses a card by clicking its hide button and waiting for it to disappear.
+   */
+  async dismissCard(title: string): Promise<void> {
+    const btn = this.dismissButton(title);
+    await btn.waitFor({ state: 'visible' });
+    // Register the preferences PATCH listener BEFORE clicking to avoid a race where
+    // the PATCH completes before the listener is attached (optimistic UI dismisses
+    // the card immediately while the server write is still in-flight).
+    const patchPromise = this.page.waitForResponse(
+      (resp) =>
+        resp.url().includes('/api/users/me/preferences') &&
+        resp.request().method() === 'PATCH' &&
+        resp.status() === 200,
+    );
+    await btn.click();
+    // Wait for the card to disappear from DOM
+    await this.card(title).waitFor({ state: 'detached' });
+    // Wait for preferences to be persisted on the server before any reload.
+    await patchPromise;
+  }
+
+  /**
+   * Opens the "Add" dropdown and waits for the menu items to appear.
+   * The dropdown contains five items: Work Item, Household Item, Milestone, Diary Entry, Invoice.
+   */
+  async openAddDropdown(): Promise<void> {
+    await this.addButton.click();
+    await this.page.getByTestId('dashboard-add-work-item').waitFor({ state: 'visible' });
+    await this.page.getByTestId('dashboard-add-diary-entry').waitFor({ state: 'visible' });
+  }
+
+  /**
+   * Opens the Customize dropdown (only available when cards are hidden).
+   */
+  async openCustomizeDropdown(): Promise<void> {
+    await this.customizeButton.waitFor({ state: 'visible' });
+    await this.customizeButton.click();
+    await this.customizeDropdown.waitFor({ state: 'visible' });
+  }
+
+  /**
+   * Re-enables a previously dismissed card via the Customize dropdown.
+   */
+  async reEnableCard(title: string): Promise<void> {
+    await this.openCustomizeDropdown();
+    const menuItem = this.customizeDropdown.getByRole('menuitem', { name: `Show ${title}` });
+    await menuItem.waitFor({ state: 'visible' });
+    // Register the preferences PATCH listener BEFORE clicking, matching dismissCard()'s
+    // convention — DashboardPage.tsx's handleReEnableCard() awaits this PATCH before updating
+    // local state, so the card reappearing already implies the round-trip settled, but this
+    // keeps the two mirror-image methods consistent for any caller that chains further
+    // preference-dependent actions (e.g. a reload) immediately after re-enabling.
+    const patchPromise = this.page.waitForResponse(
+      (resp) =>
+        resp.url().includes('/api/users/me/preferences') &&
+        resp.request().method() === 'PATCH' &&
+        resp.status() === 200,
+    );
+    await menuItem.click();
+    // Wait for card to be back in DOM
+    await this.card(title).waitFor({ state: 'visible' });
+    // Wait for preferences to be persisted on the server before any follow-up action.
+    await patchPromise;
+  }
+
+  /**
+   * Checks whether the mobile collapsible "Timeline" section is present on page.
+   */
+  timelineSection(): Locator {
+    return this.mobileSections.locator('details').filter({
+      has: this.page.locator('summary').filter({ hasText: 'Timeline' }),
+    });
+  }
+
+  /**
+   * Checks whether the mobile collapsible "Budget Details" section is present on page.
+   */
+  budgetDetailsSection(): Locator {
+    return this.mobileSections.locator('details').filter({
+      has: this.page.locator('summary').filter({ hasText: 'Budget Details' }),
+    });
+  }
+
+  /**
+   * Returns the Mini Gantt card container (the clickable region button).
+   */
+  miniGanttContainer(): Locator {
+    return this.card('Mini Gantt').getByRole('button', { name: 'View full schedule' });
+  }
+
+  /**
+   * Returns the Recent Diary dashboard card article element.
+   * The card wraps a RecentDiaryCard component with entries, "View All", and "+ New Entry" links.
+   */
+  recentDiaryCard(): Locator {
+    return this.card('Recent Diary');
+  }
+
+  /**
+   * Returns the "View All" link inside the Recent Diary card that navigates to /diary.
+   */
+  recentDiaryViewAllLink(): Locator {
+    return this.recentDiaryCard().getByRole('link', { name: 'View All' });
+  }
+}

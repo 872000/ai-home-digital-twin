@@ -1,0 +1,671 @@
+import { randomUUID } from 'node:crypto';
+import { eq, desc, and, asc, sql, gte, lte, inArray } from 'drizzle-orm';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import type * as schemaTypes from '../db/schema.js';
+import { invoices, vendors, users, invoiceDeposits, budgetSources } from '../db/schema.js';
+import type {
+  Invoice,
+  InvoiceStatus,
+  InvoiceDeposit,
+  CreateInvoiceRequest,
+  UpdateInvoiceRequest,
+  UserSummary,
+  PaginationMeta,
+  InvoiceStatusBreakdown,
+  InvoiceStatusSummary,
+  FilterMeta,
+} from '@cornerstone/shared';
+import { NotFoundError, ValidationError } from '../errors/AppError.js';
+import { deleteLinksForEntity } from './documentLinkService.js';
+import { getInvoiceBudgetLinesForInvoice } from './invoiceBudgetLineService.js';
+import { onInvoiceStatusChanged } from './diaryAutoEventService.js';
+import {
+  aggregateInvoiceStatusBreakdown,
+  aggregateClaimableBreakdown,
+  computeFinalPaymentAmount,
+  computeFinalPaymentAmounts,
+  computeOpenAmounts,
+  type InvoiceDepositRowWithDiscretionary,
+} from './shared/depositAggregateUtils.js';
+
+type DbType = BetterSQLite3Database<typeof schemaTypes>;
+
+/**
+ * ISO 8601 date pattern: YYYY-MM-DD
+ */
+const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Validate an ISO date string (YYYY-MM-DD).
+ * Returns true if the value is a valid ISO date string.
+ */
+function isValidIsoDate(value: string): boolean {
+  if (!ISO_DATE_PATTERN.test(value)) return false;
+  const d = new Date(value);
+  return !isNaN(d.getTime());
+}
+
+/**
+ * Convert a database user row to UserSummary shape.
+ */
+function toUserSummary(user: typeof users.$inferSelect | null | undefined): UserSummary | null {
+  if (!user) return null;
+  return {
+    id: user.id,
+    displayName: user.displayName,
+    email: user.email,
+  };
+}
+
+/**
+ * Convert a database invoice row to Invoice API shape.
+ * Resolves vendorName and createdBy via separate queries.
+ * Resolves budget lines via invoiceBudgetLineService.
+ * Resolves deposits via invoiceDepositService.
+ * If knownVendorName is provided, skips the vendor DB lookup.
+ */
+export function toInvoice(
+  db: DbType,
+  row: typeof invoices.$inferSelect,
+  knownVendorName?: string,
+): Invoice {
+  const vendorName =
+    knownVendorName !== undefined
+      ? knownVendorName
+      : (db.select().from(vendors).where(eq(vendors.id, row.vendorId)).get()?.name ?? 'Unknown');
+  const createdByUser = row.createdBy
+    ? db.select().from(users).where(eq(users.id, row.createdBy)).get()
+    : null;
+
+  const { budgetLines, remainingAmount } = getInvoiceBudgetLinesForInvoice(db, row.id, row.amount);
+
+  // Fetch deposits for this invoice, ordered by dueDate then createdAt
+  const depositRows = db
+    .select()
+    .from(invoiceDeposits)
+    .where(eq(invoiceDeposits.invoiceId, row.id))
+    .orderBy(asc(invoiceDeposits.dueDate), asc(invoiceDeposits.createdAt))
+    .all();
+
+  const deposits = depositRows.map((depositRow) => {
+    const depositCreatedByUser = depositRow.createdBy
+      ? db.select().from(users).where(eq(users.id, depositRow.createdBy)).get()
+      : null;
+
+    return {
+      id: depositRow.id,
+      invoiceId: depositRow.invoiceId,
+      amount: depositRow.amount,
+      dueDate: depositRow.dueDate,
+      paidDate: depositRow.paidDate,
+      claimedDate: depositRow.claimedDate,
+      description: depositRow.description,
+      status: depositRow.status,
+      entryType: depositRow.entryType,
+      budgetSourceId: depositRow.budgetSourceId,
+      createdBy: toUserSummary(depositCreatedByUser),
+      createdAt: depositRow.createdAt,
+      updatedAt: depositRow.updatedAt,
+    };
+  });
+
+  // Compute finalPaymentAmount using refund-aware formula
+  const finalPaymentAmount = computeFinalPaymentAmount(
+    row.amount,
+    depositRows.map((d) => ({ amount: d.amount, status: d.status, entryType: d.entryType })),
+  );
+
+  return {
+    id: row.id,
+    vendorId: row.vendorId,
+    vendorName,
+    invoiceNumber: row.invoiceNumber,
+    amount: row.amount,
+    date: row.date,
+    dueDate: row.dueDate,
+    status: row.status as InvoiceStatus,
+    notes: row.notes,
+    budgetLines,
+    remainingAmount,
+    deposits,
+    finalPaymentAmount,
+    createdBy: toUserSummary(createdByUser),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+/**
+ * Assert that a vendor exists, throwing NotFoundError if not.
+ * Returns the vendor name so callers can pass it to toInvoice() without an extra lookup.
+ */
+export function assertVendorExists(db: DbType, vendorId: string): string {
+  const vendor = db.select().from(vendors).where(eq(vendors.id, vendorId)).get();
+  if (!vendor) {
+    throw new NotFoundError('Vendor not found');
+  }
+  return vendor.name;
+}
+
+/**
+ * List all invoices for a vendor, sorted by date descending.
+ * @throws NotFoundError if vendor does not exist
+ */
+export function listInvoices(db: DbType, vendorId: string): Invoice[] {
+  const vendorName = assertVendorExists(db, vendorId);
+
+  const rows = db
+    .select()
+    .from(invoices)
+    .where(eq(invoices.vendorId, vendorId))
+    .orderBy(desc(invoices.date))
+    .all();
+
+  return rows.map((row) => toInvoice(db, row, vendorName));
+}
+
+/**
+ * List all invoices across all vendors with pagination, filtering, sorting, and a status summary.
+ */
+export function listAllInvoices(
+  db: DbType,
+  query: {
+    page?: number;
+    pageSize?: number;
+    q?: string;
+    status?: InvoiceStatus;
+    vendorId?: string;
+    amountMin?: number;
+    amountMax?: number;
+    dateFrom?: string;
+    dateTo?: string;
+    dueDateFrom?: string;
+    dueDateTo?: string;
+    sortBy?: string;
+    sortOrder?: 'asc' | 'desc';
+    openOnly?: boolean;
+  },
+): {
+  invoices: Invoice[];
+  pagination: PaginationMeta;
+  summary: InvoiceStatusBreakdown;
+  filterMeta: FilterMeta;
+} {
+  const page = Math.max(1, query.page ?? 1);
+  const pageSize = Math.min(100, Math.max(1, query.pageSize ?? 25));
+  const sortOrder = query.sortOrder ?? 'desc';
+  const openOnly = query.openOnly === true;
+
+  // Build base conditions (excluding numeric amount range filter)
+  const baseConditions = [];
+  if (query.status) {
+    baseConditions.push(eq(invoices.status, query.status));
+  }
+  if (query.vendorId) {
+    baseConditions.push(eq(invoices.vendorId, query.vendorId));
+  }
+  if (query.q) {
+    const escapedQ = query.q.replace(/%/g, '\\%').replace(/_/g, '\\_');
+    const pattern = `%${escapedQ}%`;
+    baseConditions.push(sql`LOWER(${invoices.invoiceNumber}) LIKE LOWER(${pattern}) ESCAPE '\\'`);
+  }
+  if (query.dateFrom) {
+    baseConditions.push(gte(invoices.date, query.dateFrom));
+  }
+  if (query.dateTo) {
+    baseConditions.push(lte(invoices.date, query.dateTo));
+  }
+  if (query.dueDateFrom) {
+    baseConditions.push(gte(invoices.dueDate, query.dueDateFrom));
+  }
+  if (query.dueDateTo) {
+    baseConditions.push(lte(invoices.dueDate, query.dueDateTo));
+  }
+  if (openOnly) {
+    // Story #2046 (AC1/AC2): an invoice is an "open item" if it is itself pending,
+    // OR it has at least one pending deposit (of either entryType) — a pending
+    // refund alone qualifies (AC18/AC20). Placed in baseConditions (not just
+    // `conditions`) so filterMeta's amount bounds reflect the open set being viewed,
+    // consistent with how `status` is already handled.
+    baseConditions.push(
+      sql`(${invoices.status} = 'pending' OR EXISTS (
+        SELECT 1 FROM invoice_deposits d
+        WHERE d.invoice_id = ${invoices.id} AND d.status = 'pending'
+      ))`,
+    );
+  }
+
+  const baseWhereClause = baseConditions.length > 0 ? and(...baseConditions) : undefined;
+
+  // Compute filterMeta from base conditions
+  const metaRow = db
+    .select({
+      amountMin: sql<number>`COALESCE(MIN(${invoices.amount}), 0)`,
+      amountMax: sql<number>`COALESCE(MAX(${invoices.amount}), 0)`,
+    })
+    .from(invoices)
+    .innerJoin(vendors, eq(invoices.vendorId, vendors.id))
+    .where(baseWhereClause)
+    .get();
+
+  // Build full conditions with numeric amount range filter for main query
+  const conditions = [...baseConditions];
+  if (query.amountMin !== undefined) {
+    conditions.push(gte(invoices.amount, query.amountMin));
+  }
+  if (query.amountMax !== undefined) {
+    conditions.push(lte(invoices.amount, query.amountMax));
+  }
+
+  const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+  // Count total
+  const countResult = db
+    .select({ count: sql<number>`COUNT(*)` })
+    .from(invoices)
+    .innerJoin(vendors, eq(invoices.vendorId, vendors.id))
+    .where(whereClause)
+    .get();
+  const totalItems = countResult?.count ?? 0;
+  const totalPages = Math.ceil(totalItems / pageSize);
+
+  // ORDER BY
+  const sortColumn =
+    query.sortBy === 'amount'
+      ? invoices.amount
+      : query.sortBy === 'status'
+        ? invoices.status
+        : query.sortBy === 'vendor_name'
+          ? vendors.name
+          : query.sortBy === 'due_date'
+            ? invoices.dueDate
+            : invoices.date; // default: date
+  const orderBy = sortOrder === 'asc' ? asc(sortColumn) : desc(sortColumn);
+
+  // Story #2046 (AC22/AC23): earliest-open-due ordering, used as the default order
+  // when openOnly=true and no explicit sortBy is given. SQLite's scalar MIN(a, b)
+  // returns NULL if either argument is NULL, whereas the aggregate MIN() in the
+  // subquery ignores NULLs — the '9999-12-31' sentinel makes both branches non-null
+  // so undated items sort last under ASC. ISO YYYY-MM-DD strings compare
+  // lexicographically, so no date casting is needed. invoice_deposits.due_date is
+  // NOT NULL, so the subquery is NULL only when there are no pending deposits.
+  const earliestOpenDue = sql<string>`MIN(
+    COALESCE(CASE WHEN ${invoices.status} = 'pending' THEN ${invoices.dueDate} END, '9999-12-31'),
+    COALESCE((SELECT MIN(d.due_date) FROM invoice_deposits d
+               WHERE d.invoice_id = ${invoices.id} AND d.status = 'pending'), '9999-12-31')
+  )`;
+  const useOpenDefaultOrder = openOnly && !query.sortBy;
+
+  // Fetch page with JOIN for vendorName
+  const offset = (page - 1) * pageSize;
+  const rows = db
+    .select({
+      invoice: invoices,
+      vendorName: vendors.name,
+    })
+    .from(invoices)
+    .innerJoin(vendors, eq(invoices.vendorId, vendors.id))
+    .where(whereClause)
+    .orderBy(...(useOpenDefaultOrder ? [asc(earliestOpenDue), asc(invoices.id)] : [orderBy]))
+    .limit(pageSize)
+    .offset(offset)
+    .all();
+
+  // Compute deposit-aware GLOBAL summary across ALL invoices (filter-independent).
+  // The page filters only narrow the listed rows; the header summary always shows totals
+  // across the entire dataset so users can see what the other filter values would yield.
+  // budget_sources is joined to determine which deposits are discretionary (for claimable tile).
+  const summaryRawRows: InvoiceDepositRowWithDiscretionary[] = db
+    .select({
+      invoice_id: invoices.id,
+      invoice_amount: invoices.amount,
+      invoice_status: invoices.status,
+      deposit_id: invoiceDeposits.id,
+      deposit_amount: invoiceDeposits.amount,
+      deposit_status: invoiceDeposits.status,
+      deposit_entry_type: invoiceDeposits.entryType,
+      deposit_is_discretionary: budgetSources.isDiscretionary,
+    })
+    .from(invoices)
+    .leftJoin(invoiceDeposits, eq(invoiceDeposits.invoiceId, invoices.id))
+    .leftJoin(budgetSources, eq(budgetSources.id, invoiceDeposits.budgetSourceId))
+    .all();
+
+  const aggregated = aggregateInvoiceStatusBreakdown(summaryRawRows);
+  const { claimable, quotationCoveredByDeposits } = aggregateClaimableBreakdown(summaryRawRows);
+  const finalPaymentAmountsByInvoice = computeFinalPaymentAmounts(summaryRawRows);
+  // Story #2046 (AC14/AC16/AC19): the summaryRawRows query already spans every
+  // invoice, so it is a superset of InvoiceDepositRow and can be passed straight in.
+  const openAmounts = computeOpenAmounts(summaryRawRows);
+
+  // Compute overdue count + total: pending invoices with due_date < today (global, unfiltered)
+  const overdueRow = db
+    .select({
+      count: sql<number>`COUNT(*)`,
+      totalAmount: sql<number>`COALESCE(SUM(${invoices.amount}), 0)`,
+    })
+    .from(invoices)
+    .where(
+      and(
+        eq(invoices.status, 'pending'),
+        sql`${invoices.dueDate} IS NOT NULL`,
+        sql`${invoices.dueDate} < date('now', 'localtime')`,
+      ),
+    )
+    .get();
+
+  const defaultSummary: InvoiceStatusSummary = { count: 0, totalAmount: 0 };
+  const summary: InvoiceStatusBreakdown = {
+    pending: aggregated['pending'] ?? { ...defaultSummary },
+    paid: aggregated['paid'] ?? { ...defaultSummary },
+    claimed: aggregated['claimed'] ?? { ...defaultSummary },
+    quotation: aggregated['quotation'] ?? { ...defaultSummary },
+    overdue: {
+      count: overdueRow?.count ?? 0,
+      totalAmount: overdueRow?.totalAmount ?? 0,
+    },
+    claimable,
+    quotationCoveredByDeposits,
+    openPayable: openAmounts.openPayable,
+    refundsDue: openAmounts.refundsDue,
+  };
+
+  // Story #2046 (AC3/AC9): when openOnly, bulk-fetch full deposit rows for the
+  // invoices on the current page so the response can render pending deposits as
+  // child rows. Mapped exactly as toInvoice() does (ordering + createdBy resolution),
+  // since the client derives the "Deposit n/N" ordinal from this order.
+  const pageInvoiceIds = rows.map((r) => r.invoice.id);
+  const depositsByInvoice = new Map<string, InvoiceDeposit[]>();
+  if (openOnly && pageInvoiceIds.length > 0) {
+    const depositRows = db
+      .select()
+      .from(invoiceDeposits)
+      .where(inArray(invoiceDeposits.invoiceId, pageInvoiceIds))
+      .orderBy(asc(invoiceDeposits.dueDate), asc(invoiceDeposits.createdAt))
+      .all();
+
+    // Memoise createdBy user lookups (one query per distinct user id, not per row).
+    const userCache = new Map<string, UserSummary | null>();
+    const resolveCreatedBy = (createdBy: string | null): UserSummary | null => {
+      if (!createdBy) return null;
+      if (!userCache.has(createdBy)) {
+        const user = db.select().from(users).where(eq(users.id, createdBy)).get();
+        userCache.set(createdBy, toUserSummary(user));
+      }
+      return userCache.get(createdBy) ?? null;
+    };
+
+    for (const depositRow of depositRows) {
+      const list = depositsByInvoice.get(depositRow.invoiceId) ?? [];
+      list.push({
+        id: depositRow.id,
+        invoiceId: depositRow.invoiceId,
+        amount: depositRow.amount,
+        dueDate: depositRow.dueDate,
+        paidDate: depositRow.paidDate,
+        claimedDate: depositRow.claimedDate,
+        description: depositRow.description,
+        status: depositRow.status,
+        entryType: depositRow.entryType,
+        budgetSourceId: depositRow.budgetSourceId,
+        createdBy: resolveCreatedBy(depositRow.createdBy),
+        createdAt: depositRow.createdAt,
+        updatedAt: depositRow.updatedAt,
+      });
+      depositsByInvoice.set(depositRow.invoiceId, list);
+    }
+  }
+
+  // Map rows directly (not using toInvoice()) to avoid fetching full deposits in list.
+  // NOTE: List endpoints set deposits: [] but finalPaymentAmount is now refund-aware (still computed from summary query).
+  // If new Invoice fields are added, ensure they are updated in BOTH toInvoice() (for detail endpoints)
+  // AND here (for list endpoints).
+  const invoiceList: Invoice[] = rows.map(({ invoice: row, vendorName: vName }) => {
+    const createdByUser = row.createdBy
+      ? db.select().from(users).where(eq(users.id, row.createdBy)).get()
+      : null;
+
+    const { budgetLines, remainingAmount } = getInvoiceBudgetLinesForInvoice(
+      db,
+      row.id,
+      row.amount,
+    );
+
+    return {
+      id: row.id,
+      vendorId: row.vendorId,
+      vendorName: vName,
+      invoiceNumber: row.invoiceNumber,
+      amount: row.amount,
+      date: row.date,
+      dueDate: row.dueDate,
+      status: row.status as InvoiceStatus,
+      notes: row.notes,
+      budgetLines,
+      remainingAmount,
+      deposits: openOnly ? (depositsByInvoice.get(row.id) ?? []) : [],
+      finalPaymentAmount: finalPaymentAmountsByInvoice.get(row.id) ?? row.amount,
+      ...(openOnly ? { openAmount: openAmounts.byInvoice.get(row.id) ?? 0 } : {}),
+      createdBy: toUserSummary(createdByUser),
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    };
+  });
+
+  const filterMeta: FilterMeta = {
+    amount: { min: metaRow?.amountMin ?? 0, max: metaRow?.amountMax ?? 0 },
+  };
+
+  return {
+    invoices: invoiceList,
+    pagination: { page, pageSize, totalItems, totalPages },
+    summary,
+    filterMeta,
+  };
+}
+
+/**
+ * Get a single invoice by ID (cross-vendor lookup).
+ * @throws NotFoundError if invoice does not exist
+ */
+export function getInvoiceById(db: DbType, invoiceId: string): Invoice {
+  const row = db.select().from(invoices).where(eq(invoices.id, invoiceId)).get();
+  if (!row) {
+    throw new NotFoundError('Invoice not found');
+  }
+  return toInvoice(db, row);
+}
+
+/**
+ * Create a new invoice for a vendor.
+ * Validates: amount > 0, date is required ISO date, dueDate >= date if both present.
+ * @throws NotFoundError if vendor does not exist
+ * @throws ValidationError if any field is invalid
+ */
+export function createInvoice(
+  db: DbType,
+  vendorId: string,
+  data: CreateInvoiceRequest,
+  userId: string,
+): Invoice {
+  const vendorName = assertVendorExists(db, vendorId);
+
+  // Validate amount
+  if (data.amount <= 0) {
+    throw new ValidationError('Amount must be greater than 0');
+  }
+
+  // Validate date
+  if (!isValidIsoDate(data.date)) {
+    throw new ValidationError('Date must be a valid ISO date (YYYY-MM-DD)');
+  }
+
+  // Validate dueDate if provided
+  if (data.dueDate !== undefined && data.dueDate !== null) {
+    if (!isValidIsoDate(data.dueDate)) {
+      throw new ValidationError('Due date must be a valid ISO date (YYYY-MM-DD)');
+    }
+    if (data.dueDate < data.date) {
+      throw new ValidationError('Due date must be on or after the invoice date');
+    }
+  }
+
+  const id = randomUUID();
+  const now = new Date().toISOString();
+
+  db.insert(invoices)
+    .values({
+      id,
+      vendorId,
+      invoiceNumber: data.invoiceNumber ?? null,
+      amount: data.amount,
+      date: data.date,
+      dueDate: data.dueDate ?? null,
+      status: data.status ?? 'pending',
+      notes: data.notes ?? null,
+      createdBy: userId,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .run();
+
+  const row = db.select().from(invoices).where(eq(invoices.id, id)).get()!;
+  return toInvoice(db, row, vendorName);
+}
+
+/**
+ * Partial update of an invoice.
+ * Validates same rules as createInvoice for any provided fields.
+ * If vendorId is provided, reassigns the invoice to the new vendor.
+ * @throws NotFoundError if vendor or invoice not found, or if invoice doesn't belong to vendor
+ * @throws ValidationError if any provided field is invalid
+ *
+ * @param db - Database connection
+ * @param vendorId - Vendor ID (source vendor, from path param)
+ * @param invoiceId - Invoice ID
+ * @param data - Update request data (may include target vendorId)
+ * @param diaryAutoEvents - Whether to create automatic diary entries (default: true)
+ */
+export function updateInvoice(
+  db: DbType,
+  vendorId: string,
+  invoiceId: string,
+  data: UpdateInvoiceRequest,
+  diaryAutoEvents: boolean = true,
+): Invoice {
+  const vendorName = assertVendorExists(db, vendorId);
+
+  const existing = db
+    .select()
+    .from(invoices)
+    .where(and(eq(invoices.id, invoiceId), eq(invoices.vendorId, vendorId)))
+    .get();
+
+  if (!existing) {
+    throw new NotFoundError('Invoice not found');
+  }
+
+  const updates: Partial<typeof invoices.$inferInsert> = {};
+
+  // Validate and apply target vendor if provided
+  let targetVendorName = vendorName;
+  if (data.vendorId !== undefined) {
+    if (data.vendorId !== existing.vendorId) {
+      // Validate target vendor exists before applying any updates
+      targetVendorName = assertVendorExists(db, data.vendorId);
+      updates.vendorId = data.vendorId;
+    }
+  }
+
+  // Validate and apply amount if provided
+  if (data.amount !== undefined) {
+    if (data.amount <= 0) {
+      throw new ValidationError('Amount must be greater than 0');
+    }
+    updates.amount = data.amount;
+  }
+
+  // Validate and apply date if provided
+  if (data.date !== undefined) {
+    if (!isValidIsoDate(data.date)) {
+      throw new ValidationError('Date must be a valid ISO date (YYYY-MM-DD)');
+    }
+    updates.date = data.date;
+  }
+
+  // Validate dueDate relationship: compare against the resulting date (updated or existing)
+  if (data.dueDate !== undefined) {
+    if (data.dueDate !== null) {
+      if (!isValidIsoDate(data.dueDate)) {
+        throw new ValidationError('Due date must be a valid ISO date (YYYY-MM-DD)');
+      }
+      const effectiveDate = updates.date ?? existing.date;
+      if (data.dueDate < effectiveDate) {
+        throw new ValidationError('Due date must be on or after the invoice date');
+      }
+    }
+    updates.dueDate = data.dueDate;
+  }
+
+  if (data.invoiceNumber !== undefined) {
+    updates.invoiceNumber = data.invoiceNumber;
+  }
+
+  let statusChanged = false;
+  let previousStatus: string | undefined;
+  let newStatus: string | undefined;
+
+  if (data.status !== undefined) {
+    statusChanged = data.status !== existing.status;
+    previousStatus = existing.status;
+    newStatus = data.status;
+    updates.status = data.status;
+  }
+
+  if (data.notes !== undefined) {
+    updates.notes = data.notes;
+  }
+
+  const now = new Date().toISOString();
+  updates.updatedAt = now;
+
+  db.update(invoices).set(updates).where(eq(invoices.id, invoiceId)).run();
+
+  // Log status change to diary if enabled
+  if (statusChanged && previousStatus !== undefined && newStatus !== undefined) {
+    onInvoiceStatusChanged(
+      db,
+      diaryAutoEvents,
+      invoiceId,
+      existing.invoiceNumber || 'N/A',
+      previousStatus,
+      newStatus,
+    );
+  }
+
+  const updated = db.select().from(invoices).where(eq(invoices.id, invoiceId)).get()!;
+  return toInvoice(db, updated, targetVendorName);
+}
+
+/**
+ * Delete an invoice.
+ * @throws NotFoundError if invoice not found or does not belong to the specified vendor
+ */
+export function deleteInvoice(db: DbType, vendorId: string, invoiceId: string): void {
+  assertVendorExists(db, vendorId);
+
+  const existing = db
+    .select()
+    .from(invoices)
+    .where(and(eq(invoices.id, invoiceId), eq(invoices.vendorId, vendorId)))
+    .get();
+
+  if (!existing) {
+    throw new NotFoundError('Invoice not found');
+  }
+
+  // Cascade delete document links (polymorphic FK, enforced at app layer)
+  deleteLinksForEntity(db, 'invoice', invoiceId);
+
+  db.delete(invoices).where(eq(invoices.id, invoiceId)).run();
+}

@@ -1,0 +1,936 @@
+/**
+ * @jest-environment jsdom
+ */
+import { jest, describe, it, expect, beforeEach } from '@jest/globals';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import type * as InvoicesApiTypes from '../../lib/invoicesApi.js';
+import type * as InvoiceBudgetLinesApiTypes from '../../lib/invoiceBudgetLinesApi.js';
+import type { Invoice, InvoiceListPaginatedResponse } from '@cornerstone/shared';
+import type { InvoiceLinkModalProps } from './InvoiceLinkModal.js';
+
+// ─── Module-scope mock functions ─────────────────────────────────────────────
+
+const mockFetchAllInvoices = jest.fn<typeof InvoicesApiTypes.fetchAllInvoices>();
+const mockFetchInvoiceBudgetLines =
+  jest.fn<typeof InvoiceBudgetLinesApiTypes.fetchInvoiceBudgetLines>();
+const mockCreateInvoiceBudgetLine =
+  jest.fn<typeof InvoiceBudgetLinesApiTypes.createInvoiceBudgetLine>();
+const mockShowToast = jest.fn<(type: string, message: string) => void>();
+
+// ─── Mock: formatters — provides useFormatters() hook used by InvoiceLinkModal ─
+
+jest.unstable_mockModule('../../lib/formatters.js', () => {
+  const fmtCurrency = (n: number) =>
+    new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: 'EUR',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(n);
+  const fmtDate = (d: string | null | undefined, fallback = '—') => {
+    if (!d) return fallback;
+    const [year, month, day] = d.slice(0, 10).split('-').map(Number);
+    if (!year || !month || !day) return fallback;
+    return new Date(year, month - 1, day).toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    });
+  };
+  return {
+    formatCurrency: fmtCurrency,
+    formatDate: fmtDate,
+    formatTime: (ts: string | null | undefined, fallback = '—') => ts ?? fallback,
+    formatDateTime: (ts: string | null | undefined, fallback = '—') => ts ?? fallback,
+    formatPercent: (n: number) => `${n.toFixed(2)}%`,
+    computeActualDuration: () => null,
+    useFormatters: () => ({
+      formatCurrency: fmtCurrency,
+      formatDate: fmtDate,
+      formatTime: (ts: string | null | undefined, fallback = '—') => ts ?? fallback,
+      formatDateTime: (ts: string | null | undefined, fallback = '—') => ts ?? fallback,
+      formatPercent: (n: number) => `${n.toFixed(2)}%`,
+    }),
+  };
+});
+
+// ─── Mock: invoicesApi ────────────────────────────────────────────────────────
+
+jest.unstable_mockModule('../../lib/invoicesApi.js', () => ({
+  fetchAllInvoices: mockFetchAllInvoices,
+  fetchInvoices: jest.fn(),
+  createInvoice: jest.fn(),
+  updateInvoice: jest.fn(),
+  deleteInvoice: jest.fn(),
+  fetchInvoiceById: jest.fn(),
+}));
+
+// ─── Mock: invoiceBudgetLinesApi ──────────────────────────────────────────────
+
+jest.unstable_mockModule('../../lib/invoiceBudgetLinesApi.js', () => ({
+  fetchInvoiceBudgetLines: mockFetchInvoiceBudgetLines,
+  createInvoiceBudgetLine: mockCreateInvoiceBudgetLine,
+  updateInvoiceBudgetLine: jest.fn(),
+  deleteInvoiceBudgetLine: jest.fn(),
+  editAndMoveBudgetLine: jest.fn(),
+}));
+
+// ─── Mock: ToastContext ───────────────────────────────────────────────────────
+
+jest.unstable_mockModule('../Toast/ToastContext.js', () => ({
+  ToastProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  useToast: () => ({
+    toasts: [],
+    showToast: mockShowToast,
+    dismissToast: jest.fn(),
+  }),
+}));
+
+// ─── Import component after mocks ─────────────────────────────────────────────
+
+import type * as InvoiceLinkModalModule from './InvoiceLinkModal.js';
+
+let InvoiceLinkModal: (typeof InvoiceLinkModalModule)['InvoiceLinkModal'];
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function buildInvoice(id: string, invoiceNumber: string | null = `INV-${id}`): Invoice {
+  return {
+    id,
+    vendorId: 'vendor-1',
+    vendorName: 'Acme Corp',
+    invoiceNumber,
+    amount: 1000,
+    date: '2025-01-15',
+    dueDate: null,
+    status: 'pending',
+    notes: null,
+    budgetLines: [],
+    remainingAmount: 1000,
+    deposits: [],
+    finalPaymentAmount: 1000,
+    createdBy: null,
+    createdAt: '2025-01-01T00:00:00Z',
+    updatedAt: '2025-01-01T00:00:00Z',
+  };
+}
+
+function buildPaginatedResponse(invoices: Invoice[]): InvoiceListPaginatedResponse {
+  return {
+    invoices,
+    pagination: { page: 1, pageSize: 1000, totalItems: invoices.length, totalPages: 1 },
+    summary: {
+      pending: { count: invoices.length, totalAmount: 1000 },
+      paid: { count: 0, totalAmount: 0 },
+      claimed: { count: 0, totalAmount: 0 },
+      quotation: { count: 0, totalAmount: 0 },
+      overdue: { count: 0, totalAmount: 0 },
+      claimable: { count: invoices.length, totalAmount: 1000 },
+      quotationCoveredByDeposits: 0,
+      openPayable: { count: 0, totalAmount: 0 },
+      refundsDue: { count: 0, totalAmount: 0 },
+    },
+  };
+}
+
+function buildProps(overrides?: Partial<InvoiceLinkModalProps>): InvoiceLinkModalProps {
+  return {
+    budgetLineId: 'budget-line-1',
+    budgetLineType: 'work_item',
+    defaultAmount: 500,
+    onSuccess: jest.fn(),
+    onClose: jest.fn(),
+    ...overrides,
+  };
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+describe('InvoiceLinkModal', () => {
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    // Default: remaining amount covers typical test amounts
+    mockFetchInvoiceBudgetLines.mockResolvedValue({
+      budgetLines: [],
+      remainingAmount: 1000,
+    });
+    const module = await import('./InvoiceLinkModal.js');
+    InvoiceLinkModal = module.InvoiceLinkModal;
+  });
+
+  it('calls fetchAllInvoices with vendorId when provided', async () => {
+    mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse([]));
+
+    render(<InvoiceLinkModal {...buildProps({ vendorId: 'vendor-42' })} />);
+
+    await waitFor(() => {
+      expect(mockFetchAllInvoices).toHaveBeenCalledWith(
+        expect.objectContaining({ pageSize: 100, vendorId: 'vendor-42' }),
+      );
+    });
+  });
+
+  it('calls fetchAllInvoices without vendorId when not provided', async () => {
+    mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse([]));
+
+    render(<InvoiceLinkModal {...buildProps()} />);
+
+    await waitFor(() => {
+      expect(mockFetchAllInvoices).toHaveBeenCalledWith(expect.objectContaining({ pageSize: 100 }));
+      // vendorId should NOT be in the call
+      const callArg = mockFetchAllInvoices.mock.calls[0]?.[0];
+      expect(callArg).not.toHaveProperty('vendorId');
+    });
+  });
+
+  it('auto-selects first invoice and shows it in search input', async () => {
+    const invoices = [buildInvoice('inv-1', 'INV-001'), buildInvoice('inv-2', 'INV-002')];
+    mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+
+    render(<InvoiceLinkModal {...buildProps()} />);
+
+    await waitFor(() => {
+      const searchInput = screen.getByPlaceholderText(/search by invoice/i) as HTMLInputElement;
+      expect(searchInput.value).toContain('#INV-001');
+    });
+  });
+
+  it('amount input defaults to defaultAmount', async () => {
+    mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse([buildInvoice('inv-1')]));
+
+    render(<InvoiceLinkModal {...buildProps({ defaultAmount: 750 })} />);
+
+    await waitFor(() => {
+      expect(screen.queryByText('Loading invoices...')).toBeNull();
+    });
+
+    const amountInput = screen.getByLabelText(/itemized amount/i) as HTMLInputElement;
+    expect(amountInput.value).toBe('750');
+  });
+
+  it('work item submit calls createInvoiceBudgetLine with workItemBudgetId', async () => {
+    const invoices = [buildInvoice('inv-1', 'INV-001')];
+    mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+    mockCreateInvoiceBudgetLine.mockResolvedValue({
+      budgetLine: {
+        id: 'ibl-1',
+        invoiceId: 'inv-1',
+        workItemBudgetId: 'budget-line-1',
+        householdItemBudgetId: null,
+        itemizedAmount: 500,
+        budgetLineDescription: null,
+        plannedAmount: 1000,
+        confidence: 'own_estimate',
+        categoryId: null,
+        categoryName: null,
+        categoryColor: null,
+        categoryTranslationKey: null,
+        parentItemId: 'wi-1',
+        parentItemTitle: 'Test Item',
+        parentItemType: 'work_item',
+        parentItemArea: null,
+        quantity: null,
+        unit: null,
+        unitPrice: null,
+        includesVat: true,
+        vendorId: null,
+        budgetSourceId: null,
+        createdAt: '2025-01-01T00:00:00Z',
+        updatedAt: '2025-01-01T00:00:00Z',
+      },
+      remainingAmount: 500,
+    });
+    const onSuccess = jest.fn();
+    const onClose = jest.fn();
+
+    render(
+      <InvoiceLinkModal
+        {...buildProps({
+          budgetLineId: 'budget-line-1',
+          budgetLineType: 'work_item',
+          defaultAmount: 500,
+          onSuccess,
+          onClose,
+        })}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByText('Loading invoices...')).toBeNull();
+    });
+
+    const submitBtn = screen.getByRole('button', { name: /link to invoice/i });
+    fireEvent.click(submitBtn);
+
+    await waitFor(() => {
+      expect(mockCreateInvoiceBudgetLine).toHaveBeenCalledWith(
+        'inv-1',
+        expect.objectContaining({
+          invoiceId: 'inv-1',
+          workItemBudgetId: 'budget-line-1',
+          itemizedAmount: 500,
+        }),
+      );
+    });
+  });
+
+  it('household item submit calls createInvoiceBudgetLine with householdItemBudgetId', async () => {
+    const invoices = [buildInvoice('inv-1', 'INV-001')];
+    mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+    mockCreateInvoiceBudgetLine.mockResolvedValue({
+      budgetLine: {
+        id: 'ibl-1',
+        invoiceId: 'inv-1',
+        workItemBudgetId: null,
+        householdItemBudgetId: 'hi-budget-1',
+        itemizedAmount: 300,
+        budgetLineDescription: null,
+        plannedAmount: 800,
+        confidence: 'own_estimate',
+        categoryId: null,
+        categoryName: null,
+        categoryColor: null,
+        categoryTranslationKey: null,
+        parentItemId: 'hi-1',
+        parentItemTitle: 'Test HI',
+        parentItemType: 'household_item',
+        parentItemArea: null,
+        quantity: null,
+        unit: null,
+        unitPrice: null,
+        includesVat: true,
+        vendorId: null,
+        budgetSourceId: null,
+        createdAt: '2025-01-01T00:00:00Z',
+        updatedAt: '2025-01-01T00:00:00Z',
+      },
+      remainingAmount: 700,
+    });
+
+    render(
+      <InvoiceLinkModal
+        {...buildProps({
+          budgetLineId: 'hi-budget-1',
+          budgetLineType: 'household_item',
+          defaultAmount: 300,
+        })}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByText('Loading invoices...')).toBeNull();
+    });
+
+    const submitBtn = screen.getByRole('button', { name: /link to invoice/i });
+    fireEvent.click(submitBtn);
+
+    await waitFor(() => {
+      expect(mockCreateInvoiceBudgetLine).toHaveBeenCalledWith(
+        'inv-1',
+        expect.objectContaining({
+          invoiceId: 'inv-1',
+          householdItemBudgetId: 'hi-budget-1',
+          itemizedAmount: 300,
+        }),
+      );
+    });
+  });
+
+  it('on success calls onSuccess and closes modal', async () => {
+    const invoices = [buildInvoice('inv-1', 'INV-001')];
+    mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+    mockCreateInvoiceBudgetLine.mockResolvedValue({
+      budgetLine: {
+        id: 'ibl-1',
+        invoiceId: 'inv-1',
+        workItemBudgetId: 'budget-line-1',
+        householdItemBudgetId: null,
+        itemizedAmount: 500,
+        budgetLineDescription: null,
+        plannedAmount: 1000,
+        confidence: 'own_estimate',
+        categoryId: null,
+        categoryName: null,
+        categoryColor: null,
+        categoryTranslationKey: null,
+        parentItemId: 'wi-1',
+        parentItemTitle: 'Test Item',
+        parentItemType: 'work_item',
+        parentItemArea: null,
+        quantity: null,
+        unit: null,
+        unitPrice: null,
+        includesVat: true,
+        vendorId: null,
+        budgetSourceId: null,
+        createdAt: '2025-01-01T00:00:00Z',
+        updatedAt: '2025-01-01T00:00:00Z',
+      },
+      remainingAmount: 500,
+    });
+    const onSuccess = jest.fn();
+    const onClose = jest.fn();
+
+    render(<InvoiceLinkModal {...buildProps({ onSuccess, onClose })} />);
+
+    await waitFor(() => {
+      expect(screen.queryByText('Loading invoices...')).toBeNull();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /link to invoice/i }));
+
+    await waitFor(() => {
+      expect(onSuccess).toHaveBeenCalled();
+    });
+  });
+
+  it('BUDGET_LINE_ALREADY_LINKED error is shown inline', async () => {
+    const invoices = [buildInvoice('inv-1', 'INV-001')];
+    mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+    mockCreateInvoiceBudgetLine.mockRejectedValue(
+      new Error('BUDGET_LINE_ALREADY_LINKED: budget line is already linked'),
+    );
+
+    render(<InvoiceLinkModal {...buildProps()} />);
+
+    await waitFor(() => {
+      expect(screen.queryByText('Loading invoices...')).toBeNull();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /link to invoice/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText('This budget line is already linked to an invoice')).toBeTruthy();
+    });
+  });
+
+  it('ITEMIZED_SUM_EXCEEDS_INVOICE error is shown inline', async () => {
+    const invoices = [buildInvoice('inv-1', 'INV-001')];
+    mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+    mockCreateInvoiceBudgetLine.mockRejectedValue(
+      new Error('ITEMIZED_SUM_EXCEEDS_INVOICE: itemized amount exceeds invoice total'),
+    );
+
+    render(<InvoiceLinkModal {...buildProps()} />);
+
+    await waitFor(() => {
+      expect(screen.queryByText('Loading invoices...')).toBeNull();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /link to invoice/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText('The itemized amount exceeds the invoice total')).toBeTruthy();
+    });
+  });
+
+  it('Escape key closes the modal', async () => {
+    mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse([]));
+    const onClose = jest.fn();
+
+    render(<InvoiceLinkModal {...buildProps({ onClose })} />);
+
+    fireEvent.keyDown(document, { key: 'Escape', code: 'Escape' });
+
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it('shows empty state when no invoices available', async () => {
+    mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse([]));
+
+    render(<InvoiceLinkModal {...buildProps()} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('No invoices available')).toBeTruthy();
+    });
+  });
+
+  it('submit is disabled when no invoices available', async () => {
+    mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse([]));
+
+    render(<InvoiceLinkModal {...buildProps()} />);
+
+    await waitFor(() => {
+      expect(screen.queryByText('Loading invoices...')).toBeNull();
+    });
+
+    const submitBtn = screen.getByRole('button', { name: /link to invoice/i });
+    expect(submitBtn).toBeDisabled();
+  });
+
+  it('shows error banner on load failure', async () => {
+    mockFetchAllInvoices.mockRejectedValue(new Error('Network error'));
+
+    render(<InvoiceLinkModal {...buildProps()} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Failed to load invoices. Please try again.')).toBeTruthy();
+    });
+  });
+
+  // ─── Vendor name display (#1372) ──────────────────────────────────────────
+
+  describe('vendor name display in invoice picker (#1372)', () => {
+    it('shows vendor name in the dropdown item', async () => {
+      const invoices = [{ ...buildInvoice('inv-1', 'INV-001'), vendorName: 'Acme Corp' }];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+
+      render(<InvoiceLinkModal {...buildProps()} />);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Loading invoices...')).toBeNull();
+      });
+
+      // Open the dropdown
+      const searchInput = screen.getByPlaceholderText(/search by invoice/i);
+      fireEvent.focus(searchInput);
+
+      await waitFor(() => {
+        expect(screen.getByText('Acme Corp')).toBeInTheDocument();
+      });
+    });
+
+    it('shows vendor name alongside invoice number in the dropdown', async () => {
+      const invoices = [{ ...buildInvoice('inv-1', 'INV-001'), vendorName: 'Acme Corp' }];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+
+      render(<InvoiceLinkModal {...buildProps()} />);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Loading invoices...')).toBeNull();
+      });
+
+      // Open the dropdown
+      const searchInput = screen.getByPlaceholderText(/search by invoice/i);
+      fireEvent.focus(searchInput);
+
+      await waitFor(() => {
+        // Both invoice number and vendor name should be present
+        expect(screen.getByText('#INV-001')).toBeInTheDocument();
+        expect(screen.getByText('Acme Corp')).toBeInTheDocument();
+      });
+    });
+
+    it('shows vendor name in the selected invoice display value', async () => {
+      const invoices = [{ ...buildInvoice('inv-1', 'INV-001'), vendorName: 'Acme Corp' }];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+
+      render(<InvoiceLinkModal {...buildProps()} />);
+
+      await waitFor(() => {
+        // After auto-select of first invoice, the input shows the invoice+vendor
+        const searchInput = screen.getByPlaceholderText(/search by invoice/i) as HTMLInputElement;
+        expect(searchInput.value).toContain('#INV-001');
+        expect(searchInput.value).toContain('Acme Corp');
+      });
+    });
+
+    it('vendor name search matches invoice — typing vendor name shows the invoice', async () => {
+      const invoices = [{ ...buildInvoice('inv-1', 'INV-001'), vendorName: 'Acme Corp' }];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+
+      render(<InvoiceLinkModal {...buildProps()} />);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Loading invoices...')).toBeNull();
+      });
+
+      const searchInput = screen.getByPlaceholderText(/search by invoice/i);
+      fireEvent.change(searchInput, { target: { value: 'Acme' } });
+
+      await waitFor(() => {
+        expect(screen.getByText('Acme Corp')).toBeInTheDocument();
+        expect(screen.getByText('#INV-001')).toBeInTheDocument();
+      });
+    });
+
+    it('typing a string matching neither invoice number nor vendor name shows empty dropdown', async () => {
+      const invoices = [{ ...buildInvoice('inv-1', 'INV-001'), vendorName: 'Acme Corp' }];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+
+      render(<InvoiceLinkModal {...buildProps()} />);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Loading invoices...')).toBeNull();
+      });
+
+      const searchInput = screen.getByPlaceholderText(/search by invoice/i);
+      fireEvent.change(searchInput, { target: { value: 'ZZZNOMATCH' } });
+
+      await waitFor(() => {
+        expect(screen.getByText('No invoices match your search')).toBeInTheDocument();
+      });
+    });
+
+    it('selected invoice display includes both invoice number and vendor name', async () => {
+      const invoices = [
+        { ...buildInvoice('inv-1', 'INV-001'), vendorName: 'Acme Corp' },
+        { ...buildInvoice('inv-2', 'INV-002'), vendorName: 'Beta Ltd' },
+      ];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+
+      render(<InvoiceLinkModal {...buildProps()} />);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Loading invoices...')).toBeNull();
+      });
+
+      // Open dropdown and select inv-2
+      const searchInput = screen.getByPlaceholderText(/search by invoice/i);
+      fireEvent.focus(searchInput);
+
+      await waitFor(() => {
+        expect(screen.getByText('Beta Ltd')).toBeInTheDocument();
+      });
+
+      const inv2Button = screen.getByText('Beta Ltd').closest('button');
+      expect(inv2Button).toBeTruthy();
+      fireEvent.click(inv2Button!);
+
+      await waitFor(() => {
+        const input = screen.getByPlaceholderText(/search by invoice/i) as HTMLInputElement;
+        expect(input.value).toContain('#INV-002');
+        expect(input.value).toContain('Beta Ltd');
+      });
+    });
+  });
+
+  // ─── onWheel blurs numeric inputs (#1370) ─────────────────────────────────
+
+  describe('onWheel prevents value change on numeric inputs (#1370)', () => {
+    it('blurs the amount input when wheel event fires', async () => {
+      const invoices = [buildInvoice('inv-1', 'INV-001')];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+
+      render(<InvoiceLinkModal {...buildProps({ defaultAmount: 500 })} />);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Loading invoices...')).toBeNull();
+      });
+
+      const amountInput = screen.getByLabelText(/itemized amount/i) as HTMLInputElement;
+      const blurSpy = jest.spyOn(amountInput, 'blur');
+      amountInput.focus();
+
+      fireEvent.wheel(amountInput);
+
+      expect(blurSpy).toHaveBeenCalled();
+      blurSpy.mockRestore();
+    });
+
+    it('amount input value is unchanged after wheel event', async () => {
+      const invoices = [buildInvoice('inv-1', 'INV-001')];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+
+      render(<InvoiceLinkModal {...buildProps({ defaultAmount: 500 })} />);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Loading invoices...')).toBeNull();
+      });
+
+      const amountInput = screen.getByLabelText(/itemized amount/i) as HTMLInputElement;
+      amountInput.focus();
+      expect(amountInput.value).toBe('500');
+
+      fireEvent.wheel(amountInput);
+
+      // Value is controlled — remains unchanged
+      expect(amountInput.value).toBe('500');
+    });
+  });
+
+  // ─── Issue #1812: newly-translated error/indicator strings ───────────────
+
+  describe('validation and indicator strings (Issue #1812)', () => {
+    it('shows "Please enter a valid amount" when the amount is not a positive number', async () => {
+      const invoices = [buildInvoice('inv-1', 'INV-001')];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+
+      render(<InvoiceLinkModal {...buildProps()} />);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Loading invoices...')).toBeNull();
+      });
+
+      const amountInput = screen.getByLabelText(/itemized amount/i) as HTMLInputElement;
+      fireEvent.change(amountInput, { target: { value: '0' } });
+      fireEvent.click(screen.getByRole('button', { name: /link to invoice/i }));
+
+      await waitFor(() => {
+        expect(screen.getByText('Please enter a valid amount')).toBeInTheDocument();
+      });
+      expect(mockCreateInvoiceBudgetLine).not.toHaveBeenCalled();
+
+      // Editing the amount clears the field error (covers the onChange error-reset branch).
+      fireEvent.change(amountInput, { target: { value: '100' } });
+      expect(screen.queryByText('Please enter a valid amount')).not.toBeInTheDocument();
+    });
+
+    it('shows "Amount exceeds available balance" when the amount exceeds remainingAmount', async () => {
+      const invoices = [buildInvoice('inv-1', 'INV-001')];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+      mockFetchInvoiceBudgetLines.mockResolvedValue({ budgetLines: [], remainingAmount: 200 });
+
+      render(<InvoiceLinkModal {...buildProps({ defaultAmount: 500 })} />);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Loading invoices...')).toBeNull();
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: /link to invoice/i }));
+
+      await waitFor(() => {
+        expect(
+          screen.getByText(/Amount exceeds available balance \(.*200.*available\)/),
+        ).toBeInTheDocument();
+      });
+      expect(mockCreateInvoiceBudgetLine).not.toHaveBeenCalled();
+    });
+
+    it('falls back to "Failed to link budget line" when the thrown Error has no message', async () => {
+      const invoices = [buildInvoice('inv-1', 'INV-001')];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+      mockCreateInvoiceBudgetLine.mockRejectedValue(new Error(''));
+
+      render(<InvoiceLinkModal {...buildProps()} />);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Loading invoices...')).toBeNull();
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: /link to invoice/i }));
+
+      await waitFor(() => {
+        expect(screen.getByText('Failed to link budget line')).toBeInTheDocument();
+      });
+    });
+
+    it('shows "An unexpected error occurred" when a non-Error value is thrown', async () => {
+      const invoices = [buildInvoice('inv-1', 'INV-001')];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+      mockCreateInvoiceBudgetLine.mockRejectedValue('some non-Error rejection');
+
+      render(<InvoiceLinkModal {...buildProps()} />);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Loading invoices...')).toBeNull();
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: /link to invoice/i }));
+
+      await waitFor(() => {
+        expect(screen.getByText('An unexpected error occurred')).toBeInTheDocument();
+      });
+    });
+
+    it('renders the plain amount input (no invoice picker) and no amountIndicator when there are no invoices', async () => {
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse([]));
+
+      render(<InvoiceLinkModal {...buildProps({ defaultAmount: 500 })} />);
+
+      await waitFor(() => {
+        expect(screen.getByText('No invoices available')).toBeInTheDocument();
+      });
+
+      const amountInput = screen.getByLabelText(/itemized amount/i) as HTMLInputElement;
+      expect(amountInput.value).toBe('500');
+      // No selected invoice → no "will remain"/"over available" indicator text.
+      expect(screen.queryByText(/will remain/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/over available/)).not.toBeInTheDocument();
+
+      // Editing the amount in this no-invoice-selected branch updates the controlled value
+      // (covers the separate onChange handler used when no invoice is selected).
+      fireEvent.change(amountInput, { target: { value: '750' } });
+      expect(amountInput.value).toBe('750');
+    });
+
+    it('shows "{{amount}} will remain" when the itemized amount is under the remaining balance', async () => {
+      const invoices = [buildInvoice('inv-1', 'INV-001')];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+      mockFetchInvoiceBudgetLines.mockResolvedValue({ budgetLines: [], remainingAmount: 1000 });
+
+      render(<InvoiceLinkModal {...buildProps({ defaultAmount: 500 })} />);
+
+      await waitFor(() => {
+        expect(screen.getByText(/will remain/)).toBeInTheDocument();
+      });
+    });
+
+    it('shows "{{amount}} over available" when the itemized amount exceeds the remaining balance', async () => {
+      const invoices = [buildInvoice('inv-1', 'INV-001')];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+      mockFetchInvoiceBudgetLines.mockResolvedValue({ budgetLines: [], remainingAmount: 100 });
+
+      render(<InvoiceLinkModal {...buildProps({ defaultAmount: 500 })} />);
+
+      await waitFor(() => {
+        expect(screen.getByText(/over available/)).toBeInTheDocument();
+      });
+    });
+
+    it('shows "{{amount}} available on this invoice" when remainingAmount is non-negative', async () => {
+      const invoices = [buildInvoice('inv-1', 'INV-001')];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+      mockFetchInvoiceBudgetLines.mockResolvedValue({ budgetLines: [], remainingAmount: 250 });
+
+      render(<InvoiceLinkModal {...buildProps()} />);
+
+      await waitFor(() => {
+        expect(screen.getByText(/available on this invoice/)).toBeInTheDocument();
+      });
+    });
+
+    it('shows "Over-allocated by {{amount}}" when remainingAmount is negative', async () => {
+      const invoices = [buildInvoice('inv-1', 'INV-001')];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+      mockFetchInvoiceBudgetLines.mockResolvedValue({ budgetLines: [], remainingAmount: -50 });
+
+      render(<InvoiceLinkModal {...buildProps()} />);
+
+      await waitFor(() => {
+        expect(screen.getByText(/Over-allocated by/)).toBeInTheDocument();
+      });
+    });
+
+    it('falls back to remainingAmount 0 when fetchInvoiceBudgetLines fails', async () => {
+      const invoices = [buildInvoice('inv-1', 'INV-001')];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+      mockFetchInvoiceBudgetLines.mockRejectedValue(new Error('network error'));
+
+      render(<InvoiceLinkModal {...buildProps({ defaultAmount: 500 })} />);
+
+      await waitFor(() => {
+        // remainingAmount falls back to 0 → "available on this invoice" shows €0.00
+        expect(screen.getByText(/available on this invoice/)).toBeInTheDocument();
+      });
+    });
+
+    it('shows the "Invoice {{id}}" fallback label in the dropdown when invoiceNumber is null', async () => {
+      const invoices = [buildInvoice('inv-1', 'INV-001'), buildInvoice('inv-2', null)];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+
+      render(<InvoiceLinkModal {...buildProps()} />);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Loading invoices...')).toBeNull();
+      });
+
+      fireEvent.focus(screen.getByPlaceholderText(/search by invoice/i));
+
+      await waitFor(() => {
+        expect(screen.getByText(`Invoice ${'inv-2'.slice(0, 8)}`)).toBeInTheDocument();
+      });
+    });
+
+    it('clears the "invoice" field error when a different invoice is selected after an alreadyLinked error', async () => {
+      const invoices = [
+        buildInvoice('inv-1', 'INV-001'),
+        { ...buildInvoice('inv-2', 'INV-002'), vendorName: 'Beta Ltd' },
+      ];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+      mockCreateInvoiceBudgetLine.mockRejectedValue(
+        new Error('BUDGET_LINE_ALREADY_LINKED: budget line is already linked'),
+      );
+
+      render(<InvoiceLinkModal {...buildProps()} />);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Loading invoices...')).toBeNull();
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: /link to invoice/i }));
+
+      await waitFor(() => {
+        expect(
+          screen.getByText('This budget line is already linked to an invoice'),
+        ).toBeInTheDocument();
+      });
+
+      fireEvent.focus(screen.getByPlaceholderText(/search by invoice/i));
+      await waitFor(() => {
+        expect(screen.getByText('Beta Ltd')).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByText('Beta Ltd').closest('button')!);
+
+      await waitFor(() => {
+        expect(
+          screen.queryByText('This budget line is already linked to an invoice'),
+        ).not.toBeInTheDocument();
+      });
+    });
+
+    it('shows the success toast message when linking succeeds', async () => {
+      const invoices = [buildInvoice('inv-1', 'INV-001')];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+      mockCreateInvoiceBudgetLine.mockResolvedValue({
+        budgetLine: {
+          id: 'ibl-1',
+          invoiceId: 'inv-1',
+          workItemBudgetId: 'budget-line-1',
+          householdItemBudgetId: null,
+          itemizedAmount: 500,
+          budgetLineDescription: null,
+          plannedAmount: 1000,
+          confidence: 'own_estimate',
+          categoryId: null,
+          categoryName: null,
+          categoryColor: null,
+          categoryTranslationKey: null,
+          parentItemId: 'wi-1',
+          parentItemTitle: 'Test Item',
+          parentItemType: 'work_item',
+          parentItemArea: null,
+          quantity: null,
+          unit: null,
+          unitPrice: null,
+          includesVat: true,
+          vendorId: null,
+          budgetSourceId: null,
+          createdAt: '2025-01-01T00:00:00Z',
+          updatedAt: '2025-01-01T00:00:00Z',
+        },
+        remainingAmount: 500,
+      });
+
+      render(<InvoiceLinkModal {...buildProps()} />);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Loading invoices...')).toBeNull();
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: /link to invoice/i }));
+
+      await waitFor(() => {
+        expect(mockShowToast).toHaveBeenCalledWith(
+          'success',
+          'Budget line linked to invoice successfully',
+        );
+      });
+    });
+
+    it('closes the search dropdown when clicking outside of it', async () => {
+      const invoices = [
+        buildInvoice('inv-1', 'INV-001'),
+        { ...buildInvoice('inv-2', 'INV-002'), vendorName: 'Beta Ltd' },
+      ];
+      mockFetchAllInvoices.mockResolvedValue(buildPaginatedResponse(invoices));
+
+      render(<InvoiceLinkModal {...buildProps()} />);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Loading invoices...')).toBeNull();
+      });
+
+      fireEvent.focus(screen.getByPlaceholderText(/search by invoice/i));
+      await waitFor(() => {
+        expect(screen.getByText('Beta Ltd')).toBeInTheDocument();
+      });
+
+      fireEvent.mouseDown(document.body);
+
+      await waitFor(() => {
+        expect(screen.queryByText('Beta Ltd')).not.toBeInTheDocument();
+      });
+    });
+  });
+});

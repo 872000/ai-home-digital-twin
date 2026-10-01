@@ -1,0 +1,529 @@
+/**
+ * Calendar utility functions for monthly and weekly views.
+ *
+ * Date handling strategy: all dates are treated as UTC midnight ISO strings
+ * (YYYY-MM-DD) to avoid local timezone shifting when constructing Date objects.
+ */
+
+import type {
+  TimelineWorkItem,
+  TimelineMilestone,
+  TimelineHouseholdItem,
+} from '@cornerstone/shared';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/**
+ * A single day cell in a calendar grid.
+ */
+export interface CalendarDay {
+  /** The Date object for this cell (UTC midnight). */
+  date: Date;
+  /** ISO date string (YYYY-MM-DD). */
+  dateStr: string;
+  /** Day of month (1–31). */
+  dayOfMonth: number;
+  /** True when this day belongs to the currently displayed month (month grid only). */
+  isCurrentMonth: boolean;
+  /** True when this day is today. */
+  isToday: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Date helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates a Date at UTC midnight from a YYYY-MM-DD string.
+ * Avoids local timezone shifts that would occur with `new Date(str)`.
+ */
+export function parseIsoDate(dateStr: string): Date {
+  const parts = dateStr.split('-').map(Number);
+  const year = parts[0]!; // split ensures at least 1 part or throws
+  const month = parts[1]!; // must be YYYY-MM-DD format
+  const day = parts[2]!; // must be YYYY-MM-DD format
+  return new Date(Date.UTC(year, month - 1, day));
+}
+
+/**
+ * Formats a Date as YYYY-MM-DD (using UTC parts).
+ */
+export function formatIsoDate(date: Date): string {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+/**
+ * Returns the ISO date string for today, using local date (for "today" highlight).
+ */
+export function getTodayStr(): string {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+// ---------------------------------------------------------------------------
+// Month grid
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns an array of 6 weeks (rows), each with 7 CalendarDay objects (Sun–Sat),
+ * covering the full 6-row grid for the given year/month.
+ *
+ * Days outside the current month have `isCurrentMonth = false`.
+ */
+export function getMonthGrid(year: number, month: number): CalendarDay[][] {
+  const todayStr = getTodayStr();
+
+  // First day of the month (UTC)
+  const firstOfMonth = new Date(Date.UTC(year, month - 1, 1));
+  // 0 = Sunday, 1 = Monday, …
+  const startDow = firstOfMonth.getUTCDay();
+
+  // Total days in the month
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+
+  // Build a flat list of cells starting from the Sunday before (or on) the 1st
+  const cells: CalendarDay[] = [];
+
+  // Days before the first of the month (from previous month)
+  for (let i = startDow - 1; i >= 0; i--) {
+    const d = new Date(Date.UTC(year, month - 1, -i));
+    const dateStr = formatIsoDate(d);
+    cells.push({
+      date: d,
+      dateStr,
+      dayOfMonth: d.getUTCDate(),
+      isCurrentMonth: false,
+      isToday: dateStr === todayStr,
+    });
+  }
+
+  // Days of the current month
+  for (let day = 1; day <= daysInMonth; day++) {
+    const d = new Date(Date.UTC(year, month - 1, day));
+    const dateStr = formatIsoDate(d);
+    cells.push({
+      date: d,
+      dateStr,
+      dayOfMonth: day,
+      isCurrentMonth: true,
+      isToday: dateStr === todayStr,
+    });
+  }
+
+  // Days after the last of the month (from next month) to fill 6 rows × 7 columns
+  const totalCells = 42; // 6 rows
+  let nextDay = 1;
+  while (cells.length < totalCells) {
+    const d = new Date(Date.UTC(year, month, nextDay));
+    const dateStr = formatIsoDate(d);
+    cells.push({
+      date: d,
+      dateStr,
+      dayOfMonth: d.getUTCDate(),
+      isCurrentMonth: false,
+      isToday: dateStr === todayStr,
+    });
+    nextDay++;
+  }
+
+  // Split flat list into rows of 7
+  const weeks: CalendarDay[][] = [];
+  for (let row = 0; row < 6; row++) {
+    weeks.push(cells.slice(row * 7, row * 7 + 7));
+  }
+
+  return weeks;
+}
+
+// ---------------------------------------------------------------------------
+// Week grid
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns 7 CalendarDay objects (Sun–Sat) for the week containing the given date.
+ */
+export function getWeekDates(date: Date): CalendarDay[] {
+  const todayStr = getTodayStr();
+  const dow = date.getUTCDay(); // 0 = Sunday
+
+  const days: CalendarDay[] = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(
+      Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() - dow + i),
+    );
+    const dateStr = formatIsoDate(d);
+    days.push({
+      date: d,
+      dateStr,
+      dayOfMonth: d.getUTCDate(),
+      isCurrentMonth: true, // not relevant for week view
+      isToday: dateStr === todayStr,
+    });
+  }
+  return days;
+}
+
+// ---------------------------------------------------------------------------
+// Item filtering helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns work items that overlap the given day.
+ * An item overlaps if its startDate <= day <= endDate.
+ * Items without both dates are excluded.
+ *
+ * Items are sorted by duration (longest first) for consistent visual ordering.
+ */
+export function getItemsForDay(dateStr: string, items: TimelineWorkItem[]): TimelineWorkItem[] {
+  const filtered = items.filter((item) => {
+    if (!item.startDate || !item.endDate) return false;
+    return item.startDate <= dateStr && item.endDate >= dateStr;
+  });
+
+  // Sort by duration (longest first)
+  return filtered.sort((a, b) => {
+    const durationA = new Date(a.endDate!).getTime() - new Date(a.startDate!).getTime();
+    const durationB = new Date(b.endDate!).getTime() - new Date(b.startDate!).getTime();
+    return durationB - durationA;
+  });
+}
+
+/**
+ * Returns milestones that should appear on the given day.
+ *
+ * Date resolution order:
+ *   1. Completed milestones: match on completedAt date (YYYY-MM-DD portion)
+ *   2. Incomplete with projectedDate: match on projectedDate
+ *   3. Incomplete without projectedDate: match on targetDate (fallback)
+ *
+ * Milestones are sorted by ID to ensure consistent visual ordering.
+ */
+export function getMilestonesForDay(
+  dateStr: string,
+  milestones: TimelineMilestone[],
+): TimelineMilestone[] {
+  const filtered = milestones.filter((m) => {
+    if (m.isCompleted && m.completedAt) {
+      // Use the YYYY-MM-DD portion of the ISO timestamp
+      return m.completedAt.slice(0, 10) === dateStr;
+    }
+    if (m.projectedDate) {
+      return m.projectedDate === dateStr;
+    }
+    return m.targetDate === dateStr;
+  });
+
+  // Sort by ID for consistent ordering
+  return filtered.sort((a, b) => a.id - b.id);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-day span helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns whether a work item starts on the given day
+ * (used to decide whether to render the item title or a continuation bar).
+ */
+export function isItemStart(dateStr: string, item: TimelineWorkItem): boolean {
+  return item.startDate === dateStr;
+}
+
+/**
+ * Returns whether a work item ends on the given day.
+ */
+export function isItemEnd(dateStr: string, item: TimelineWorkItem): boolean {
+  return item.endDate === dateStr;
+}
+
+// ---------------------------------------------------------------------------
+// Navigation helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the previous month's year and month (1-indexed).
+ */
+export function prevMonth(year: number, month: number): { year: number; month: number } {
+  if (month === 1) return { year: year - 1, month: 12 };
+  return { year, month: month - 1 };
+}
+
+/**
+ * Returns the next month's year and month (1-indexed).
+ */
+export function nextMonth(year: number, month: number): { year: number; month: number } {
+  if (month === 12) return { year: year + 1, month: 1 };
+  return { year, month: month + 1 };
+}
+
+/**
+ * Returns the Date for the same day one week earlier.
+ */
+export function prevWeek(date: Date): Date {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() - 7));
+}
+
+/**
+ * Returns the Date for the same day one week later.
+ */
+export function nextWeek(date: Date): Date {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 7));
+}
+
+// ---------------------------------------------------------------------------
+// Lane allocation for multi-day item visual continuity
+// ---------------------------------------------------------------------------
+
+/**
+ * Allocates a consistent vertical lane index to each work item that appears
+ * within the given week (weekStart..weekEnd inclusive).
+ *
+ * Algorithm:
+ *  1. Collect all items that overlap the week.
+ *  2. Sort: multi-day items first (longest duration first), then single-day.
+ *  3. Greedily assign lanes: for each item find the lowest lane that is free
+ *     on all days the item spans within this week.
+ *
+ * Returns a Map<itemId, laneIndex> (0-based).
+ */
+export function allocateLanes(
+  weekStart: string,
+  weekEnd: string,
+  items: TimelineWorkItem[],
+): Map<string, number> {
+  // Only items with both dates that overlap this week
+  const weekItems = items.filter((item) => {
+    if (!item.startDate || !item.endDate) return false;
+    // Item overlaps if its range intersects [weekStart, weekEnd]
+    return item.startDate <= weekEnd && item.endDate >= weekStart;
+  });
+
+  // Calculate how many days each item spans *within* this week
+  function spanInWeek(item: TimelineWorkItem): number {
+    const start = item.startDate! > weekStart ? item.startDate! : weekStart;
+    const end = item.endDate! < weekEnd ? item.endDate! : weekEnd;
+    // Count days between start and end inclusive
+    const startDate = parseIsoDate(start);
+    const endDate = parseIsoDate(end);
+    return Math.round((endDate.getTime() - startDate.getTime()) / 86400000) + 1;
+  }
+
+  // Sort: multi-day (span > 1) first by descending span, then single-day
+  const sorted = [...weekItems].sort((a, b) => {
+    const spanA = spanInWeek(a);
+    const spanB = spanInWeek(b);
+    // Multi-day first
+    if (spanA > 1 && spanB === 1) return -1;
+    if (spanA === 1 && spanB > 1) return 1;
+    // Both multi-day: longer span first
+    return spanB - spanA;
+  });
+
+  // Build a list of ISO day strings for the week
+  const weekDays: string[] = [];
+  {
+    const startDate = parseIsoDate(weekStart);
+    const endDate = parseIsoDate(weekEnd);
+    let d = startDate;
+    while (d <= endDate) {
+      weekDays.push(formatIsoDate(d));
+      d = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1));
+    }
+  }
+
+  // laneBusy[day][lane] = itemId occupying that lane on that day
+  const laneBusy: Map<string, Set<number>> = new Map();
+  for (const day of weekDays) {
+    laneBusy.set(day, new Set());
+  }
+
+  const result = new Map<string, number>();
+
+  for (const item of sorted) {
+    // Days this item occupies within the week
+    const itemStart = item.startDate! > weekStart ? item.startDate! : weekStart;
+    const itemEnd = item.endDate! < weekEnd ? item.endDate! : weekEnd;
+    const occupiedDays = weekDays.filter((d) => d >= itemStart && d <= itemEnd);
+
+    // Find the lowest lane free on all occupied days
+    let lane = 0;
+    let laneFree = false;
+    while (!laneFree) {
+      laneFree = occupiedDays.every((d) => !laneBusy.get(d)!.has(lane));
+      if (!laneFree) lane++;
+    }
+
+    // Mark lane as occupied on all days
+    for (const d of occupiedDays) {
+      laneBusy.get(d)!.add(lane);
+    }
+
+    result.set(item.id, lane);
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Item color palette
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns a deterministic color index (1–8) for a work item based on its ID.
+ * The same ID always maps to the same color slot.
+ */
+export function getItemColor(itemId: string): number {
+  let hash = 0;
+  for (let i = 0; i < itemId.length; i++) {
+    hash = (hash * 31 + itemId.charCodeAt(i)) >>> 0; // keep as unsigned 32-bit
+  }
+  return (hash % 8) + 1; // 1-indexed, 1..8
+}
+
+/**
+ * Returns '#ffffff' or '#000000' — whichever achieves WCAG AA contrast
+ * against the given hex background color.
+ *
+ * @param bgHex - A 6-digit hex color string, with or without '#' prefix (e.g. '#3b82f6' or '3b82f6').
+ */
+export function getContrastTextColor(bgHex: string): string {
+  const hex = bgHex.replace(/^#/, '');
+  if (hex.length !== 6) return '#000000';
+  const r = parseInt(hex.slice(0, 2), 16);
+  const g = parseInt(hex.slice(2, 4), 16);
+  const b = parseInt(hex.slice(4, 6), 16);
+  // sRGB linearisation per WCAG 2.x
+  function linearise(c: number): number {
+    const s = c / 255;
+    return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+  }
+  const L = 0.2126 * linearise(r) + 0.7152 * linearise(g) + 0.0722 * linearise(b);
+  // WCAG AA: use white text when luminance < 0.179 (approx 4.5:1 contrast against white)
+  return L < 0.179 ? '#ffffff' : '#000000';
+}
+
+// ---------------------------------------------------------------------------
+// Display helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns month names for the user's current locale.
+ * Uses Intl.DateTimeFormat for automatic locale support.
+ */
+function getMonthNames(locale: string): string[] {
+  const monthNames = [];
+  for (let i = 0; i < 12; i++) {
+    const date = new Date(Date.UTC(2024, i, 1));
+    monthNames.push(date.toLocaleDateString(locale, { month: 'long', timeZone: 'UTC' }));
+  }
+  return monthNames;
+}
+
+/**
+ * Returns day names for the user's current locale (Sun, Mon, ..., Sat).
+ * Uses Intl.DateTimeFormat for automatic locale support.
+ */
+function getDayNames(locale: string): string[] {
+  const dayNames = [];
+  // Use a date that's known to be a Sunday (2024-01-01 was a Monday, so offset by 6 days for Sunday)
+  for (let i = 0; i < 7; i++) {
+    const date = new Date(Date.UTC(2024, 0, 7 + i)); // 2024-01-07 is a Sunday
+    dayNames.push(date.toLocaleDateString(locale, { weekday: 'short', timeZone: 'UTC' }));
+  }
+  return dayNames;
+}
+
+/**
+ * Returns narrow day names for the user's current locale (S, M, T, W, T, F, S).
+ * Uses Intl.DateTimeFormat for automatic locale support.
+ */
+function getDayNamesNarrow(locale: string): string[] {
+  const dayNames = [];
+  for (let i = 0; i < 7; i++) {
+    const date = new Date(Date.UTC(2024, 0, 7 + i)); // 2024-01-07 is a Sunday
+    dayNames.push(date.toLocaleDateString(locale, { weekday: 'narrow', timeZone: 'UTC' }));
+  }
+  return dayNames;
+}
+
+export function getMonthName(month: number, locale = 'en-US'): string {
+  const monthNames = getMonthNames(locale);
+  return monthNames[month - 1] ?? '';
+}
+
+export function getDayName(day: number, locale = 'en-US'): string {
+  const dayNames = getDayNames(locale);
+  return dayNames[day] ?? '';
+}
+
+export function getDayNameNarrow(day: number, locale = 'en-US'): string {
+  const dayNames = getDayNamesNarrow(locale);
+  return dayNames[day] ?? '';
+}
+
+// Default English fallbacks for backward compatibility
+const _MONTH_NAMES_DEFAULT = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+];
+
+export const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+export const DAY_NAMES_NARROW = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
+
+/**
+ * Formats a YYYY-MM-DD date string as a human-readable aria-label.
+ * Example: "2026-02-24" → "Tuesday, February 24, 2026"
+ */
+export function formatDateForAria(dateStr: string, locale = 'en-US'): string {
+  const parts = dateStr.split('-').map(Number);
+  const year = parts[0]!; // split ensures at least 1 part or throws
+  const month = parts[1]!; // must be YYYY-MM-DD format
+  const day = parts[2]!; // must be YYYY-MM-DD format
+  const date = new Date(Date.UTC(year, month - 1, day));
+  const weekday = date.toLocaleDateString(locale, { weekday: 'long', timeZone: 'UTC' });
+  const monthName = date.toLocaleDateString(locale, { month: 'long', timeZone: 'UTC' });
+  return `${weekday}, ${monthName} ${day}, ${year}`;
+}
+
+/**
+ * Returns household items that should appear on the given date.
+ * A household item is shown on a date if:
+ *   - It has an actualDeliveryDate matching the date (shown ONLY on that date)
+ *   - Otherwise, if it has a targetDeliveryDate matching the date
+ *
+ * Items are sorted by ID to ensure consistent visual ordering.
+ */
+export function getHouseholdItemsForDay(
+  dateStr: string,
+  items: TimelineHouseholdItem[],
+): TimelineHouseholdItem[] {
+  const filtered = items.filter((item) => {
+    // Actual delivery date takes priority (exclusive)
+    if (item.actualDeliveryDate) {
+      return item.actualDeliveryDate === dateStr;
+    }
+    // Otherwise check target delivery date
+    return item.targetDeliveryDate === dateStr;
+  });
+
+  // Sort by ID for consistent ordering
+  return filtered.sort((a, b) => a.id.localeCompare(b.id));
+}

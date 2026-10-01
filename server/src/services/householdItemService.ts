@@ -1,0 +1,682 @@
+/**
+ * Household item service — CRUD operations for household items.
+ *
+ * EPIC-04: Household Items & Furniture Management
+ *
+ * Handles create, read, update, delete, and list operations for household items,
+ * including tag management (with replace-all semantics), vendor linking, budget
+ * line aggregation, and document link cleanup on deletion.
+ */
+
+import { randomUUID } from 'node:crypto';
+import { eq, sql, and, or, desc, asc, inArray, isNull } from 'drizzle-orm';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import type * as schemaTypes from '../db/schema.js';
+import type { areas } from '../db/schema.js';
+import {
+  householdItems,
+  householdItemCategories,
+  users,
+  vendors,
+  householdItemBudgets,
+  householdItemSubsidies,
+  subsidyPrograms,
+  invoices,
+  invoiceBudgetLines,
+} from '../db/schema.js';
+import { deleteLinksForEntity } from './documentLinkService.js';
+import { listDeps } from './householdItemDepService.js';
+import { autoReschedule } from './schedulingEngine.js';
+import { loadAreaMap, resolveAreaAncestors, resolveAreaFilter } from './areaService.js';
+import type { AreaMapEntry } from './areaService.js';
+import { toUserSummary, toAreaSummary, toVendorSummaryWithTrade } from './shared/converters.js';
+import { validateVendorId, validateAreaId } from './shared/validators.js';
+import type {
+  HouseholdItemDetail,
+  HouseholdItemSummary,
+  HouseholdItemCategory,
+  HouseholdItemStatus,
+  HouseholdItemSubsidySummary,
+  HouseholdItemBudgetAggregate,
+  CreateHouseholdItemRequest,
+  UpdateHouseholdItemRequest,
+  HouseholdItemListQuery,
+  PaginationMeta,
+  FilterMeta,
+} from '@cornerstone/shared';
+import { NotFoundError, ValidationError } from '../errors/AppError.js';
+
+type DbType = BetterSQLite3Database<typeof schemaTypes>;
+
+/**
+ * Fetch subsidy programs linked to a household item.
+ */
+function getHouseholdItemSubsidies(
+  db: DbType,
+  householdItemId: string,
+): HouseholdItemSubsidySummary[] {
+  const rows = db
+    .select({ subsidy: subsidyPrograms })
+    .from(householdItemSubsidies)
+    .innerJoin(subsidyPrograms, eq(subsidyPrograms.id, householdItemSubsidies.subsidyProgramId))
+    .where(eq(householdItemSubsidies.householdItemId, householdItemId))
+    .all();
+
+  return rows.map((row) => ({
+    id: row.subsidy.id,
+    name: row.subsidy.name,
+    reductionType: row.subsidy.reductionType as 'percentage' | 'fixed',
+    reductionValue: row.subsidy.reductionValue,
+    applicationStatus: row.subsidy.applicationStatus,
+  }));
+}
+
+/**
+ * Count budget lines for a household item.
+ */
+function getBudgetLineCount(db: DbType, householdItemId: string): number {
+  const result = db
+    .select({ count: sql<number>`COUNT(*)` })
+    .from(householdItemBudgets)
+    .where(eq(householdItemBudgets.householdItemId, householdItemId))
+    .get();
+  return result?.count ?? 0;
+}
+
+/**
+ * Sum total planned amount from budget lines for a household item.
+ */
+function getTotalPlannedAmount(db: DbType, householdItemId: string): number {
+  const result = db
+    .select({ total: sql<number>`COALESCE(SUM(${householdItemBudgets.plannedAmount}), 0)` })
+    .from(householdItemBudgets)
+    .where(eq(householdItemBudgets.householdItemId, householdItemId))
+    .get();
+  return result?.total ?? 0;
+}
+
+/**
+ * Sum total actual amount from invoices linked to household item budget lines.
+ */
+function getTotalActualAmount(db: DbType, householdItemId: string): number {
+  // EPIC-15: Join through invoiceBudgetLines junction table instead of direct FK
+  const result = db
+    .select({ total: sql<number>`COALESCE(SUM(${invoiceBudgetLines.itemizedAmount}), 0)` })
+    .from(invoiceBudgetLines)
+    .innerJoin(invoices, eq(invoices.id, invoiceBudgetLines.invoiceId))
+    .innerJoin(
+      householdItemBudgets,
+      eq(invoiceBudgetLines.householdItemBudgetId, householdItemBudgets.id),
+    )
+    .where(eq(householdItemBudgets.householdItemId, householdItemId))
+    .get();
+  return result?.total ?? 0;
+}
+
+/**
+ * Calculate the total subsidy reduction for a household item.
+ * Sums up all reductions from linked subsidy programs (non-rejected).
+ * For percentage subsidies, computes based on matching budget lines with confidence margins.
+ * For fixed subsidies, uses the fixed reduction value.
+ */
+function getTotalSubsidyReduction(db: DbType, householdItemId: string): number {
+  // Fetch linked subsidies (non-rejected)
+  const linkedSubsidies = db
+    .select({
+      id: subsidyPrograms.id,
+      reductionType: subsidyPrograms.reductionType,
+      reductionValue: subsidyPrograms.reductionValue,
+    })
+    .from(householdItemSubsidies)
+    .innerJoin(subsidyPrograms, eq(subsidyPrograms.id, householdItemSubsidies.subsidyProgramId))
+    .where(
+      and(
+        eq(householdItemSubsidies.householdItemId, householdItemId),
+        sql`${subsidyPrograms.applicationStatus} != 'rejected'`,
+      ),
+    )
+    .all();
+
+  if (linkedSubsidies.length === 0) {
+    return 0;
+  }
+
+  let totalReduction = 0;
+
+  for (const subsidy of linkedSubsidies) {
+    if (subsidy.reductionType === 'fixed') {
+      totalReduction += subsidy.reductionValue;
+    } else if (subsidy.reductionType === 'percentage') {
+      // For percentage subsidies, compute the reduction as percentage of planned amount
+      const plannedAmount = getTotalPlannedAmount(db, householdItemId);
+      const reduction = plannedAmount * (subsidy.reductionValue / 100);
+      totalReduction += reduction;
+    }
+  }
+
+  return totalReduction;
+}
+
+/**
+ * Compute the budget aggregates for a household item.
+ */
+function getBudgetSummary(db: DbType, householdItemId: string): HouseholdItemBudgetAggregate {
+  const totalPlanned = getTotalPlannedAmount(db, householdItemId);
+  const totalActual = getTotalActualAmount(db, householdItemId);
+  const subsidyReduction = getTotalSubsidyReduction(db, householdItemId);
+  const netCost = totalPlanned - subsidyReduction;
+
+  return {
+    totalPlanned,
+    totalActual,
+    subsidyReduction,
+    netCost,
+  };
+}
+
+/**
+ * Get area with ancestors resolved from the area map.
+ * Returns null if areaId is null or area is not found in the map.
+ */
+function getAreaWithAncestors(
+  areaId: string | null,
+  areaMap: Map<string, AreaMapEntry>,
+): ReturnType<typeof toAreaSummary> {
+  if (!areaId) return null;
+  const entry = areaMap.get(areaId);
+  if (!entry) return null;
+  const ancestors = resolveAreaAncestors(areaId, areaMap);
+  return toAreaSummary(
+    {
+      id: entry.id,
+      name: entry.name,
+      color: entry.color,
+      parentId: entry.parentId,
+    } as typeof areas.$inferSelect,
+    ancestors,
+  );
+}
+
+/**
+ * Convert database household item row to HouseholdItemSummary shape.
+ */
+export function toHouseholdItemSummary(
+  db: DbType,
+  item: typeof householdItems.$inferSelect,
+  areaMap: Map<string, AreaMapEntry>,
+): HouseholdItemSummary {
+  const vendor = item.vendorId
+    ? (db.select().from(vendors).where(eq(vendors.id, item.vendorId)).get() ?? null)
+    : null;
+
+  const createdByUser = item.createdBy
+    ? (db.select().from(users).where(eq(users.id, item.createdBy)).get() ?? null)
+    : null;
+
+  const area = getAreaWithAncestors(item.areaId, areaMap);
+
+  return {
+    id: item.id,
+    name: item.name,
+    description: item.description,
+    category: item.categoryId as HouseholdItemCategory,
+    status: item.status as HouseholdItemStatus,
+    vendor: toVendorSummaryWithTrade(db, vendor),
+    area,
+    quantity: item.quantity,
+    orderDate: item.orderDate,
+    actualDeliveryDate: item.actualDeliveryDate,
+    earliestDeliveryDate: item.earliestDeliveryDate,
+    latestDeliveryDate: item.latestDeliveryDate,
+    targetDeliveryDate: item.targetDeliveryDate,
+    isLate: !!item.isLate,
+    url: item.url,
+    budgetLineCount: getBudgetLineCount(db, item.id),
+    totalPlannedAmount: getTotalPlannedAmount(db, item.id),
+    budgetSummary: getBudgetSummary(db, item.id),
+    createdBy: toUserSummary(createdByUser),
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+  };
+}
+
+/**
+ * Convert database household item row to HouseholdItemDetail shape.
+ */
+export function toHouseholdItemDetail(
+  db: DbType,
+  item: typeof householdItems.$inferSelect,
+  areaMap: Map<string, AreaMapEntry>,
+): HouseholdItemDetail {
+  const summary = toHouseholdItemSummary(db, item, areaMap);
+  const dependencies = listDeps(db, item.id);
+  const subsidies = getHouseholdItemSubsidies(db, item.id);
+
+  return {
+    ...summary,
+    dependencies,
+    subsidies,
+  };
+}
+
+/**
+ * Find a household item by ID.
+ * Returns null if not found.
+ */
+function findHouseholdItemById(db: DbType, id: string): typeof householdItems.$inferSelect | null {
+  return db.select().from(householdItems).where(eq(householdItems.id, id)).get() ?? null;
+}
+
+/**
+ * Validate that household item category ID exists.
+ * Throws ValidationError if category does not exist.
+ */
+function validateHouseholdItemCategoryId(db: DbType, categoryId: string): void {
+  const category = db
+    .select()
+    .from(householdItemCategories)
+    .where(eq(householdItemCategories.id, categoryId))
+    .get();
+  if (!category) {
+    throw new ValidationError(`Household item category not found: ${categoryId}`);
+  }
+}
+
+/**
+ * Create a new household item.
+ */
+export function createHouseholdItem(
+  db: DbType,
+  userId: string,
+  data: CreateHouseholdItemRequest,
+): HouseholdItemDetail {
+  // Validate required fields
+  if (!data.name || data.name.trim().length === 0) {
+    throw new ValidationError('Name is required');
+  }
+
+  // Validate optional vendor if provided
+  if (data.vendorId) {
+    validateVendorId(db, data.vendorId);
+  }
+
+  // Validate optional category ID if provided, default to 'hic-other'
+  const categoryId = data.category ?? 'hic-other';
+  validateHouseholdItemCategoryId(db, categoryId);
+
+  // Validate areaId if provided
+  if (data.areaId) {
+    validateAreaId(db, data.areaId);
+  }
+
+  // Cross-field validation: if both earliest and latest are provided, earliest <= latest
+  if (data.earliestDeliveryDate && data.latestDeliveryDate) {
+    if (data.earliestDeliveryDate > data.latestDeliveryDate) {
+      throw new ValidationError(
+        'Earliest delivery date must be before or equal to latest delivery date',
+      );
+    }
+  }
+
+  const id = randomUUID();
+  const now = new Date().toISOString();
+
+  db.insert(householdItems)
+    .values({
+      id,
+      name: data.name.trim(),
+      description: data.description ?? null,
+      categoryId,
+      status: data.status ?? 'planned',
+      vendorId: data.vendorId ?? null,
+      areaId: data.areaId ?? null,
+      url: data.url ?? null,
+      quantity: data.quantity ?? 1,
+      orderDate: data.orderDate ?? null,
+      actualDeliveryDate: data.actualDeliveryDate ?? null,
+      earliestDeliveryDate: data.earliestDeliveryDate ?? null,
+      latestDeliveryDate: data.latestDeliveryDate ?? null,
+      targetDeliveryDate: null,
+      isLate: false,
+      createdBy: userId,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .run();
+
+  // Fetch and return the created item
+  const createdItem = findHouseholdItemById(db, id)!;
+  const areaMap = loadAreaMap(db);
+  return toHouseholdItemDetail(db, createdItem, areaMap);
+}
+
+/**
+ * Get a household item by ID.
+ * Throws NotFoundError if not found.
+ */
+export function getHouseholdItemById(db: DbType, id: string): HouseholdItemDetail {
+  const item = findHouseholdItemById(db, id);
+  if (!item) {
+    throw new NotFoundError('Household item not found');
+  }
+  const areaMap = loadAreaMap(db);
+  return toHouseholdItemDetail(db, item, areaMap);
+}
+
+/**
+ * Update a household item.
+ * Throws NotFoundError if item does not exist.
+ * Throws ValidationError if data is invalid.
+ */
+export function updateHouseholdItem(
+  db: DbType,
+  id: string,
+  data: UpdateHouseholdItemRequest,
+): HouseholdItemDetail {
+  const item = findHouseholdItemById(db, id);
+  if (!item) {
+    throw new NotFoundError('Household item not found');
+  }
+
+  // Validate vendor if provided
+  if ('vendorId' in data && data.vendorId) {
+    validateVendorId(db, data.vendorId);
+  }
+
+  // Validate category if provided
+  if ('category' in data && data.category) {
+    validateHouseholdItemCategoryId(db, data.category);
+  }
+
+  // Validate areaId if provided
+  if ('areaId' in data && data.areaId) {
+    validateAreaId(db, data.areaId);
+  }
+
+  // Cross-field validation: if both earliest and latest are provided, earliest <= latest
+  const earliestFromData =
+    'earliestDeliveryDate' in data ? data.earliestDeliveryDate : item.earliestDeliveryDate;
+  const latestFromData =
+    'latestDeliveryDate' in data ? data.latestDeliveryDate : item.latestDeliveryDate;
+  if (earliestFromData && latestFromData) {
+    if (earliestFromData > latestFromData) {
+      throw new ValidationError(
+        'Earliest delivery date must be before or equal to latest delivery date',
+      );
+    }
+  }
+
+  // Build update data
+  const updateData: Partial<typeof householdItems.$inferInsert> = {};
+
+  // Derive actualDeliveryDate: auto-set to today if status → 'arrived' and date not already set
+  let resolvedActualDeliveryDate: string | null | undefined = undefined;
+  if (data.status === 'arrived' && !('actualDeliveryDate' in data) && !item.actualDeliveryDate) {
+    resolvedActualDeliveryDate = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+  }
+
+  if ('name' in data) {
+    if (!data.name || data.name.trim().length === 0) {
+      throw new ValidationError('Name cannot be empty');
+    }
+    updateData.name = data.name.trim();
+  }
+
+  if ('description' in data) {
+    updateData.description = data.description ?? null;
+  }
+
+  if ('category' in data) {
+    updateData.categoryId = data.category;
+  }
+
+  if ('status' in data) {
+    updateData.status = data.status;
+  }
+
+  if ('vendorId' in data) {
+    updateData.vendorId = data.vendorId ?? null;
+  }
+
+  if ('url' in data) {
+    updateData.url = data.url ?? null;
+  }
+
+  if ('areaId' in data) {
+    updateData.areaId = data.areaId ?? null;
+  }
+
+  if ('quantity' in data) {
+    updateData.quantity = data.quantity;
+  }
+
+  if ('orderDate' in data) {
+    updateData.orderDate = data.orderDate ?? null;
+  }
+
+  if ('earliestDeliveryDate' in data) {
+    updateData.earliestDeliveryDate = data.earliestDeliveryDate ?? null;
+  }
+
+  if ('latestDeliveryDate' in data) {
+    updateData.latestDeliveryDate = data.latestDeliveryDate ?? null;
+  }
+
+  if ('actualDeliveryDate' in data) {
+    updateData.actualDeliveryDate = data.actualDeliveryDate ?? null;
+  } else if (resolvedActualDeliveryDate !== undefined) {
+    updateData.actualDeliveryDate = resolvedActualDeliveryDate;
+  }
+
+  // Always update updatedAt
+  updateData.updatedAt = new Date().toISOString();
+
+  // Update household item
+  db.update(householdItems).set(updateData).where(eq(householdItems.id, id)).run();
+
+  // Trigger auto-reschedule when any scheduling-relevant field changed.
+  const schedulingFieldChanged =
+    'earliestDeliveryDate' in data ||
+    'latestDeliveryDate' in data ||
+    'actualDeliveryDate' in data ||
+    'status' in data;
+
+  if (schedulingFieldChanged) {
+    autoReschedule(db);
+  }
+
+  // Fetch and return the updated item
+  const updatedItem = findHouseholdItemById(db, id)!;
+  const areaMap = loadAreaMap(db);
+  return toHouseholdItemDetail(db, updatedItem, areaMap);
+}
+
+/**
+ * Delete a household item.
+ * Throws NotFoundError if item does not exist.
+ */
+export function deleteHouseholdItem(db: DbType, id: string): void {
+  const item = findHouseholdItemById(db, id);
+  if (!item) {
+    throw new NotFoundError('Household item not found');
+  }
+
+  // Cascade delete document links (polymorphic FK, enforced at app layer)
+  deleteLinksForEntity(db, 'household_item', id);
+
+  db.delete(householdItems).where(eq(householdItems.id, id)).run();
+}
+
+/**
+ * List household items with filtering, sorting, and pagination.
+ */
+export function listHouseholdItems(
+  db: DbType,
+  query: HouseholdItemListQuery,
+): { items: HouseholdItemSummary[]; pagination: PaginationMeta; filterMeta: FilterMeta } {
+  const page = Math.max(1, query.page ?? 1);
+  const pageSize = Math.min(100, Math.max(1, query.pageSize ?? 25));
+  const sortBy = query.sortBy ?? 'created_at';
+  const sortOrder = query.sortOrder ?? 'desc';
+
+  // Build base conditions (excluding numeric range filters)
+  const baseConditions = [];
+
+  if (query.category) {
+    baseConditions.push(eq(householdItems.categoryId, query.category));
+  }
+
+  if (query.status) {
+    baseConditions.push(eq(householdItems.status, query.status));
+  }
+
+  if (query.vendorId) {
+    baseConditions.push(eq(householdItems.vendorId, query.vendorId));
+  }
+
+  if (query.areaId) {
+    const { areaIds, includeNull, hasInput } = resolveAreaFilter(db, query.areaId);
+    if (includeNull && areaIds.length > 0) {
+      baseConditions.push(
+        or(isNull(householdItems.areaId), inArray(householdItems.areaId, areaIds))!,
+      );
+    } else if (includeNull) {
+      baseConditions.push(isNull(householdItems.areaId));
+    } else if (areaIds.length > 0) {
+      baseConditions.push(inArray(householdItems.areaId, areaIds));
+    } else if (hasInput) {
+      // User supplied ID(s) but all were unknown — yield empty result
+      baseConditions.push(sql`1 = 0`);
+    }
+    // else: no meaningful input (empty/whitespace-only CSV) — skip filter
+  }
+
+  if (query.q) {
+    // Escape SQL LIKE wildcards (% and _) in user input
+    const escapedQ = query.q.replace(/%/g, '\\%').replace(/_/g, '\\_');
+    const pattern = `%${escapedQ}%`;
+    baseConditions.push(
+      or(
+        sql`LOWER(${householdItems.name}) LIKE LOWER(${pattern}) ESCAPE '\\'`,
+        sql`LOWER(${householdItems.description}) LIKE LOWER(${pattern}) ESCAPE '\\'`,
+      )!,
+    );
+  }
+
+  const baseWhereClause = baseConditions.length > 0 ? and(...baseConditions) : undefined;
+
+  // Compute filterMeta from base conditions
+  const metaRow = db
+    .select({
+      plannedCostMin: sql<number>`COALESCE(MIN(COALESCE((SELECT SUM(planned_amount) FROM household_item_budgets WHERE household_item_id = household_items.id), 0)), 0)`,
+      plannedCostMax: sql<number>`COALESCE(MAX(COALESCE((SELECT SUM(planned_amount) FROM household_item_budgets WHERE household_item_id = household_items.id), 0)), 0)`,
+      actualCostMin: sql<number>`COALESCE(MIN(COALESCE((SELECT SUM(ibl.itemized_amount) FROM invoice_budget_lines ibl INNER JOIN household_item_budgets hib ON ibl.household_item_budget_id = hib.id WHERE hib.household_item_id = household_items.id), 0)), 0)`,
+      actualCostMax: sql<number>`COALESCE(MAX(COALESCE((SELECT SUM(ibl.itemized_amount) FROM invoice_budget_lines ibl INNER JOIN household_item_budgets hib ON ibl.household_item_budget_id = hib.id WHERE hib.household_item_id = household_items.id), 0)), 0)`,
+      budgetLinesMin: sql<number>`COALESCE(MIN(COALESCE((SELECT COUNT(*) FROM household_item_budgets WHERE household_item_id = household_items.id), 0)), 0)`,
+      budgetLinesMax: sql<number>`COALESCE(MAX(COALESCE((SELECT COUNT(*) FROM household_item_budgets WHERE household_item_id = household_items.id), 0)), 0)`,
+    })
+    .from(householdItems)
+    .where(baseWhereClause)
+    .get();
+
+  // Build full conditions with numeric range filters for main query
+  const conditions = [...baseConditions];
+
+  // Filter by budget line count
+  if (query.budgetLinesMin !== undefined) {
+    conditions.push(
+      sql`(SELECT COUNT(*) FROM ${householdItemBudgets} WHERE ${householdItemBudgets.householdItemId} = ${householdItems.id}) >= ${query.budgetLinesMin}`,
+    );
+  }
+  if (query.budgetLinesMax !== undefined) {
+    conditions.push(
+      sql`(SELECT COUNT(*) FROM ${householdItemBudgets} WHERE ${householdItemBudgets.householdItemId} = ${householdItems.id}) <= ${query.budgetLinesMax}`,
+    );
+  }
+
+  // Filter by planned cost
+  if (query.plannedCostMin !== undefined) {
+    conditions.push(
+      sql`COALESCE((SELECT SUM(${householdItemBudgets.plannedAmount}) FROM ${householdItemBudgets} WHERE ${householdItemBudgets.householdItemId} = ${householdItems.id}), 0) >= ${query.plannedCostMin}`,
+    );
+  }
+  if (query.plannedCostMax !== undefined) {
+    conditions.push(
+      sql`COALESCE((SELECT SUM(${householdItemBudgets.plannedAmount}) FROM ${householdItemBudgets} WHERE ${householdItemBudgets.householdItemId} = ${householdItems.id}), 0) <= ${query.plannedCostMax}`,
+    );
+  }
+
+  // Filter by actual cost (from invoices)
+  if (query.actualCostMin !== undefined) {
+    conditions.push(
+      sql`COALESCE((SELECT SUM(ibl.itemized_amount) FROM invoice_budget_lines ibl INNER JOIN household_item_budgets hib ON ibl.household_item_budget_id = hib.id WHERE hib.household_item_id = household_items.id), 0) >= ${query.actualCostMin}`,
+    );
+  }
+  if (query.actualCostMax !== undefined) {
+    conditions.push(
+      sql`COALESCE((SELECT SUM(ibl.itemized_amount) FROM invoice_budget_lines ibl INNER JOIN household_item_budgets hib ON ibl.household_item_budget_id = hib.id WHERE hib.household_item_id = household_items.id), 0) <= ${query.actualCostMax}`,
+    );
+  }
+
+  const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+  // Count total items
+  const countResult = db
+    .select({ count: sql<number>`COUNT(*)` })
+    .from(householdItems)
+    .where(whereClause)
+    .get();
+  const totalItems = countResult?.count ?? 0;
+  const totalPages = Math.ceil(totalItems / pageSize);
+
+  // Build ORDER BY
+  const sortColumn =
+    sortBy === 'name'
+      ? householdItems.name
+      : sortBy === 'category'
+        ? householdItems.categoryId
+        : sortBy === 'status'
+          ? householdItems.status
+          : sortBy === 'order_date'
+            ? householdItems.orderDate
+            : sortBy === 'target_delivery_date'
+              ? householdItems.targetDeliveryDate
+              : sortBy === 'updated_at'
+                ? householdItems.updatedAt
+                : householdItems.createdAt;
+
+  const orderBy = sortOrder === 'asc' ? asc(sortColumn) : desc(sortColumn);
+
+  // Load area map once for all items
+  const areaMap = loadAreaMap(db);
+
+  // Fetch paginated items
+  const offset = (page - 1) * pageSize;
+  const itemRows = db
+    .select()
+    .from(householdItems)
+    .where(whereClause)
+    .orderBy(orderBy)
+    .limit(pageSize)
+    .offset(offset)
+    .all();
+
+  const items = itemRows.map((item) => toHouseholdItemSummary(db, item, areaMap));
+
+  const filterMeta: FilterMeta = {
+    plannedCost: { min: metaRow?.plannedCostMin ?? 0, max: metaRow?.plannedCostMax ?? 0 },
+    actualCost: { min: metaRow?.actualCostMin ?? 0, max: metaRow?.actualCostMax ?? 0 },
+    budgetLines: { min: metaRow?.budgetLinesMin ?? 0, max: metaRow?.budgetLinesMax ?? 0 },
+  };
+
+  return {
+    items,
+    pagination: {
+      page,
+      pageSize,
+      totalItems,
+      totalPages,
+    },
+    filterMeta,
+  };
+}

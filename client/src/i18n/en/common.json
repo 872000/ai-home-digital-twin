@@ -1,0 +1,184 @@
+{
+  "nav": {
+    "project": "Project",
+    "budget": "Budget",
+    "schedule": "Schedule",
+    "diary": "Diary",
+    "settings": "Settings"
+  },
+  "name": "Name",
+  "noArea": "No Area",
+  "noAreaDescription": "No Area — show items without an area assignment",
+  "button": {
+    "logout": "Logout",
+    "close": "Close",
+    "save": "Save",
+    "cancel": "Cancel",
+    "delete": "Delete",
+    "edit": "Edit",
+    "add": "Add",
+    "create": "Create",
+    "confirm": "Confirm",
+    "back": "Back",
+    "search": "Search",
+    "clearFilters": "Clear Filters",
+    "next": "Next",
+    "retry": "Retry"
+  },
+  "optional": "(optional)",
+  "aria": {
+    "closeMenu": "Close menu",
+    "openMenu": "Open menu",
+    "goToOverview": "Go to project overview",
+    "closeDialog": "Close dialog",
+    "clearSelection": "Clear selection",
+    "noArea": "No area",
+    "noTrade": "No trade",
+    "noOrientation": "No orientation",
+    "selectArea": "Select an area",
+    "selectTrade": "Select a trade",
+    "selectOrientation": "Select an orientation",
+    "selectAssignment": "Select user or vendor",
+    "unassigned": "Unassigned",
+    "mainNavigation": "Main navigation"
+  },
+  "loading": "Loading...",
+  "searching": "Searching...",
+  "appName": "Cornerstone",
+  "search": {
+    "placeholder": "Search items...",
+    "emptyHint": "Type to search items",
+    "noResults": "No matching items found",
+    "loadError": "Failed to load items",
+    "searchError": "Failed to search items"
+  },
+  "status": {
+    "notStarted": "Not Started",
+    "inProgress": "In Progress",
+    "completed": "Completed",
+    "onHold": "On Hold",
+    "cancelled": "Cancelled"
+  },
+  "theme": {
+    "light": "Light",
+    "dark": "Dark",
+    "system": "System",
+    "switchTo": "Switch to {{mode}} mode",
+    "current": "Current: {{current}} — click to switch to {{next}}"
+  },
+  "notFound": {
+    "title": "404 - Page Not Found",
+    "description": "The page you are looking for does not exist or has been moved.",
+    "backLink": "Go back to Project Overview"
+  },
+  "tagPicker": {
+    "placeholderEmpty": "Add tags...",
+    "placeholderMore": "Add more...",
+    "createHeader": "Create new tag:",
+    "colorLabel": "Color:",
+    "createButton": "Create Tag",
+    "creating": "Creating...",
+    "createError": "Failed to create tag. Please try again.",
+    "noMatchingTags": "No matching tags found",
+    "noMoreTags": "No more tags available"
+  },
+  "tagPill": {
+    "removeAriaLabel": "Remove tag {{name}}"
+  },
+  "keyboardShortcuts": {
+    "title": "Keyboard Shortcuts",
+    "closeAriaLabel": "Close",
+    "keyColumn": "Key",
+    "actionColumn": "Action"
+  },
+  "toast": {
+    "dismissAriaLabel": "Dismiss notification"
+  },
+  "actions": "Actions",
+  "assignmentPicker": {
+    "usersGroup": "Users",
+    "vendorsGroup": "Vendors"
+  },
+  "subnav": {
+    "project": {
+      "overview": "Overview",
+      "workItems": "Work Items",
+      "householdItems": "Household Items",
+      "milestones": "Milestones"
+    },
+    "budget": {
+      "overview": "Overview",
+      "invoices": "Invoices",
+      "sources": "Sources",
+      "subsidies": "Subsidies",
+      "reports": "Reports"
+    },
+    "settings": {
+      "profile": "Profile",
+      "manage": "Manage",
+      "vendors": "Vendors",
+      "userManagement": "User Management",
+      "backups": "Backups"
+    }
+  },
+  "dataTable": {
+    "search": {
+      "placeholder": "Search...",
+      "ariaLabel": "Search items"
+    },
+    "filter": {
+      "all": "All",
+      "yes": "Yes",
+      "no": "No",
+      "min": "Min",
+      "max": "Max",
+      "from": "From",
+      "to": "To",
+      "clearFilter": "Clear",
+      "applyFilter": "Apply",
+      "filterByColumn": "Filter by {{column}}",
+      "textPlaceholder": "Search...",
+      "searchPlaceholder": "Search...",
+      "booleanAriaLabel": "Boolean filter",
+      "selectAll": "Select All",
+      "selectNone": "Select None",
+      "dateRangeAriaLabel": "Date range picker"
+    },
+    "sort": {
+      "ascending": "Sort ascending",
+      "descending": "Sort descending",
+      "none": "No sort",
+      "ariaLabel": "Sort by {{column}}"
+    },
+    "columnSettings": {
+      "ariaLabel": "Column settings",
+      "title": "Visible columns",
+      "resetToDefaults": "Reset to defaults",
+      "dragHandleAriaLabel": "Drag to reorder {{column}} column",
+      "saveError": "Failed to save column settings"
+    },
+    "pagination": {
+      "showing": "Showing {{from}}–{{to}} of {{total}} items",
+      "page": "Page {{page}} of {{totalPages}}",
+      "previous": "Previous",
+      "next": "Next",
+      "pageSize": "Per page"
+    },
+    "empty": {
+      "defaultMessage": "No items found",
+      "filteredMessage": "No items match the current filters"
+    },
+    "loading": "Loading table data..."
+  },
+  "dateRangePicker": {
+    "previousMonth": "Previous month",
+    "nextMonth": "Next month",
+    "selectStart": "Select start date",
+    "selectEnd": "Select end date",
+    "calendarGridAriaLabel": "Calendar"
+  },
+  "chunkError": {
+    "message": "The application could not load a required file. This usually happens after an update.",
+    "refreshButton": "Refresh page"
+  }
+}

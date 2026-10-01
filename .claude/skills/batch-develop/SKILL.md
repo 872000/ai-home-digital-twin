@@ -1,0 +1,141 @@
+---
+name: batch-develop
+description: 'Reads /tmp/batch-queue.md and runs /develop for each line sequentially. Each line gets its own branch, PR, and full development cycle. Skips /develop step 1 (Rebase) since it handles its own baseline reset.'
+---
+
+# Batch Develop — Sequential Development from Notes File
+
+You are the orchestrator running a sequential development pipeline. This skill accepts a list of GitHub issue numbers (as arguments) or reads `/tmp/batch-queue.md`, and invokes the `/develop` workflow for each item, one at a time. Each item gets its own branch, PR, and full development cycle.
+
+**When to use:** Processing a backlog of issues or bug descriptions listed in `/tmp/batch-queue.md`, where each item should be developed independently.
+**When NOT to use:** When items should be batched into a single PR — use `/develop @<file>` with any ad-hoc list file instead; do NOT use `/tmp/notes.md` (reserved for `/release` feedback) or `/tmp/batch-queue.md` (this skill's queue). When running a full epic lifecycle (use `/epic-run`).
+
+## Input
+
+`$ARGUMENTS` determines the input source:
+
+- **Issue list**: `$ARGUMENTS` contains issue numbers (e.g., `#741 #742 #743` or `741, 742, 743` or `#741 #742`). Any combination of `#N` or bare `N` separated by spaces, commas, or semicolons.
+- **File mode** (no arguments): When `$ARGUMENTS` is empty, falls back to reading `/tmp/batch-queue.md`. If the file does not exist or is empty, ask the user to provide issue numbers or create the file before proceeding.
+
+### File Format (when using `/tmp/batch-queue.md`)
+
+`/tmp/batch-queue.md` contains one item per line:
+
+- **Issue number**: `#42` or `42`
+- **Bug/feature description**: Free-text description
+- **Empty lines**: Skipped
+- **Comment lines** (starting with `#`): Skipped — but note that `#42` (digits after `#`) is treated as an issue number, not a comment
+
+## Task Tracking
+
+Use tasks to track progress across the batch.
+
+**Create these tasks upfront** (using `TaskCreate`):
+
+1. **Read and parse queue** — Parse input arguments or /tmp/batch-queue.md into items queue
+2. **Session setup** — Fetch latest beta, sync wiki
+
+**After parsing** — create one task per item in the queue:
+
+3–N. **Item #\<issue-number\>: \<title or description\>** — Full /develop cycle for this item
+
+**After all items complete:**
+
+- **Print summary** — Final batch results summary
+
+Standard task-tracking rules apply — see CLAUDE.md > "Skill Task Tracking".
+
+## Steps
+
+### 1. Read and Parse
+
+**If `$ARGUMENTS` contains issue numbers:** Extract all issue numbers from the arguments (strip `#` prefixes, commas, semicolons). Each number becomes an item in the queue.
+
+**If `$ARGUMENTS` is empty:** Read `/tmp/batch-queue.md`. Parse each non-empty, non-comment line into an ordered **items queue**.
+
+Print the queue:
+
+```
+Batch Develop Queue:
+  1. #42 — (issue reference)
+  2. The login page crashes on mobile — (description)
+  3. #55 — (issue reference)
+  ...
+Total: N items
+```
+
+If the queue is empty, inform the user and stop.
+
+### 2. Session Setup
+
+Fetch latest state:
+
+```
+git fetch origin beta
+```
+
+Sync wiki:
+
+```
+git submodule update --init wiki && git -C wiki pull origin master
+```
+
+### 3. Sequential Processing Loop
+
+For each item in the queue:
+
+#### 3a. Reset to Beta
+
+Start each item from a clean `beta` baseline:
+
+```
+git checkout -B batch-dev-temp origin/beta
+```
+
+#### 3b. Invoke /develop
+
+Invoke the `/develop` skill with the current item as `$ARGUMENTS`. The `/develop` skill handles the full cycle (steps 1–11): resolve issue → visual spec → branch → move to in progress → implement + test → verify PR → review → fix loop → merge → close.
+
+**Note:** Skip `/develop` step 1 (Rebase) — the baseline reset is already handled by step 3a above. Execute `/develop` steps 2–11 for each item, **except step 11's worktree/branch cleanup item** — the batch session must stay in the same worktree to process the next item. Do not let `/develop` run its worktree removal mid-batch; that step only runs once, after the entire queue is processed (see step 5, Session Cleanup, below). Per-item local branches are left in place during the loop rather than individually deleted — this avoids the checkout-conflict fragility of deleting a branch that a subsequent iteration's `git checkout -B` may still be touching, at the cost of leaving a handful of merged local branches for the final cleanup (or a manual `git branch --merged beta` sweep) to catch.
+
+#### 3c. Track Result
+
+After `/develop` completes for the item:
+
+- **Success** (PR merged, issue closed): Add to completed list. If in file mode, remove the line from `/tmp/batch-queue.md`.
+- **Failure** (retry budget exhausted or error): Add to failed list, continue to next item. If in file mode, keep the line in `/tmp/batch-queue.md`.
+
+#### 3d. Progress Update
+
+After each item, print progress:
+
+```
+Progress: N/M complete | Completed: #42, #55 | Failed: none | Remaining: N
+```
+
+### 4. Summary
+
+After all items are processed, print a final summary:
+
+```
+Batch Develop Complete
+======================
+Total items:  N
+Completed:    N — #42, #55, #61
+Failed:       N — #88 (reason)
+Remaining in /tmp/batch-queue.md: N lines
+```
+
+In file mode: if all items succeeded, `/tmp/batch-queue.md` will be empty (or contain only comments). If any failed, the file retains those lines for a future run.
+
+### 5. Session Cleanup
+
+After the batch completes (all items processed, summary printed), clean up the worktree — the batch-deferred equivalent of `/develop` step 11's cleanup item. Run from the **base repository**:
+
+```bash
+bash scripts/worktree-done.sh <worktree-path> <branch>
+```
+
+The script verifies the tree is clean, removes the worktree (handling the wiki-submodule refusal), and deletes the branch only when a merged PR exists. If the worktree ended on a purely local branch with no PR of its own (e.g., a leftover `batch-dev-temp`), pass `FORCE_BRANCH_DELETE=1` to delete it anyway.
+
+**Skip this step** if any items in the batch failed and remain unresolved in the queue file, or if the worktree has uncommitted changes — leave it in place for manual follow-up in that case.

@@ -1,0 +1,430 @@
+/**
+ * @jest-environment jsdom
+ *
+ * Smoke tests for TimelinePage — verifies the page renders without crashing
+ * in a router context. Comprehensive tests for the Gantt chart functionality
+ * are owned by the qa-integration-tester agent.
+ */
+import { jest, describe, it, expect, beforeEach } from '@jest/globals';
+import { render, screen, fireEvent } from '@testing-library/react';
+import { MemoryRouter, useLocation } from 'react-router-dom';
+import type * as TimelineApiTypes from '../../lib/timelineApi.js';
+import type * as MilestonesApiTypes from '../../lib/milestonesApi.js';
+import type { TimelineResponse } from '@cornerstone/shared';
+import type React from 'react';
+
+/** Renders the current router location pathname into a data-testid for navigation assertions. */
+function LocationDisplay() {
+  const location = useLocation();
+  return <div data-testid="location-display">{location.pathname}</div>;
+}
+
+const mockGetTimeline = jest.fn<typeof TimelineApiTypes.getTimeline>();
+
+jest.unstable_mockModule('../../lib/timelineApi.js', () => ({
+  getTimeline: mockGetTimeline,
+}));
+
+// Mock milestonesApi so useMilestones doesn't make real network calls.
+const mockListMilestones = jest.fn<typeof MilestonesApiTypes.listMilestones>();
+jest.unstable_mockModule('../../lib/milestonesApi.js', () => ({
+  listMilestones: mockListMilestones,
+  getMilestone: jest.fn<typeof MilestonesApiTypes.getMilestone>(),
+  createMilestone: jest.fn<typeof MilestonesApiTypes.createMilestone>(),
+  updateMilestone: jest.fn<typeof MilestonesApiTypes.updateMilestone>(),
+  deleteMilestone: jest.fn<typeof MilestonesApiTypes.deleteMilestone>(),
+  linkWorkItem: jest.fn<typeof MilestonesApiTypes.linkWorkItem>(),
+  unlinkWorkItem: jest.fn<typeof MilestonesApiTypes.unlinkWorkItem>(),
+  addDependentWorkItem: jest.fn<typeof MilestonesApiTypes.addDependentWorkItem>(),
+  removeDependentWorkItem: jest.fn<typeof MilestonesApiTypes.removeDependentWorkItem>(),
+}));
+
+// Mock useToast so TimelinePage can render without a ToastProvider wrapper.
+jest.unstable_mockModule('../../components/Toast/ToastContext.js', () => ({
+  ToastProvider: ({ children }: { children: React.ReactNode }) => children,
+  useToast: () => ({
+    toasts: [],
+    showToast: jest.fn(),
+    dismissToast: jest.fn(),
+  }),
+}));
+
+const EMPTY_TIMELINE: TimelineResponse = {
+  workItems: [],
+  dependencies: [],
+  milestones: [],
+  householdItems: [],
+  criticalPath: [],
+  dateRange: null,
+};
+
+describe('TimelinePage', () => {
+  let TimelinePage: React.ComponentType;
+  let parseFilterParam: (raw: string | null) => ReadonlySet<string>;
+  let serializeFilterParam: (active: ReadonlySet<string>) => string;
+
+  beforeEach(async () => {
+    if (!TimelinePage) {
+      const module = await import('./TimelinePage.js');
+      TimelinePage = module.TimelinePage;
+      parseFilterParam = module.parseFilterParam as (raw: string | null) => ReadonlySet<string>;
+      serializeFilterParam = module.serializeFilterParam as (active: ReadonlySet<string>) => string;
+    }
+
+    mockGetTimeline.mockResolvedValue(EMPTY_TIMELINE);
+    mockListMilestones.mockResolvedValue([]);
+  });
+
+  function renderWithRouter(initialEntries?: string[]) {
+    return render(
+      <MemoryRouter initialEntries={initialEntries}>
+        <TimelinePage />
+        <LocationDisplay />
+      </MemoryRouter>,
+    );
+  }
+
+  it('renders Schedule heading', () => {
+    renderWithRouter();
+    expect(screen.getByRole('heading', { name: /schedule/i })).toBeInTheDocument();
+  });
+
+  it('renders zoom level toggle controls', () => {
+    renderWithRouter();
+    expect(screen.getByRole('toolbar', { name: /zoom level/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /day/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /week/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /month/i })).toBeInTheDocument();
+  });
+
+  it('shows loading skeleton while fetching', () => {
+    // Leave in loading state by never resolving the promise
+    mockGetTimeline.mockReturnValue(new Promise(() => {}));
+    renderWithRouter();
+    expect(screen.getByTestId('gantt-chart-skeleton')).toBeInTheDocument();
+  });
+
+  // ---------------------------------------------------------------------------
+  // parseFilterParam — unit tests for the exported helper
+  // ---------------------------------------------------------------------------
+
+  describe('parseFilterParam', () => {
+    it('returns all 3 entity types when raw is null', () => {
+      const result = parseFilterParam(null);
+      expect(result.has('work-items')).toBe(true);
+      expect(result.has('milestones')).toBe(true);
+      expect(result.has('household-items')).toBe(true);
+      expect(result.size).toBe(3);
+    });
+
+    it('parses "work-items,milestones" into a 2-element set', () => {
+      const result = parseFilterParam('work-items,milestones');
+      expect(result.has('work-items')).toBe(true);
+      expect(result.has('milestones')).toBe(true);
+      expect(result.has('household-items')).toBe(false);
+      expect(result.size).toBe(2);
+    });
+
+    it('parses a single valid value "milestones"', () => {
+      const result = parseFilterParam('milestones');
+      expect(result.has('milestones')).toBe(true);
+      expect(result.size).toBe(1);
+    });
+
+    it('falls back to all types when raw contains only invalid values', () => {
+      const result = parseFilterParam('bad-value');
+      expect(result.size).toBe(3);
+      expect(result.has('work-items')).toBe(true);
+      expect(result.has('milestones')).toBe(true);
+      expect(result.has('household-items')).toBe(true);
+    });
+
+    it('filters out invalid tokens and keeps valid ones', () => {
+      const result = parseFilterParam('work-items,bad-value,milestones');
+      expect(result.has('work-items')).toBe(true);
+      expect(result.has('milestones')).toBe(true);
+      expect(result.has('household-items')).toBe(false);
+      expect(result.size).toBe(2);
+    });
+
+    it('falls back to all types when raw is an empty string', () => {
+      const result = parseFilterParam('');
+      expect(result.size).toBe(3);
+      expect(result.has('work-items')).toBe(true);
+      expect(result.has('milestones')).toBe(true);
+      expect(result.has('household-items')).toBe(true);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // serializeFilterParam — unit tests for the exported helper
+  // ---------------------------------------------------------------------------
+
+  describe('serializeFilterParam', () => {
+    it('serializes all 3 entity types in canonical order', () => {
+      const result = serializeFilterParam(new Set(['work-items', 'milestones', 'household-items']));
+      expect(result).toBe('work-items,milestones,household-items');
+    });
+
+    it('serializes a single entity type', () => {
+      const result = serializeFilterParam(new Set(['milestones']));
+      expect(result).toBe('milestones');
+    });
+
+    it('serializes an unordered set in canonical ALL_ENTITY_TYPES order', () => {
+      // Set contains household-items before work-items, but output must follow canonical order
+      const result = serializeFilterParam(new Set(['household-items', 'work-items']));
+      expect(result).toBe('work-items,household-items');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Entity filter group rendering
+  // ---------------------------------------------------------------------------
+
+  describe('entity filter group rendering', () => {
+    it('renders a group with aria-label "Entity filter"', () => {
+      renderWithRouter();
+      expect(screen.getByRole('group', { name: /entity filter/i })).toBeInTheDocument();
+    });
+
+    it('renders three filter buttons all pressed by default', () => {
+      renderWithRouter();
+      const workItemsBtn = screen.getByTestId('entity-filter-work-items');
+      const milestonesBtn = screen.getByTestId('entity-filter-milestones');
+      const householdItemsBtn = screen.getByTestId('entity-filter-household-items');
+
+      expect(workItemsBtn).toHaveAttribute('aria-pressed', 'true');
+      expect(milestonesBtn).toHaveAttribute('aria-pressed', 'true');
+      expect(householdItemsBtn).toHaveAttribute('aria-pressed', 'true');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Toggling entity filter buttons
+  // ---------------------------------------------------------------------------
+
+  describe('entity filter button toggling', () => {
+    it('marks milestones button inactive after clicking it', () => {
+      renderWithRouter();
+      const milestonesBtn = screen.getByTestId('entity-filter-milestones');
+
+      expect(milestonesBtn).toHaveAttribute('aria-pressed', 'true');
+      fireEvent.click(milestonesBtn);
+      expect(milestonesBtn).toHaveAttribute('aria-pressed', 'false');
+    });
+
+    it('disables the last-active button so the user cannot hide all entities', () => {
+      renderWithRouter(['/schedule?filter=milestones']);
+      const milestonesBtn = screen.getByTestId('entity-filter-milestones');
+      const workItemsBtn = screen.getByTestId('entity-filter-work-items');
+      const householdItemsBtn = screen.getByTestId('entity-filter-household-items');
+
+      expect(milestonesBtn).toBeDisabled();
+      expect(workItemsBtn).toHaveAttribute('aria-pressed', 'false');
+      expect(householdItemsBtn).toHaveAttribute('aria-pressed', 'false');
+    });
+
+    it('restores an entity when its hidden button is clicked', () => {
+      renderWithRouter(['/schedule?filter=work-items']);
+      const milestonesBtn = screen.getByTestId('entity-filter-milestones');
+
+      expect(milestonesBtn).toHaveAttribute('aria-pressed', 'false');
+      fireEvent.click(milestonesBtn);
+      expect(milestonesBtn).toHaveAttribute('aria-pressed', 'true');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // URL param initialises filter state
+  // ---------------------------------------------------------------------------
+
+  describe('entity filter URL param initialisation', () => {
+    it('shows only work items active when URL has ?filter=work-items', () => {
+      renderWithRouter(['/schedule?filter=work-items']);
+      expect(screen.getByTestId('entity-filter-work-items')).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      );
+      expect(screen.getByTestId('entity-filter-milestones')).toHaveAttribute(
+        'aria-pressed',
+        'false',
+      );
+      expect(screen.getByTestId('entity-filter-household-items')).toHaveAttribute(
+        'aria-pressed',
+        'false',
+      );
+    });
+
+    it('falls back to all entities shown when URL has an invalid filter param', () => {
+      renderWithRouter(['/schedule?filter=invalid-value']);
+      expect(screen.getByTestId('entity-filter-work-items')).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      );
+      expect(screen.getByTestId('entity-filter-milestones')).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      );
+      expect(screen.getByTestId('entity-filter-household-items')).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Filter group visible in calendar view
+  // ---------------------------------------------------------------------------
+
+  describe('entity filter in calendar view', () => {
+    it('shows the entity filter group when the route is /schedule/calendar', () => {
+      renderWithRouter(['/schedule/calendar']);
+      expect(screen.getByRole('group', { name: /entity filter/i })).toBeInTheDocument();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Add entity dropdown (renamed from "New" to "Add" in issue #1050)
+  // ---------------------------------------------------------------------------
+
+  describe('Add entity dropdown', () => {
+    it('"Add" button renders on Gantt view', () => {
+      renderWithRouter();
+      expect(screen.getByTestId('timeline-add-button')).toBeInTheDocument();
+    });
+
+    it('"Add" button renders on Calendar view', () => {
+      renderWithRouter(['/schedule/calendar']);
+      expect(screen.getByTestId('timeline-add-button')).toBeInTheDocument();
+    });
+
+    it('"Add" button has text "Add"', () => {
+      renderWithRouter();
+      expect(screen.getByTestId('timeline-add-button')).toHaveTextContent('Add');
+    });
+
+    it('dropdown is initially closed — no menu in document', () => {
+      renderWithRouter();
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    });
+
+    it('clicking "Add" opens the dropdown with menu items', () => {
+      renderWithRouter();
+      fireEvent.click(screen.getByTestId('timeline-add-button'));
+      expect(screen.getByRole('menu')).toBeInTheDocument();
+      expect(screen.getByTestId('timeline-add-work-item')).toBeInTheDocument();
+      expect(screen.getByTestId('timeline-add-household-item')).toBeInTheDocument();
+      expect(screen.getByTestId('timeline-add-milestone')).toBeInTheDocument();
+    });
+
+    it('menu items have "New ..." prefix labels', () => {
+      renderWithRouter();
+      fireEvent.click(screen.getByTestId('timeline-add-button'));
+      expect(screen.getByTestId('timeline-add-work-item')).toHaveTextContent('New Work Item');
+      expect(screen.getByTestId('timeline-add-household-item')).toHaveTextContent(
+        'New Household Item',
+      );
+      expect(screen.getByTestId('timeline-add-milestone')).toHaveTextContent('New Milestone');
+    });
+
+    it('clicking "Add" again closes the dropdown (toggle)', () => {
+      renderWithRouter();
+      const addButton = screen.getByTestId('timeline-add-button');
+      fireEvent.click(addButton);
+      expect(screen.getByRole('menu')).toBeInTheDocument();
+      fireEvent.click(addButton);
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    });
+
+    it('pressing Escape closes the dropdown', () => {
+      renderWithRouter();
+      fireEvent.click(screen.getByTestId('timeline-add-button'));
+      expect(screen.getByRole('menu')).toBeInTheDocument();
+      fireEvent.keyDown(document, { key: 'Escape' });
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    });
+
+    it('clicking outside the dropdown closes it', () => {
+      renderWithRouter();
+      fireEvent.click(screen.getByTestId('timeline-add-button'));
+      expect(screen.getByRole('menu')).toBeInTheDocument();
+      fireEvent.mouseDown(document.body);
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    });
+
+    it('"New Work Item" menu item navigates to /project/work-items/new', () => {
+      renderWithRouter();
+      fireEvent.click(screen.getByTestId('timeline-add-button'));
+      fireEvent.click(screen.getByTestId('timeline-add-work-item'));
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+      expect(screen.getByTestId('location-display')).toHaveTextContent('/project/work-items/new');
+    });
+
+    it('"New Household Item" menu item navigates to /project/household-items/new', () => {
+      renderWithRouter();
+      fireEvent.click(screen.getByTestId('timeline-add-button'));
+      fireEvent.click(screen.getByTestId('timeline-add-household-item'));
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+      expect(screen.getByTestId('location-display')).toHaveTextContent(
+        '/project/household-items/new',
+      );
+    });
+
+    it('"New Milestone" menu item navigates to /project/milestones/new', () => {
+      renderWithRouter();
+      fireEvent.click(screen.getByTestId('timeline-add-button'));
+      fireEvent.click(screen.getByTestId('timeline-add-milestone'));
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+      expect(screen.getByTestId('location-display')).toHaveTextContent('/project/milestones/new');
+    });
+
+    it('"Add" button has aria-haspopup="menu"', () => {
+      renderWithRouter();
+      expect(screen.getByTestId('timeline-add-button')).toHaveAttribute('aria-haspopup', 'menu');
+    });
+
+    it('"Add" button aria-expanded is false when closed', () => {
+      renderWithRouter();
+      expect(screen.getByTestId('timeline-add-button')).toHaveAttribute('aria-expanded', 'false');
+    });
+
+    it('"Add" button aria-expanded is true when open', () => {
+      renderWithRouter();
+      fireEvent.click(screen.getByTestId('timeline-add-button'));
+      expect(screen.getByTestId('timeline-add-button')).toHaveAttribute('aria-expanded', 'true');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // ScheduleSubNav integration
+  // ---------------------------------------------------------------------------
+
+  describe('ScheduleSubNav integration', () => {
+    it('renders the ScheduleSubNav with aria-label "Schedule section navigation"', () => {
+      renderWithRouter();
+      expect(
+        screen.getByRole('navigation', { name: /schedule section navigation/i }),
+      ).toBeInTheDocument();
+    });
+
+    it('renders both Gantt and Calendar tabs', () => {
+      renderWithRouter();
+      expect(screen.getByTestId('schedule-view-gantt')).toBeInTheDocument();
+      expect(screen.getByTestId('schedule-view-calendar')).toBeInTheDocument();
+    });
+
+    it('Gantt tab links to /schedule/gantt', () => {
+      renderWithRouter();
+      expect(screen.getByTestId('schedule-view-gantt')).toHaveAttribute('href', '/schedule/gantt');
+    });
+
+    it('Calendar tab links to /schedule/calendar', () => {
+      renderWithRouter();
+      expect(screen.getByTestId('schedule-view-calendar')).toHaveAttribute(
+        'href',
+        '/schedule/calendar',
+      );
+    });
+  });
+});

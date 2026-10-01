@@ -1,0 +1,184 @@
+{
+  "nav": {
+    "project": "Projekt",
+    "budget": "Budget",
+    "schedule": "Zeitplan",
+    "diary": "Tagebuch",
+    "settings": "Einstellungen"
+  },
+  "name": "Name",
+  "noArea": "Kein Bereich",
+  "noAreaDescription": "Kein Bereich — Elemente ohne Bereichszuweisung anzeigen",
+  "button": {
+    "logout": "Abmelden",
+    "close": "Schließen",
+    "save": "Speichern",
+    "cancel": "Abbrechen",
+    "delete": "Löschen",
+    "edit": "Bearbeiten",
+    "add": "Hinzufügen",
+    "create": "Erstellen",
+    "confirm": "Bestätigen",
+    "back": "Zurück",
+    "search": "Suchen",
+    "clearFilters": "Filter zurücksetzen",
+    "next": "Weiter",
+    "retry": "Erneut versuchen"
+  },
+  "optional": "(optional)",
+  "aria": {
+    "closeMenu": "Menü schließen",
+    "openMenu": "Menü öffnen",
+    "goToOverview": "Zur Projektübersicht",
+    "closeDialog": "Dialog schließen",
+    "clearSelection": "Auswahl aufheben",
+    "noArea": "Kein Bereich",
+    "noTrade": "Kein Gewerk",
+    "noOrientation": "Keine Ausrichtung",
+    "selectArea": "Bereich auswählen",
+    "selectTrade": "Gewerk auswählen",
+    "selectOrientation": "Ausrichtung auswählen",
+    "selectAssignment": "Benutzer oder Auftragnehmer auswählen",
+    "unassigned": "Nicht zugewiesen",
+    "mainNavigation": "Hauptnavigation"
+  },
+  "loading": "Wird geladen...",
+  "searching": "Suche läuft...",
+  "appName": "Cornerstone",
+  "search": {
+    "placeholder": "Elemente suchen...",
+    "emptyHint": "Zum Suchen tippen",
+    "noResults": "Keine passenden Elemente gefunden",
+    "loadError": "Elemente konnten nicht geladen werden",
+    "searchError": "Suche fehlgeschlagen"
+  },
+  "status": {
+    "notStarted": "Nicht begonnen",
+    "inProgress": "In Bearbeitung",
+    "completed": "Abgeschlossen",
+    "onHold": "Pausiert",
+    "cancelled": "Abgebrochen"
+  },
+  "theme": {
+    "light": "Hell",
+    "dark": "Dunkel",
+    "system": "System",
+    "switchTo": "Zu {{mode}}-Modus wechseln",
+    "current": "Aktuell: {{current}} — klicken um zu {{next}} zu wechseln"
+  },
+  "notFound": {
+    "title": "404 - Seite nicht gefunden",
+    "description": "Die gesuchte Seite existiert nicht oder wurde verschoben.",
+    "backLink": "Zurück zur Projektübersicht"
+  },
+  "tagPicker": {
+    "placeholderEmpty": "Tags hinzufügen...",
+    "placeholderMore": "Weitere hinzufügen...",
+    "createHeader": "Neuen Tag erstellen:",
+    "colorLabel": "Farbe:",
+    "createButton": "Tag erstellen",
+    "creating": "Wird erstellt...",
+    "createError": "Tag konnte nicht erstellt werden. Bitte versuchen Sie es erneut.",
+    "noMatchingTags": "Keine passenden Tags gefunden",
+    "noMoreTags": "Keine weiteren Tags verfügbar"
+  },
+  "tagPill": {
+    "removeAriaLabel": "Tag {{name}} entfernen"
+  },
+  "keyboardShortcuts": {
+    "title": "Tastaturkürzel",
+    "closeAriaLabel": "Schließen",
+    "keyColumn": "Taste",
+    "actionColumn": "Aktion"
+  },
+  "toast": {
+    "dismissAriaLabel": "Benachrichtigung schließen"
+  },
+  "actions": "Aktionen",
+  "assignmentPicker": {
+    "usersGroup": "Benutzer",
+    "vendorsGroup": "Auftragnehmer"
+  },
+  "subnav": {
+    "project": {
+      "overview": "Übersicht",
+      "workItems": "Arbeitspakete",
+      "householdItems": "Haushaltsartikel",
+      "milestones": "Meilensteine"
+    },
+    "budget": {
+      "overview": "Übersicht",
+      "invoices": "Rechnungen",
+      "sources": "Geldquellen",
+      "subsidies": "Zuschüsse",
+      "reports": "Berichte"
+    },
+    "settings": {
+      "profile": "Profil",
+      "manage": "Verwalten",
+      "vendors": "Auftragnehmer",
+      "userManagement": "Benutzerverwaltung",
+      "backups": "Sicherungen"
+    }
+  },
+  "dataTable": {
+    "search": {
+      "placeholder": "Suchen...",
+      "ariaLabel": "Elemente suchen"
+    },
+    "filter": {
+      "all": "Alle",
+      "yes": "Ja",
+      "no": "Nein",
+      "min": "Min",
+      "max": "Max",
+      "from": "Von",
+      "to": "Bis",
+      "clearFilter": "Zurücksetzen",
+      "applyFilter": "Anwenden",
+      "filterByColumn": "Nach {{column}} filtern",
+      "textPlaceholder": "Suchen...",
+      "searchPlaceholder": "Suchen...",
+      "booleanAriaLabel": "Boolesche Filteroption",
+      "selectAll": "Alle auswählen",
+      "selectNone": "Keine auswählen",
+      "dateRangeAriaLabel": "Datumsbereichsauswahl"
+    },
+    "sort": {
+      "ascending": "Aufsteigend sortieren",
+      "descending": "Absteigend sortieren",
+      "none": "Keine Sortierung",
+      "ariaLabel": "Nach {{column}} sortieren"
+    },
+    "columnSettings": {
+      "ariaLabel": "Spalteneinstellungen",
+      "title": "Sichtbare Spalten",
+      "resetToDefaults": "Standardeinstellungen wiederherstellen",
+      "dragHandleAriaLabel": "{{column}}-Spalte zum Neuanordnen ziehen",
+      "saveError": "Spalteneinstellungen konnten nicht gespeichert werden"
+    },
+    "pagination": {
+      "showing": "Zeige {{from}}–{{to}} von {{total}} Einträgen",
+      "page": "Seite {{page}} von {{totalPages}}",
+      "previous": "Zurück",
+      "next": "Weiter",
+      "pageSize": "Pro Seite"
+    },
+    "empty": {
+      "defaultMessage": "Keine Einträge gefunden",
+      "filteredMessage": "Keine Einträge entsprechen den aktuellen Filtern"
+    },
+    "loading": "Tabellendaten werden geladen..."
+  },
+  "dateRangePicker": {
+    "previousMonth": "Vorheriger Monat",
+    "nextMonth": "Nächster Monat",
+    "selectStart": "Startdatum auswählen",
+    "selectEnd": "Enddatum auswählen",
+    "calendarGridAriaLabel": "Kalender"
+  },
+  "chunkError": {
+    "message": "Die Anwendung konnte eine erforderliche Datei nicht laden. Dies passiert normalerweise nach einem Update.",
+    "refreshButton": "Seite neu laden"
+  }
+}

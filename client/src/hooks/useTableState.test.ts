@@ -1,0 +1,522 @@
+import { renderHook, act } from '@testing-library/react';
+import { describe, it, expect, jest, afterEach } from '@jest/globals';
+import React from 'react';
+import { MemoryRouter } from 'react-router-dom';
+
+import { useTableState } from './useTableState.js';
+
+// Wrapper that provides React Router context required by useSearchParams
+function makeWrapper(initialEntries: string[] = ['/']) {
+  return ({ children }: { children: React.ReactNode }) =>
+    React.createElement(MemoryRouter, { initialEntries }, children);
+}
+
+describe('useTableState', () => {
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  describe('initial state', () => {
+    it('initializes with default values when URL has no params', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(),
+      });
+
+      expect(result.current.tableState.search).toBe('');
+      expect(result.current.tableState.sortBy).toBeNull();
+      expect(result.current.tableState.sortDir).toBeNull();
+      expect(result.current.tableState.page).toBe(1);
+      expect(result.current.tableState.pageSize).toBe(25);
+      expect(result.current.tableState.filters.size).toBe(0);
+    });
+
+    it('respects custom defaultPageSize option', () => {
+      const { result } = renderHook(() => useTableState({ defaultPageSize: 50 }), {
+        wrapper: makeWrapper(),
+      });
+      expect(result.current.tableState.pageSize).toBe(50);
+    });
+
+    it('initializes search from URL ?q= param', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?q=test+query']),
+      });
+      expect(result.current.tableState.search).toBe('test query');
+    });
+
+    it('initializes sortBy from URL ?sortBy= param', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?sortBy=title&sortOrder=asc']),
+      });
+      expect(result.current.tableState.sortBy).toBe('title');
+    });
+
+    it('initializes sortDir from URL ?sortOrder= param', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?sortBy=title&sortOrder=desc']),
+      });
+      expect(result.current.tableState.sortDir).toBe('desc');
+    });
+
+    it('initializes page from URL ?page= param', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?page=3']),
+      });
+      expect(result.current.tableState.page).toBe(3);
+    });
+
+    it('initializes filter from custom URL param', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?status=active']),
+      });
+      expect(result.current.tableState.filters.get('status')?.value).toBe('active');
+    });
+  });
+
+  describe('setSearch (immediate)', () => {
+    it('initializes searchInput from URL q param', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?q=initial']),
+      });
+      expect(result.current.searchInput).toBe('initial');
+    });
+
+    it('updates tableState.search immediately after setSearch', async () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(),
+      });
+
+      act(() => {
+        result.current.setSearch('hello');
+      });
+
+      expect(result.current.tableState.search).toBe('hello');
+    });
+
+    it('updates URL search params to include q= after setSearch', async () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(),
+      });
+
+      act(() => {
+        result.current.setSearch('foo');
+      });
+
+      expect(result.current.tableState.search).toBe('foo');
+      expect(result.current.toApiParams().q).toBe('foo');
+    });
+
+    it('resets page to 1 in URL when setSearch is called', async () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?page=5']),
+      });
+
+      act(() => {
+        result.current.setSearch('bar');
+      });
+
+      expect(result.current.tableState.page).toBe(1);
+    });
+
+    it('clearing search with setSearch("") removes q from tableState', async () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?q=existing']),
+      });
+
+      act(() => {
+        result.current.setSearch('');
+      });
+
+      expect(result.current.tableState.search).toBe('');
+      expect(result.current.toApiParams().q).toBeUndefined();
+    });
+
+    it('searchInput always equals tableState.search', async () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(),
+      });
+
+      act(() => {
+        result.current.setSearch('synced');
+      });
+
+      expect(result.current.searchInput).toBe(result.current.tableState.search);
+    });
+
+    it('search initialized from URL is reflected in tableState and toApiParams', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?q=hello']),
+      });
+
+      expect(result.current.tableState.search).toBe('hello');
+      expect(result.current.toApiParams().q).toBe('hello');
+    });
+
+    it('search and page are both initialized correctly from URL params', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?q=myquery&page=3']),
+      });
+
+      expect(result.current.tableState.search).toBe('myquery');
+      expect(result.current.tableState.page).toBe(3);
+      expect(result.current.searchInput).toBe('myquery');
+    });
+  });
+
+  describe('setFilter', () => {
+    it('adds a filter to the URL and tableState', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(),
+      });
+
+      act(() => {
+        result.current.setFilter('status', 'active');
+      });
+
+      expect(result.current.tableState.filters.get('status')?.value).toBe('active');
+    });
+
+    it('removes a filter when value is null', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?status=active']),
+      });
+
+      act(() => {
+        result.current.setFilter('status', null);
+      });
+
+      expect(result.current.tableState.filters.has('status')).toBe(false);
+    });
+
+    it('removes a filter when value is empty string', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?status=active']),
+      });
+
+      act(() => {
+        result.current.setFilter('status', '');
+      });
+
+      expect(result.current.tableState.filters.has('status')).toBe(false);
+    });
+
+    it('resets page to 1 when filter changes', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?page=5']),
+      });
+
+      act(() => {
+        result.current.setFilter('status', 'active');
+      });
+
+      expect(result.current.tableState.page).toBe(1);
+    });
+  });
+
+  describe('setSort — 3-state cycling', () => {
+    it('cycles from none to asc on first call', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(),
+      });
+
+      act(() => {
+        result.current.setSort('title');
+      });
+
+      expect(result.current.tableState.sortBy).toBe('title');
+      expect(result.current.tableState.sortDir).toBe('asc');
+    });
+
+    it('cycles from asc to desc on second call', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?sortBy=title&sortOrder=asc']),
+      });
+
+      act(() => {
+        result.current.setSort('title');
+      });
+
+      expect(result.current.tableState.sortBy).toBe('title');
+      expect(result.current.tableState.sortDir).toBe('desc');
+    });
+
+    it('cycles from desc to none on third call', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?sortBy=title&sortOrder=desc']),
+      });
+
+      act(() => {
+        result.current.setSort('title');
+      });
+
+      expect(result.current.tableState.sortBy).toBeNull();
+      expect(result.current.tableState.sortDir).toBeNull();
+    });
+
+    it('resets to asc when sorting a different column', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?sortBy=title&sortOrder=asc']),
+      });
+
+      act(() => {
+        result.current.setSort('amount');
+      });
+
+      expect(result.current.tableState.sortBy).toBe('amount');
+      expect(result.current.tableState.sortDir).toBe('asc');
+    });
+
+    it('uses columnSortKey over columnKey when provided', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(),
+      });
+
+      act(() => {
+        result.current.setSort('title', 'title_sort_key');
+      });
+
+      expect(result.current.tableState.sortBy).toBe('title_sort_key');
+    });
+  });
+
+  describe('setPage', () => {
+    it('updates page in tableState', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(),
+      });
+
+      act(() => {
+        result.current.setPage(3);
+      });
+
+      expect(result.current.tableState.page).toBe(3);
+    });
+  });
+
+  describe('setPageSize', () => {
+    it('updates pageSize in tableState', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(),
+      });
+
+      act(() => {
+        result.current.setPageSize(50);
+      });
+
+      expect(result.current.tableState.pageSize).toBe(50);
+    });
+
+    it('resets page to 1 when page size changes', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?page=5']),
+      });
+
+      act(() => {
+        result.current.setPageSize(50);
+      });
+
+      expect(result.current.tableState.page).toBe(1);
+    });
+  });
+
+  describe('toApiParams', () => {
+    it('returns page and pageSize at minimum', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(),
+      });
+
+      const params = result.current.toApiParams();
+      expect(params.page).toBe(1);
+      expect(params.pageSize).toBe(25);
+    });
+
+    it('includes q when search is active', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?q=search+term']),
+      });
+
+      const params = result.current.toApiParams();
+      expect(params.q).toBe('search term');
+    });
+
+    it('does not include q when search is empty', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(),
+      });
+
+      const params = result.current.toApiParams();
+      expect(params.q).toBeUndefined();
+    });
+
+    it('includes sortBy and sortOrder when sort is active', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?sortBy=title&sortOrder=asc']),
+      });
+
+      const params = result.current.toApiParams();
+      expect(params.sortBy).toBe('title');
+      expect(params.sortOrder).toBe('asc');
+    });
+
+    it('decomposes number range filter "min:100,max:500" into titleMin and titleMax', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?title=min:100,max:500']),
+      });
+
+      const params = result.current.toApiParams();
+      expect(params['titleMin']).toBe(100);
+      expect(params['titleMax']).toBe(500);
+    });
+
+    it('decomposes date range filter "from:2026-01-01,to:2026-12-31" into From and To', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?date=from:2026-01-01,to:2026-12-31']),
+      });
+
+      const params = result.current.toApiParams();
+      expect(params['dateFrom']).toBe('2026-01-01');
+      expect(params['dateTo']).toBe('2026-12-31');
+    });
+
+    it('passes through string filter values as-is', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?status=active']),
+      });
+
+      const params = result.current.toApiParams();
+      expect(params['status']).toBe('active');
+    });
+
+    it('passes through boolean filter values as-is', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?isActive=true']),
+      });
+
+      const params = result.current.toApiParams();
+      expect(params['isActive']).toBe('true');
+    });
+
+    it('handles only min in number range filter', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?amount=min:100']),
+      });
+
+      const params = result.current.toApiParams();
+      expect(params['amountMin']).toBe(100);
+      expect(params['amountMax']).toBeUndefined();
+    });
+
+    it('handles only to in date range filter', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?date=to:2026-12-31']),
+      });
+
+      const params = result.current.toApiParams();
+      expect(params['dateFrom']).toBeUndefined();
+      expect(params['dateTo']).toBe('2026-12-31');
+    });
+  });
+
+  describe('resetFilters', () => {
+    it('clears all filter params from URL', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?status=active&type=work&page=3']),
+      });
+
+      act(() => {
+        result.current.resetFilters();
+      });
+
+      expect(result.current.tableState.filters.size).toBe(0);
+    });
+
+    it('resets page to 1', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?page=5&status=active']),
+      });
+
+      act(() => {
+        result.current.resetFilters();
+      });
+
+      expect(result.current.tableState.page).toBe(1);
+    });
+  });
+
+  // ─── reservedParams (Story #2046) ───────────────────────────────────────────
+
+  // Hoisted so every renderHook() call passes the SAME array reference across
+  // re-renders — the hook's sync effect depends on `reservedParams` by
+  // identity (matching production callers like InvoicesPage's module-level
+  // OPEN_ONLY_RESERVED). An inline `['openOnly']` literal inside the
+  // renderHook callback is re-created on every render, which the effect sees
+  // as a changed dependency, re-runs, calls setTableState, triggers another
+  // render, and recreates the array again — an infinite render loop.
+  const RESERVED_PARAMS = ['openOnly'];
+
+  describe('reservedParams', () => {
+    it('excludes a reserved param from tableState.filters on initial state', () => {
+      const { result } = renderHook(() => useTableState({ reservedParams: RESERVED_PARAMS }), {
+        wrapper: makeWrapper(['/?openOnly=true&status=paid&q=x']),
+      });
+
+      expect(result.current.tableState.filters.has('openOnly')).toBe(false);
+      expect(result.current.tableState.filters.get('status')?.value).toBe('paid');
+    });
+
+    it('excludes a reserved param from tableState.filters after the URL-sync effect re-runs', () => {
+      const { result } = renderHook(() => useTableState({ reservedParams: RESERVED_PARAMS }), {
+        wrapper: makeWrapper(['/?openOnly=true&status=paid']),
+      });
+
+      act(() => {
+        result.current.setFilter('vendorId', 'vendor-1');
+      });
+
+      // The sync effect re-ran off the new searchParams; 'openOnly' must still
+      // be excluded, while the real filters (old and new) are present.
+      expect(result.current.tableState.filters.has('openOnly')).toBe(false);
+      expect(result.current.tableState.filters.get('status')?.value).toBe('paid');
+      expect(result.current.tableState.filters.get('vendorId')?.value).toBe('vendor-1');
+    });
+
+    it('resetFilters preserves a reserved param currently set in the URL', () => {
+      const { result } = renderHook(() => useTableState({ reservedParams: RESERVED_PARAMS }), {
+        wrapper: makeWrapper(['/?openOnly=true&status=paid&q=x']),
+      });
+
+      act(() => {
+        result.current.resetFilters();
+      });
+
+      // The real column filter is cleared...
+      expect(result.current.tableState.filters.has('status')).toBe(false);
+      // ...but the reserved param and the search query survive, and page resets to 1.
+      expect(result.current.searchInput).toBe('x');
+      expect(result.current.tableState.page).toBe(1);
+    });
+
+    it('resetFilters does not resurrect a reserved param that is not currently set', () => {
+      const { result } = renderHook(() => useTableState({ reservedParams: RESERVED_PARAMS }), {
+        wrapper: makeWrapper(['/?status=paid']),
+      });
+
+      act(() => {
+        result.current.resetFilters();
+      });
+
+      expect(result.current.tableState.filters.has('openOnly')).toBe(false);
+      expect(result.current.tableState.filters.has('status')).toBe(false);
+    });
+
+    it('default behaviour (reservedParams omitted) is unchanged: a same-named param IS treated as a filter', () => {
+      const { result } = renderHook(() => useTableState(), {
+        wrapper: makeWrapper(['/?openOnly=true&status=paid']),
+      });
+
+      // Without reservedParams, 'openOnly' is just another column filter.
+      expect(result.current.tableState.filters.get('openOnly')?.value).toBe('true');
+      expect(result.current.tableState.filters.get('status')?.value).toBe('paid');
+    });
+  });
+});

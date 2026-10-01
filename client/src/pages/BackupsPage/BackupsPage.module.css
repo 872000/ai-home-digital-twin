@@ -1,0 +1,202 @@
+.toolbar {
+  margin-bottom: var(--spacing-4);
+  display: flex;
+  gap: var(--spacing-3);
+}
+
+.tableWrapper {
+  overflow-x: auto;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background-color: var(--color-bg-primary);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-sm);
+}
+
+.table thead {
+  background-color: var(--color-bg-secondary);
+  border-bottom: 1px solid var(--color-border-strong);
+}
+
+.table th {
+  padding: var(--spacing-3);
+  text-align: left;
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+}
+
+.table tbody tr {
+  border-bottom: 1px solid var(--color-border);
+  transition: background-color var(--transition-fast);
+}
+
+.table tbody tr:hover {
+  background-color: var(--color-bg-secondary);
+}
+
+.table td {
+  padding: var(--spacing-3);
+  color: var(--color-text-primary);
+  vertical-align: middle;
+}
+
+.colFilename {
+  min-width: 200px;
+  word-break: break-all;
+}
+
+.colCreatedAt {
+  min-width: 120px;
+}
+
+.colSize {
+  min-width: 100px;
+  text-align: right;
+}
+
+.colActions {
+  min-width: 200px;
+}
+
+.actions {
+  display: flex;
+  gap: var(--spacing-2);
+  justify-content: flex-end;
+}
+
+.actions button {
+  white-space: nowrap;
+}
+
+.warningText {
+  color: var(--color-danger);
+  font-size: var(--font-size-sm);
+  margin: var(--spacing-3) 0 0 0;
+  padding: var(--spacing-3);
+  background-color: var(--color-danger-bg);
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--color-danger);
+}
+
+.highlightedFilename {
+  font-size: var(--font-size-sm);
+  margin: var(--spacing-2) 0;
+  padding: var(--spacing-2) var(--spacing-3);
+  background-color: var(--color-bg-secondary);
+  border-radius: var(--radius-sm);
+  font-family: monospace;
+  word-break: break-all;
+}
+
+.schedulerStatus {
+  margin-bottom: var(--spacing-4);
+  padding: var(--spacing-4) var(--spacing-5);
+  background-color: var(--color-bg-primary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+}
+
+.schedulerStatusHeading {
+  margin: 0 0 var(--spacing-3) 0;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.schedulerStatusGrid {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-2);
+  margin: 0;
+}
+
+.schedulerStatusRow {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-3);
+}
+
+.schedulerStatusRow dt {
+  flex: 0 0 auto;
+  min-width: 160px;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+
+.schedulerStatusRow dd {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-primary);
+}
+
+.schedulerStatusTimestamp {
+  font-variant-numeric: tabular-nums;
+}
+
+.schedulerStatusMuted {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.schedulerStatusHint {
+  margin: var(--spacing-2) 0 0 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+@media (max-width: 767px) {
+  .page {
+    padding: var(--spacing-4);
+  }
+
+  .pageTitle {
+    font-size: var(--font-size-xl);
+  }
+
+  .table {
+    font-size: var(--font-size-xs);
+  }
+
+  .table th,
+  .table td {
+    padding: var(--spacing-2);
+  }
+
+  .colFilename {
+    min-width: 150px;
+  }
+
+  .actions button {
+    padding: var(--spacing-1-5) var(--spacing-2);
+    font-size: var(--font-size-xs);
+  }
+
+  .schedulerStatus {
+    padding: var(--spacing-3) var(--spacing-4);
+  }
+
+  .schedulerStatusRow {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--spacing-1);
+  }
+
+  .schedulerStatusRow dt {
+    min-width: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .table tbody tr {
+    transition: none;
+  }
+}

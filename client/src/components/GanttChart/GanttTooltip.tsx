@@ -1,0 +1,757 @@
+import { createPortal } from 'react-dom';
+import { Link } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
+import type { WorkItemStatus, DependencyType } from '@cornerstone/shared';
+import { useFormatters } from '../../lib/formatters.js';
+import styles from './GanttTooltip.module.css';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/** A single entry in the work-item tooltip's Dependencies list. */
+export interface GanttTooltipDependencyEntry {
+  /** Title of the related (predecessor or successor) work item. */
+  relatedTitle: string;
+  /** The dependency relationship type. */
+  dependencyType: DependencyType;
+  /** Whether this item is a predecessor of, or successor to, the hovered work item. */
+  role: 'predecessor' | 'successor';
+}
+
+export interface GanttTooltipWorkItemData {
+  kind: 'work-item';
+  title: string;
+  status: WorkItemStatus;
+  startDate: string | null;
+  endDate: string | null;
+  durationDays: number | null;
+  assignedUserName: string | null;
+  /** Area name, if the work item is assigned to an area. */
+  areaName?: string | null;
+  /**
+   * Dependency relationships for this work item (predecessors and successors).
+   * When absent or empty, no "Dependencies" section is rendered in the tooltip.
+   */
+  dependencies?: GanttTooltipDependencyEntry[];
+  /**
+   * @deprecated Delay indicator has been removed from work item tooltips.
+   * Only milestones track late/delay status. Field retained for type compatibility.
+   */
+  delayDays?: number | null;
+  /** User-set planned duration in days. Null if not explicitly set. */
+  plannedDurationDays?: number | null;
+  /** Computed actual/effective duration in days (from start/end dates). Null if not computable. */
+  actualDurationDays?: number | null;
+  /**
+   * Work item ID used for the "View item" navigation link on touch devices.
+   * When provided, a "View item" link to `/work-items/:workItemId` is rendered
+   * in the tooltip on touch (pointer: coarse) devices.
+   */
+  workItemId?: string;
+}
+
+export interface GanttTooltipMilestoneData {
+  kind: 'milestone';
+  title: string;
+  targetDate: string;
+  /** Latest end date among linked work items, or null if unavailable. */
+  projectedDate: string | null;
+  isCompleted: boolean;
+  /** True when not completed and projectedDate > targetDate. */
+  isLate: boolean;
+  completedAt: string | null;
+  /** Work items directly linked to this milestone via milestone.workItemIds (contributing items). */
+  linkedWorkItems: { id: string; title: string }[];
+  /** Work items that depend on this milestone (have this milestone in their requiredMilestoneIds). */
+  dependentWorkItems: { id: string; title: string }[];
+  /**
+   * Milestone ID used for the "View item" navigation link on touch devices.
+   * When provided, a "View item" button is rendered in the tooltip on touch devices.
+   * The click handler calls onMilestoneNavigate with the milestone ID.
+   */
+  milestoneId?: number;
+}
+
+export interface GanttTooltipArrowData {
+  kind: 'arrow';
+  /** Human-readable description of the dependency relationship. */
+  description: string;
+}
+
+export interface GanttTooltipHouseholdItemData {
+  kind: 'household-item';
+  name: string;
+  category: string;
+  status: string;
+  earliestDeliveryDate: string | null;
+  latestDeliveryDate: string | null;
+  targetDeliveryDate: string | null;
+  actualDeliveryDate: string | null;
+  isLate: boolean;
+  /** HI ID for "View item" touch link. */
+  householdItemId?: string;
+  /** Linked items (work items / milestones) that this household item depends on. */
+  linkedItems?: { id: string; title: string; type: 'work_item' | 'milestone' }[];
+}
+
+/**
+ * Polymorphic tooltip data — discriminated by the `kind` field.
+ */
+export type GanttTooltipData =
+  | GanttTooltipWorkItemData
+  | GanttTooltipMilestoneData
+  | GanttTooltipArrowData
+  | GanttTooltipHouseholdItemData;
+
+export interface GanttTooltipPosition {
+  /** Mouse X in viewport coordinates. */
+  x: number;
+  /** Mouse Y in viewport coordinates. */
+  y: number;
+}
+
+interface GanttTooltipProps {
+  data: GanttTooltipData;
+  position: GanttTooltipPosition;
+  /** ID to apply to the tooltip element (for aria-describedby on the trigger). */
+  id?: string;
+  /**
+   * When true, renders a "View item" link/button inside the tooltip.
+   * Used on touch (pointer: coarse) devices where the two-tap pattern is active.
+   * On desktop, this prop should be false so the action is not rendered.
+   */
+  isTouchDevice?: boolean;
+  /**
+   * Called when the "View item" action is tapped on a milestone tooltip.
+   * Receives the milestone ID. Used on touch devices only.
+   */
+  onMilestoneNavigate?: (milestoneId: number) => void;
+  /**
+   * Called when the "View item" action is tapped on a household item tooltip.
+   * Receives the household item ID. Used on touch devices only.
+   */
+  onHiNavigate?: (itemId: string) => void;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const STATUS_BADGE_CLASSES: Record<WorkItemStatus, string> = {
+  not_started: styles.statusNotStarted!,
+  in_progress: styles.statusInProgress!,
+  completed: styles.statusCompleted!,
+};
+
+const TOOLTIP_WIDTH = 240;
+/**
+ * Base height estimate for tooltip flip-logic. When the work-item tooltip has
+ * visible dependencies, the actual rendered height will be larger — we add
+ * 18px per dependency row on top of this base when computing the flip point.
+ * Increased from 130 to 165 to account for planned/actual/variance duration rows.
+ */
+const TOOLTIP_HEIGHT_BASE = 165;
+const TOOLTIP_HEIGHT_ESTIMATE = 200; // safe upper bound used for arrow/milestone tooltips
+const OFFSET_X = 12;
+const OFFSET_Y = 8;
+
+const MAX_DEPS_SHOWN = 5;
+
+function WorkItemTooltipContent({
+  data,
+  isTouchDevice,
+}: {
+  data: GanttTooltipWorkItemData;
+  isTouchDevice?: boolean;
+}) {
+  const { t } = useTranslation('schedule');
+  const { formatDate } = useFormatters();
+
+  const statusLabels: Record<WorkItemStatus, string> = {
+    not_started: t('gantt.tooltip.status.not_started')!,
+    in_progress: t('gantt.tooltip.status.in_progress')!,
+    completed: t('gantt.tooltip.status.completed')!,
+  };
+
+  const dependencyTypeLabels: Record<DependencyType, string> = {
+    finish_to_start: t('gantt.tooltip.dependency.finishToStart')!,
+    start_to_start: t('gantt.tooltip.dependency.startToStart')!,
+    finish_to_finish: t('gantt.tooltip.dependency.finishToFinish')!,
+    start_to_finish: t('gantt.tooltip.dependency.startToFinish')!,
+  };
+
+  function formatDuration(days: number | null): string {
+    if (days === null) return '—';
+    if (days === 1) return `1 ${t('gantt.tooltip.duration.day')}`;
+    return `${days} ${t('gantt.tooltip.duration.days')}`;
+  }
+
+  const dependencies = data.dependencies ?? [];
+  const shownDeps = dependencies.slice(0, MAX_DEPS_SHOWN);
+  const depsOverflowCount = dependencies.length - shownDeps.length;
+
+  // Whether the duration section rendered a trailing separator.
+  // Used to avoid a double separator when there is no owner row between the
+  // variance section and the dependencies section.
+  const hasBothDurations = data.plannedDurationDays != null && data.actualDurationDays != null;
+  // A separator before dependencies is only needed when the last section before
+  // dependencies did NOT already emit a trailing separator. The trailing separator
+  // in the variance branch handles the case where there IS an owner row or dependencies
+  // follow directly. We suppress it here by moving the separator responsibility to
+  // the dependencies block and removing the trailing separator from the variance branch.
+  const hasOwner = data.assignedUserName !== null;
+
+  const durationVariance = hasBothDurations
+    ? data.actualDurationDays! - data.plannedDurationDays!
+    : null;
+  const absDurationVariance = durationVariance !== null ? Math.abs(durationVariance) : 0;
+  const varianceLabel =
+    durationVariance !== null && durationVariance !== 0
+      ? durationVariance > 0
+        ? `+${absDurationVariance}`
+        : `-${absDurationVariance}`
+      : null;
+  const varianceDayWord =
+    absDurationVariance === 1 ? t('gantt.tooltip.duration.day') : t('gantt.tooltip.duration.days');
+  const varianceClass =
+    durationVariance !== null && durationVariance > 0
+      ? styles.detailValueOverPlan
+      : styles.detailValueUnderPlan;
+  const durationVarianceRow =
+    durationVariance === null ? null : durationVariance === 0 ? (
+      <div className={styles.detailRow}>
+        <span className={styles.detailLabel}>{t('gantt.tooltip.duration.variance')}</span>
+        <span className={styles.detailValue}>{t('gantt.tooltip.duration.onPlan')}</span>
+      </div>
+    ) : (
+      <div className={styles.detailRow}>
+        <span className={styles.detailLabel}>{t('gantt.tooltip.duration.variance')}</span>
+        <span className={`${styles.detailValue} ${varianceClass}`}>
+          {varianceLabel} {varianceDayWord}
+        </span>
+      </div>
+    );
+
+  return (
+    <>
+      {/* Header: title + status badge */}
+      <div className={styles.header}>
+        <span className={styles.title}>{data.title}</span>
+        <span className={`${styles.statusBadge} ${STATUS_BADGE_CLASSES[data.status]}`}>
+          {statusLabels[data.status]}
+        </span>
+      </div>
+
+      <div className={styles.separator} aria-hidden="true" />
+
+      {/* Date range */}
+      <div className={styles.detailRow}>
+        <span className={styles.detailLabel}>{t('gantt.tooltip.workItem.startLabel')}</span>
+        <span className={styles.detailValue}>{formatDate(data.startDate)}</span>
+      </div>
+      <div className={styles.detailRow}>
+        <span className={styles.detailLabel}>{t('gantt.tooltip.workItem.endLabel')}</span>
+        <span className={styles.detailValue}>{formatDate(data.endDate)}</span>
+      </div>
+
+      {/* Duration section — planned/actual/variance when both available, single row fallback */}
+      {hasBothDurations ? (
+        <>
+          <div className={styles.separator} aria-hidden="true" />
+          <div className={styles.detailRow}>
+            <span className={styles.detailLabel}>{t('gantt.tooltip.duration.planned')}</span>
+            <span className={styles.detailValue}>
+              {formatDuration(data.plannedDurationDays ?? null)}
+            </span>
+          </div>
+          <div className={styles.detailRow}>
+            <span className={styles.detailLabel}>{t('gantt.tooltip.duration.actual')}</span>
+            <span className={styles.detailValue}>
+              {formatDuration(data.actualDurationDays ?? null)}
+            </span>
+          </div>
+          {durationVarianceRow}
+        </>
+      ) : data.plannedDurationDays != null ? (
+        <div className={styles.detailRow}>
+          <span className={styles.detailLabel}>{t('gantt.tooltip.duration.planned')}</span>
+          <span className={styles.detailValue}>{formatDuration(data.plannedDurationDays)}</span>
+        </div>
+      ) : data.actualDurationDays != null ? (
+        <div className={styles.detailRow}>
+          <span className={styles.detailLabel}>{t('gantt.tooltip.duration.label')}</span>
+          <span className={styles.detailValue}>{formatDuration(data.actualDurationDays)}</span>
+        </div>
+      ) : (
+        <div className={styles.detailRow}>
+          <span className={styles.detailLabel}>{t('gantt.tooltip.duration.label')}</span>
+          <span className={styles.detailValue}>{formatDuration(data.durationDays)}</span>
+        </div>
+      )}
+
+      {/* Separator after duration section — only when variance was shown AND owner follows.
+          When variance is shown but no owner, the separator before dependencies handles it.
+          When no variance is shown, no separator is needed here. */}
+      {hasBothDurations && hasOwner && <div className={styles.separator} aria-hidden="true" />}
+
+      {/* Assigned user */}
+      {hasOwner && (
+        <div className={styles.detailRow}>
+          <span className={styles.detailLabel}>{t('gantt.tooltip.workItem.ownerLabel')}</span>
+          <span className={styles.detailValue}>{data.assignedUserName}</span>
+        </div>
+      )}
+
+      {/* Area */}
+      {data.areaName && (
+        <div className={styles.detailRow}>
+          <span className={styles.detailLabel}>{t('gantt.tooltip.workItem.areaLabel')}</span>
+          <span className={styles.detailValue}>{data.areaName}</span>
+        </div>
+      )}
+
+      {/* Dependencies section — separator only when preceding content exists */}
+      {dependencies.length > 0 && (
+        <>
+          <div className={styles.separator} aria-hidden="true" />
+          <div className={styles.linkedItemsSection}>
+            <span className={styles.linkedItemsLabel}>
+              {t('gantt.tooltip.workItem.dependencies')} ({dependencies.length})
+            </span>
+            <ul
+              className={styles.linkedItemsList}
+              aria-label={t('gantt.tooltip.workItem.dependencies')}
+            >
+              {shownDeps.map((dep, idx) => (
+                // eslint-disable-next-line @eslint-react/no-array-index-key -- dependency list filtered at render time; composite key with title+index is stable
+                <li key={`${dep.relatedTitle}-${idx}`} className={styles.linkedItem}>
+                  <span className={styles.depTypeLabel}>
+                    {dependencyTypeLabels[dep.dependencyType]}
+                  </span>{' '}
+                  {dep.relatedTitle}
+                </li>
+              ))}
+              {depsOverflowCount > 0 && (
+                <li className={styles.linkedItemsOverflow}>
+                  +{depsOverflowCount} {t('gantt.tooltip.workItem.more')}
+                </li>
+              )}
+            </ul>
+          </div>
+        </>
+      )}
+
+      {/* Touch device navigation affordance — "View item" link visible only on pointer: coarse */}
+      {isTouchDevice && data.workItemId && (
+        <>
+          <div className={styles.separator} aria-hidden="true" />
+          <Link
+            to={`/project/work-items/${data.workItemId}`}
+            className={styles.viewItemLink}
+            aria-label={`${t('gantt.tooltip.navigation.viewItem')} ${data.title}`}
+          >
+            {t('gantt.tooltip.navigation.viewItem')}
+          </Link>
+        </>
+      )}
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Milestone tooltip content
+// ---------------------------------------------------------------------------
+
+const MAX_LINKED_ITEMS_SHOWN = 5;
+
+function MilestoneTooltipContent({
+  data,
+  isTouchDevice,
+  onMilestoneNavigate,
+}: {
+  data: GanttTooltipMilestoneData;
+  isTouchDevice?: boolean;
+  onMilestoneNavigate?: (milestoneId: number) => void;
+}) {
+  const { t } = useTranslation('schedule');
+  const { formatDate } = useFormatters();
+
+  let statusLabel: string;
+  let statusClass: string;
+  if (data.isCompleted) {
+    statusLabel = t('gantt.status.completed')!;
+    statusClass = styles.statusCompleted!;
+  } else if (data.isLate) {
+    statusLabel = t('gantt.status.late')!;
+    statusClass = styles.statusLate!;
+  } else {
+    statusLabel = t('gantt.status.onTrack')!;
+    statusClass = styles.statusInProgress!;
+  }
+
+  const { linkedWorkItems, dependentWorkItems } = data;
+  const shownLinked = linkedWorkItems.slice(0, MAX_LINKED_ITEMS_SHOWN);
+  const linkedOverflowCount = linkedWorkItems.length - shownLinked.length;
+  const shownDependent = dependentWorkItems.slice(0, MAX_LINKED_ITEMS_SHOWN);
+  const dependentOverflowCount = dependentWorkItems.length - shownDependent.length;
+
+  const hasBothEmpty = linkedWorkItems.length === 0 && dependentWorkItems.length === 0;
+
+  return (
+    <>
+      {/* Header: title + completion badge */}
+      <div className={styles.header}>
+        <span className={`${styles.milestoneIcon}`} aria-hidden="true">
+          {/* Small diamond SVG icon */}
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 10 10"
+            width="10"
+            height="10"
+            fill="currentColor"
+            aria-hidden="true"
+          >
+            <polygon points="5,0 10,5 5,10 0,5" />
+          </svg>
+        </span>
+        <span className={styles.title}>{data.title}</span>
+        <span className={`${styles.statusBadge} ${statusClass}`}>{statusLabel}</span>
+      </div>
+
+      <div className={styles.separator} aria-hidden="true" />
+
+      {/* Target date */}
+      <div className={styles.detailRow}>
+        <span className={styles.detailLabel}>{t('gantt.tooltip.milestone.targetLabel')}</span>
+        <span className={styles.detailValue}>{formatDate(data.targetDate)}</span>
+      </div>
+
+      {/* Projected date — show when available and milestone is not yet completed */}
+      {!data.isCompleted && (
+        <div className={styles.detailRow}>
+          <span className={styles.detailLabel}>{t('gantt.tooltip.milestone.projectedLabel')}</span>
+          <span className={`${styles.detailValue} ${data.isLate ? styles.detailValueLate : ''}`}>
+            {data.projectedDate !== null ? formatDate(data.projectedDate) : '—'}
+          </span>
+        </div>
+      )}
+
+      {/* Completion date */}
+      {data.isCompleted && data.completedAt !== null && (
+        <div className={styles.detailRow}>
+          <span className={styles.detailLabel}>{t('gantt.tooltip.milestone.doneLabel')}</span>
+          <span className={styles.detailValue}>{formatDate(data.completedAt)}</span>
+        </div>
+      )}
+
+      {/* When both lists are empty, show a single "No linked items" row */}
+      {hasBothEmpty ? (
+        <div className={styles.detailRow}>
+          <span className={styles.detailLabel}>{t('gantt.tooltip.milestone.linkedItems')}</span>
+          <span className={styles.detailValue}>{t('gantt.tooltip.milestone.none')}</span>
+        </div>
+      ) : (
+        <>
+          {/* Contributing items — work items linked to this milestone via workItemIds */}
+          <div className={styles.separator} aria-hidden="true" />
+          {linkedWorkItems.length === 0 ? (
+            <div className={styles.detailRow}>
+              <span className={styles.detailLabel}>
+                {t('gantt.tooltip.milestone.contributing')}
+              </span>
+              <span className={styles.detailValue}>{t('gantt.tooltip.milestone.none')}</span>
+            </div>
+          ) : (
+            <div className={styles.linkedItemsSection}>
+              <span className={styles.linkedItemsLabel}>
+                {t('gantt.tooltip.milestone.contributing')} ({linkedWorkItems.length})
+              </span>
+              <ul
+                className={styles.linkedItemsList}
+                aria-label={t('gantt.tooltip.milestone.contributingAriaLabel')}
+              >
+                {shownLinked.map((item) => (
+                  <li key={item.id} className={styles.linkedItem}>
+                    {item.title}
+                  </li>
+                ))}
+                {linkedOverflowCount > 0 && (
+                  <li className={styles.linkedItemsOverflow}>+{linkedOverflowCount} more</li>
+                )}
+              </ul>
+            </div>
+          )}
+
+          {/* Dependent items — work items that depend on this milestone via requiredMilestoneIds */}
+          {dependentWorkItems.length === 0 ? (
+            <div className={styles.detailRow}>
+              <span className={styles.detailLabel}>
+                {t('gantt.tooltip.milestone.blockedByThis')}
+              </span>
+              <span className={styles.detailValue}>{t('gantt.tooltip.milestone.none')}</span>
+            </div>
+          ) : (
+            <div className={styles.linkedItemsSection}>
+              <span className={styles.linkedItemsLabel}>
+                {t('gantt.tooltip.milestone.blockedByThis')} ({dependentWorkItems.length})
+              </span>
+              <ul
+                className={styles.linkedItemsList}
+                aria-label={t('gantt.tooltip.milestone.blockedByThisAriaLabel')}
+              >
+                {shownDependent.map((item) => (
+                  <li key={item.id} className={styles.linkedItem}>
+                    {item.title}
+                  </li>
+                ))}
+                {dependentOverflowCount > 0 && (
+                  <li className={styles.linkedItemsOverflow}>+{dependentOverflowCount} more</li>
+                )}
+              </ul>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Touch device navigation affordance — "View item" button visible only on pointer: coarse */}
+      {isTouchDevice && data.milestoneId !== undefined && onMilestoneNavigate && (
+        <>
+          <div className={styles.separator} aria-hidden="true" />
+          <button
+            type="button"
+            className={styles.viewItemLink}
+            onClick={() => onMilestoneNavigate(data.milestoneId!)}
+            aria-label={`${t('gantt.tooltip.navigation.viewItem')} ${data.title}`}
+          >
+            {t('gantt.tooltip.navigation.viewItem')}
+          </button>
+        </>
+      )}
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Arrow tooltip content
+// ---------------------------------------------------------------------------
+
+function HouseholdItemTooltipContent({
+  data,
+  isTouchDevice,
+  onNavigate,
+}: {
+  data: GanttTooltipHouseholdItemData;
+  isTouchDevice?: boolean;
+  onNavigate?: (itemId: string) => void;
+}) {
+  const { t } = useTranslation('schedule');
+  const { formatDate } = useFormatters();
+
+  const statusLabel = data.status.replace(/_/g, ' ');
+
+  // Select badge colors based on delivery status
+  const isDelivered = data.status === 'arrived';
+  const badgeBg = isDelivered
+    ? 'var(--color-hi-status-arrived-bg)'
+    : 'var(--color-hi-status-scheduled-bg)';
+  const badgeColor = isDelivered
+    ? 'var(--color-hi-status-arrived-text)'
+    : 'var(--color-hi-status-scheduled-text)';
+
+  return (
+    <>
+      {/* Header: name + category */}
+      <div className={styles.header}>
+        <span className={styles.title}>{data.name}</span>
+        <span
+          className={styles.statusBadge}
+          style={{ backgroundColor: badgeBg, color: badgeColor }}
+        >
+          {data.category}
+        </span>
+      </div>
+
+      <div className={styles.separator} aria-hidden="true" />
+
+      {/* Status */}
+      <div className={styles.detailRow}>
+        <span className={styles.detailLabel}>{t('gantt.tooltip.householdItem.statusLabel')}</span>
+        <span className={styles.detailValue}>{statusLabel}</span>
+      </div>
+
+      {/* Earliest delivery date */}
+      {data.earliestDeliveryDate && (
+        <div className={styles.detailRow}>
+          <span className={styles.detailLabel}>
+            {t('gantt.tooltip.householdItem.earliestLabel')}
+          </span>
+          <span className={styles.detailValue}>{formatDate(data.earliestDeliveryDate)}</span>
+        </div>
+      )}
+
+      {/* Target delivery date */}
+      {data.targetDeliveryDate && (
+        <div className={styles.detailRow}>
+          <span className={styles.detailLabel}>{t('gantt.tooltip.householdItem.targetLabel')}</span>
+          <span className={styles.detailValue}>{formatDate(data.targetDeliveryDate)}</span>
+        </div>
+      )}
+
+      {/* Latest delivery date */}
+      {data.latestDeliveryDate && (
+        <div className={styles.detailRow}>
+          <span className={styles.detailLabel}>{t('gantt.tooltip.householdItem.latestLabel')}</span>
+          <span className={styles.detailValue}>{formatDate(data.latestDeliveryDate)}</span>
+        </div>
+      )}
+
+      {/* Actual delivery date */}
+      {data.actualDeliveryDate && (
+        <div className={styles.detailRow}>
+          <span className={styles.detailLabel}>{t('gantt.tooltip.householdItem.actualLabel')}</span>
+          <span className={styles.detailValue}>{formatDate(data.actualDeliveryDate)}</span>
+        </div>
+      )}
+
+      {/* Floored to today note */}
+      {data.isLate && (
+        <div className={styles.detailRow}>
+          <span className={styles.detailValueFloored}>
+            {t('gantt.tooltip.householdItem.flooredToToday')}
+          </span>
+        </div>
+      )}
+
+      {/* Linked items section */}
+      {data.linkedItems && data.linkedItems.length > 0 && (
+        <>
+          <div className={styles.separator} aria-hidden="true" />
+          <div className={styles.linkedItemsSection}>
+            <span className={styles.linkedItemsLabel}>
+              {t('gantt.tooltip.householdItem.linkedItems')} ({data.linkedItems.length})
+            </span>
+            <ul
+              className={styles.linkedItemsList}
+              aria-label={t('gantt.tooltip.householdItem.linkedItems')}
+            >
+              {data.linkedItems.slice(0, MAX_LINKED_ITEMS_SHOWN).map((item) => (
+                <li key={`${item.type}-${item.id}`} className={styles.linkedItem}>
+                  {item.title}
+                </li>
+              ))}
+              {data.linkedItems.length > MAX_LINKED_ITEMS_SHOWN && (
+                <li className={styles.linkedItemsOverflow}>
+                  +{data.linkedItems.length - MAX_LINKED_ITEMS_SHOWN} more
+                </li>
+              )}
+            </ul>
+          </div>
+        </>
+      )}
+
+      {/* View item link (touch devices only) */}
+      {isTouchDevice && data.householdItemId && onNavigate && (
+        <>
+          <div className={styles.separator} aria-hidden="true" />
+          <button
+            type="button"
+            className={styles.viewItemButton}
+            onClick={() => onNavigate(data.householdItemId!)}
+          >
+            {t('gantt.tooltip.navigation.viewItem')}
+          </button>
+        </>
+      )}
+    </>
+  );
+}
+
+function ArrowTooltipContent({ data }: { data: GanttTooltipArrowData }) {
+  return (
+    <div className={styles.arrowDescription} role="status">
+      {data.description}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
+
+/**
+ * GanttTooltip renders a positioned tooltip for a hovered Gantt bar, milestone diamond,
+ * or dependency arrow.
+ *
+ * Rendered as a portal to document.body to avoid SVG clipping issues.
+ * Position is derived from mouse viewport coordinates with flip logic
+ * to avoid overflowing the viewport edges.
+ *
+ * The `data` prop is polymorphic — set `kind: 'work-item'`, `kind: 'milestone'`,
+ * or `kind: 'arrow'` to switch between tooltip layouts.
+ */
+export function GanttTooltip({
+  data,
+  position,
+  id,
+  isTouchDevice,
+  onMilestoneNavigate,
+  onHiNavigate,
+}: GanttTooltipProps) {
+  // Compute tooltip x/y, flipping to avoid viewport overflow
+  const viewportHeight = typeof window !== 'undefined' ? window.innerHeight : 800;
+
+  // For work-item tooltips with dependencies, estimate height dynamically
+  // so the flip-point avoids clipping the dependencies list at the viewport bottom.
+  const depsCount = data.kind === 'work-item' ? (data.dependencies?.length ?? 0) : 0;
+  const heightEstimate =
+    data.kind === 'work-item' && depsCount > 0
+      ? TOOLTIP_HEIGHT_BASE + Math.min(depsCount, MAX_DEPS_SHOWN) * 18
+      : TOOLTIP_HEIGHT_ESTIMATE;
+
+  // Default: place tooltip to the left of the cursor so it doesn't cover upcoming work items
+  // (Gantt chart flows left-to-right, so future items are to the right of the hovered bar).
+  // Fall back to right-of-cursor if there isn't enough space on the left.
+  let tooltipX = position.x - TOOLTIP_WIDTH - OFFSET_X;
+  let tooltipY = position.y + OFFSET_Y;
+
+  // Flip to the right if it would overflow the left edge
+  if (tooltipX < 8) {
+    tooltipX = position.x + OFFSET_X;
+  }
+
+  // Flip vertically if it would overflow the bottom edge
+  if (tooltipY + heightEstimate > viewportHeight - 8) {
+    tooltipY = position.y - heightEstimate - OFFSET_Y;
+  }
+
+  const content = (
+    <div
+      id={id}
+      className={styles.tooltip}
+      role="tooltip"
+      style={{ left: tooltipX, top: tooltipY, width: TOOLTIP_WIDTH }}
+      data-testid="gantt-tooltip"
+    >
+      {data.kind === 'work-item' ? (
+        <WorkItemTooltipContent data={data} isTouchDevice={isTouchDevice} />
+      ) : data.kind === 'milestone' ? (
+        <MilestoneTooltipContent
+          data={data}
+          isTouchDevice={isTouchDevice}
+          onMilestoneNavigate={onMilestoneNavigate}
+        />
+      ) : data.kind === 'household-item' ? (
+        <HouseholdItemTooltipContent
+          data={data}
+          isTouchDevice={isTouchDevice}
+          onNavigate={onHiNavigate}
+        />
+      ) : (
+        <ArrowTooltipContent data={data} />
+      )}
+    </div>
+  );
+
+  return createPortal(content, document.body);
+}

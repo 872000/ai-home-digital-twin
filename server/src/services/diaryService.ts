@@ -1,0 +1,1040 @@
+/**
+ * Diary service — CRUD for construction diary entries (Bautagebuch).
+ *
+ * EPIC-13: Construction Diary
+ *
+ * Manages manual and automatic diary entries with type-specific metadata validation.
+ * Supports pagination, filtering, and photo attachment management.
+ */
+
+import { randomUUID } from 'node:crypto';
+import { eq, desc, and, or, gte, lte, inArray, sql } from 'drizzle-orm';
+import type { SQL } from 'drizzle-orm';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import type * as schemaTypes from '../db/schema.js';
+import type { areas } from '../db/schema.js';
+import {
+  diaryEntries,
+  photos,
+  users,
+  workItems,
+  invoices,
+  milestones,
+  vendors,
+} from '../db/schema.js';
+import {
+  NotFoundError,
+  ValidationError,
+  InvalidMetadataError,
+  ImmutableEntryError,
+  InvalidEntryTypeError,
+  AlreadySavedError,
+} from '../errors/AppError.js';
+import { deletePhotosForEntity } from './photoService.js';
+import type {
+  DiaryEntrySummary,
+  DiaryEntryDetail,
+  CreateDiaryEntryRequest,
+  UpdateDiaryEntryRequest,
+  PromoteDiaryEntryRequest,
+  DiaryEntryListQuery,
+  DiaryUserSummary,
+  ManualDiaryEntryType,
+  DiaryEntryMetadata,
+  DiaryEntryStatus,
+  DailyLogMetadata,
+  SiteVisitMetadata,
+  DeliveryMetadata,
+  IssueMetadata,
+  DiaryEntryType,
+  DiarySourceEntityType,
+  AreaSummary,
+} from '@cornerstone/shared';
+import type { PaginationMeta } from '@cornerstone/shared';
+import { loadAreaMap, resolveAreaAncestors, type AreaMapEntry } from './areaService.js';
+import { toAreaSummary } from './shared/converters.js';
+
+type DbType = BetterSQLite3Database<typeof schemaTypes>;
+
+/**
+ * Manual diary entry types that can be created by users.
+ */
+const MANUAL_ENTRY_TYPES = new Set<ManualDiaryEntryType>([
+  'daily_log',
+  'site_visit',
+  'delivery',
+  'issue',
+  'general_note',
+]);
+
+/**
+ * Convert database user row to DiaryUserSummary shape.
+ */
+function toDiaryUserSummary(user: typeof users.$inferSelect | null): DiaryUserSummary | null {
+  if (!user) return null;
+  return {
+    id: user.id,
+    displayName: user.displayName,
+  };
+}
+
+/**
+ * Parse metadata from JSON string, returning null if not present or invalid.
+ */
+function parseMetadata(metadata: string | null): DiaryEntryMetadata | null {
+  if (!metadata) return null;
+  try {
+    return JSON.parse(metadata);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the title of a source entity based on its type and ID.
+ * Returns null if the entity type is null, the entity is not found, or the type is unknown.
+ */
+function resolveSourceEntityTitle(
+  db: DbType,
+  sourceEntityType: string | null,
+  sourceEntityId: string | null,
+): string | null {
+  if (!sourceEntityType || !sourceEntityId) {
+    return null;
+  }
+
+  try {
+    switch (sourceEntityType) {
+      case 'work_item': {
+        const result = db
+          .select({ title: workItems.title })
+          .from(workItems)
+          .where(eq(workItems.id, sourceEntityId))
+          .get();
+        return result?.title ?? null;
+      }
+
+      case 'invoice': {
+        const result = db
+          .select({ invoiceNumber: invoices.invoiceNumber })
+          .from(invoices)
+          .where(eq(invoices.id, sourceEntityId))
+          .get();
+        return result?.invoiceNumber ?? null;
+      }
+
+      case 'milestone': {
+        const result = db
+          .select({ title: milestones.title })
+          .from(milestones)
+          .where(eq(milestones.id, parseInt(sourceEntityId, 10)))
+          .get();
+        return result?.title ?? null;
+      }
+
+      default:
+        return null;
+    }
+  } catch {
+    // If query fails, return null
+    return null;
+  }
+}
+
+/**
+ * Helper to resolve area summary with ancestors from area map.
+ */
+function getAreaWithAncestors(
+  areaId: string | null,
+  areaMap: Map<string, AreaMapEntry>,
+): AreaSummary | null {
+  if (!areaId) return null;
+  const entry = areaMap.get(areaId);
+  if (!entry) return null;
+  const ancestors = resolveAreaAncestors(areaId, areaMap);
+  return toAreaSummary(
+    {
+      id: entry.id,
+      name: entry.name,
+      color: entry.color,
+      parentId: entry.parentId,
+    } as typeof areas.$inferSelect,
+    ancestors,
+  );
+}
+
+/**
+ * Resolve the area of a source entity based on its type and ID.
+ * Returns null if source entity is not a work_item or entity is not found.
+ */
+function resolveSourceEntityArea(
+  db: DbType,
+  sourceEntityType: string | null,
+  sourceEntityId: string | null,
+  areaMap: Map<string, AreaMapEntry>,
+): AreaSummary | null {
+  if (sourceEntityType !== 'work_item' || !sourceEntityId) return null;
+  const result = db
+    .select({ areaId: workItems.areaId })
+    .from(workItems)
+    .where(eq(workItems.id, sourceEntityId))
+    .get();
+  if (!result) return null;
+  return getAreaWithAncestors(result.areaId, areaMap);
+}
+
+/**
+ * Convert database diary entry row to DiaryEntrySummary shape.
+ * Includes photo count aggregated from photos table.
+ */
+function toDiarySummary(
+  entry: typeof diaryEntries.$inferSelect,
+  user: typeof users.$inferSelect | null,
+  photoCount: number,
+  sourceEntityTitle: string | null = null,
+  sourceEntityArea: AreaSummary | null = null,
+  db?: DbType,
+): DiaryEntrySummary {
+  const metadata = parseMetadata(entry.metadata);
+  // Denormalize vendorName for daily_log entries
+  if (entry.entryType === 'daily_log' && metadata && db) {
+    const dlm = metadata as DailyLogMetadata;
+    if (dlm.vendorId) {
+      const vendorRow = db
+        .select({ name: vendors.name })
+        .from(vendors)
+        .where(eq(vendors.id, dlm.vendorId))
+        .get();
+      dlm.vendorName = vendorRow?.name ?? null;
+    }
+  }
+  const isSigned = Boolean(
+    metadata &&
+    'signatures' in metadata &&
+    Array.isArray(metadata.signatures) &&
+    metadata.signatures.length > 0,
+  );
+
+  return {
+    id: entry.id,
+    entryType: entry.entryType as DiaryEntryType,
+    status: (entry.status ?? 'saved') as DiaryEntryStatus,
+    entryDate: entry.entryDate,
+    title: entry.title,
+    body: entry.body,
+    metadata,
+    isAutomatic: entry.isAutomatic,
+    isSigned,
+    sourceEntityType: entry.sourceEntityType as DiarySourceEntityType | null,
+    sourceEntityId: entry.sourceEntityId,
+    sourceEntityArea,
+    sourceEntityTitle,
+    photoCount,
+    createdBy: toDiaryUserSummary(user),
+    createdAt: entry.createdAt,
+    updatedAt: entry.updatedAt,
+  };
+}
+
+/**
+ * Validate metadata structure for a given entry type.
+ * @throws InvalidMetadataError if metadata does not match schema
+ */
+function validateMetadata(
+  entryType: string,
+  metadata: DiaryEntryMetadata | null | undefined,
+  db: DbType,
+): void {
+  if (!metadata) return;
+
+  const md = metadata as Record<string, unknown>;
+
+  switch (entryType) {
+    case 'daily_log': {
+      const dlm = md as DailyLogMetadata;
+      // Validate weather enum
+      if (dlm.weather !== undefined && dlm.weather !== null) {
+        const validWeathers = ['sunny', 'cloudy', 'rainy', 'snowy', 'stormy', 'other'];
+        if (!validWeathers.includes(dlm.weather)) {
+          throw new InvalidMetadataError(
+            `daily_log weather must be one of: ${validWeathers.join(', ')}`,
+          );
+        }
+      }
+      // Validate temperatureCelsius is number or null
+      if (dlm.temperatureCelsius !== undefined && dlm.temperatureCelsius !== null) {
+        if (typeof dlm.temperatureCelsius !== 'number') {
+          throw new InvalidMetadataError('daily_log temperatureCelsius must be a number or null');
+        }
+      }
+      // Validate workersOnSite is integer >= 0 or null
+      if (dlm.workersOnSite !== undefined && dlm.workersOnSite !== null) {
+        if (!Number.isInteger(dlm.workersOnSite) || dlm.workersOnSite < 0) {
+          throw new InvalidMetadataError(
+            'daily_log workersOnSite must be a non-negative integer or null',
+          );
+        }
+      }
+      // Validate signatures array
+      if (dlm.signatures !== undefined && dlm.signatures !== null) {
+        if (!Array.isArray(dlm.signatures)) {
+          throw new InvalidMetadataError('daily_log signatures must be an array or null');
+        }
+        for (const sig of dlm.signatures) {
+          if (typeof sig.signerName !== 'string' || sig.signerName.trim().length === 0) {
+            throw new InvalidMetadataError(
+              'daily_log signature entry must have non-empty signerName',
+            );
+          }
+          if (!['self', 'vendor'].includes(sig.signerType)) {
+            throw new InvalidMetadataError(
+              'daily_log signature entry signerType must be "self" or "vendor"',
+            );
+          }
+          if (
+            typeof sig.signatureDataUrl !== 'string' ||
+            sig.signatureDataUrl.trim().length === 0
+          ) {
+            throw new InvalidMetadataError(
+              'daily_log signature entry must have non-empty signatureDataUrl',
+            );
+          }
+          if (
+            sig.signedAt !== undefined &&
+            (typeof sig.signedAt !== 'string' || sig.signedAt.trim().length === 0)
+          ) {
+            throw new InvalidMetadataError(
+              'daily_log signature entry signedAt must be a non-empty string if provided',
+            );
+          }
+        }
+      }
+      // Validate vendorId is a string or null, and references an existing vendor
+      if (dlm.vendorId !== undefined && dlm.vendorId !== null) {
+        if (typeof dlm.vendorId !== 'string' || dlm.vendorId.trim().length === 0) {
+          throw new InvalidMetadataError('daily_log vendorId must be a non-empty string or null');
+        }
+        const vendor = db
+          .select({ id: vendors.id })
+          .from(vendors)
+          .where(eq(vendors.id, dlm.vendorId))
+          .get();
+        if (!vendor) {
+          throw new InvalidMetadataError(
+            `daily_log vendorId "${dlm.vendorId}" does not reference an existing vendor`,
+          );
+        }
+      }
+      // Validate workStart is HH:mm or null
+      const HH_MM_REGEX = /^\d{2}:\d{2}$/;
+      if (dlm.workStart !== undefined && dlm.workStart !== null) {
+        if (typeof dlm.workStart !== 'string' || !HH_MM_REGEX.test(dlm.workStart)) {
+          throw new InvalidMetadataError(
+            'daily_log workStart must be a valid HH:mm time string or null',
+          );
+        }
+      }
+      // Validate workEnd is HH:mm or null
+      if (dlm.workEnd !== undefined && dlm.workEnd !== null) {
+        if (typeof dlm.workEnd !== 'string' || !HH_MM_REGEX.test(dlm.workEnd)) {
+          throw new InvalidMetadataError(
+            'daily_log workEnd must be a valid HH:mm time string or null',
+          );
+        }
+      }
+      // Cross-field: end must be strictly after start when both present
+      if (dlm.workStart && dlm.workEnd) {
+        if (dlm.workEnd <= dlm.workStart) {
+          throw new InvalidMetadataError('daily_log workEnd must be strictly after workStart');
+        }
+      }
+      break;
+    }
+
+    case 'site_visit': {
+      const svm = md as SiteVisitMetadata;
+      // Validate inspectorName is string or null
+      if (svm.inspectorName !== undefined && svm.inspectorName !== null) {
+        if (typeof svm.inspectorName !== 'string') {
+          throw new InvalidMetadataError('site_visit inspectorName must be a string or null');
+        }
+      }
+      // Validate outcome enum
+      if (svm.outcome !== undefined && svm.outcome !== null) {
+        const validOutcomes = ['pass', 'fail', 'conditional'];
+        if (!validOutcomes.includes(svm.outcome)) {
+          throw new InvalidMetadataError(
+            `site_visit outcome must be one of: ${validOutcomes.join(', ')}`,
+          );
+        }
+      }
+      // Validate signatures array
+      if (svm.signatures !== undefined && svm.signatures !== null) {
+        if (!Array.isArray(svm.signatures)) {
+          throw new InvalidMetadataError('site_visit signatures must be an array or null');
+        }
+        for (const sig of svm.signatures) {
+          if (typeof sig.signerName !== 'string' || sig.signerName.trim().length === 0) {
+            throw new InvalidMetadataError(
+              'site_visit signature entry must have non-empty signerName',
+            );
+          }
+          if (!['self', 'vendor'].includes(sig.signerType)) {
+            throw new InvalidMetadataError(
+              'site_visit signature entry signerType must be "self" or "vendor"',
+            );
+          }
+          if (
+            typeof sig.signatureDataUrl !== 'string' ||
+            sig.signatureDataUrl.trim().length === 0
+          ) {
+            throw new InvalidMetadataError(
+              'site_visit signature entry must have non-empty signatureDataUrl',
+            );
+          }
+          if (
+            sig.signedAt !== undefined &&
+            (typeof sig.signedAt !== 'string' || sig.signedAt.trim().length === 0)
+          ) {
+            throw new InvalidMetadataError(
+              'site_visit signature entry signedAt must be a non-empty string if provided',
+            );
+          }
+        }
+      }
+      break;
+    }
+
+    case 'delivery': {
+      const dm = md as DeliveryMetadata;
+      // Validate vendor is string or null
+      if (dm.vendor !== undefined && dm.vendor !== null) {
+        if (typeof dm.vendor !== 'string') {
+          throw new InvalidMetadataError('delivery vendor must be a string or null');
+        }
+      }
+      // Validate materials is array of strings or null
+      if (dm.materials !== undefined && dm.materials !== null) {
+        if (!Array.isArray(dm.materials)) {
+          throw new InvalidMetadataError('delivery materials must be an array or null');
+        }
+        if (!dm.materials.every((m) => typeof m === 'string')) {
+          throw new InvalidMetadataError('delivery materials must be an array of strings');
+        }
+      }
+      // Validate deliveryConfirmed is boolean
+      if (dm.deliveryConfirmed !== undefined && typeof dm.deliveryConfirmed !== 'boolean') {
+        throw new InvalidMetadataError('delivery deliveryConfirmed must be a boolean');
+      }
+      break;
+    }
+
+    case 'issue': {
+      const im = md as IssueMetadata;
+      // Validate severity enum
+      if (im.severity !== undefined && im.severity !== null) {
+        const validSeverities = ['low', 'medium', 'high', 'critical'];
+        if (!validSeverities.includes(im.severity)) {
+          throw new InvalidMetadataError(
+            `issue severity must be one of: ${validSeverities.join(', ')}`,
+          );
+        }
+      }
+      // Validate resolutionStatus enum
+      if (im.resolutionStatus !== undefined && im.resolutionStatus !== null) {
+        const validStatuses = ['open', 'in_progress', 'resolved'];
+        if (!validStatuses.includes(im.resolutionStatus)) {
+          throw new InvalidMetadataError(
+            `issue resolutionStatus must be one of: ${validStatuses.join(', ')}`,
+          );
+        }
+      }
+      break;
+    }
+
+    case 'general_note':
+      // general_note accepts any metadata structure
+      break;
+
+    default:
+      // For automatic types, validate less strictly
+      break;
+  }
+}
+
+/**
+ * List diary entries with pagination, filtering, and search.
+ */
+export function listDiaryEntries(
+  db: DbType,
+  query: DiaryEntryListQuery,
+): { items: DiaryEntrySummary[]; pagination: PaginationMeta } {
+  const page = Math.max(1, query.page ?? 1);
+  const pageSize = Math.min(100, Math.max(1, query.pageSize ?? 50));
+
+  // Build WHERE conditions
+  const conditions: SQL<unknown>[] = [];
+
+  if (query.type) {
+    type EntryTypeValue = typeof diaryEntries.entryType._.data;
+    const types = query.type
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean) as EntryTypeValue[];
+    if (types.length === 1) {
+      // types[0] is defined: length check ensures the array has one element
+      conditions.push(eq(diaryEntries.entryType, types[0]!));
+    } else if (types.length > 1) {
+      conditions.push(inArray(diaryEntries.entryType, types));
+    }
+  }
+
+  if (query.dateFrom) {
+    conditions.push(gte(diaryEntries.entryDate, query.dateFrom));
+  }
+
+  if (query.dateTo) {
+    conditions.push(lte(diaryEntries.entryDate, query.dateTo));
+  }
+
+  if (query.automatic !== undefined) {
+    conditions.push(eq(diaryEntries.isAutomatic, query.automatic));
+  }
+
+  if (query.status) {
+    conditions.push(eq(diaryEntries.status, query.status));
+  }
+
+  if (query.q) {
+    // Escape SQL LIKE wildcards
+    const escapedQ = query.q.replace(/%/g, '\\%').replace(/_/g, '\\_');
+    const pattern = `%${escapedQ}%`;
+    conditions.push(
+      or(
+        sql`LOWER(${diaryEntries.title}) LIKE LOWER(${pattern}) ESCAPE '\\'`,
+        sql`LOWER(${diaryEntries.body}) LIKE LOWER(${pattern}) ESCAPE '\\'`,
+      )!,
+    );
+  }
+
+  const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+  // Count total items
+  const countResult = db
+    .select({ count: sql<number>`COUNT(*)` })
+    .from(diaryEntries)
+    .where(whereClause)
+    .get();
+  const totalItems = countResult?.count ?? 0;
+  const totalPages = Math.ceil(totalItems / pageSize);
+
+  // Fetch paginated entries with users and photo counts
+  const offset = (page - 1) * pageSize;
+  const entryRows = db
+    .select({
+      entry: diaryEntries,
+      user: users,
+    })
+    .from(diaryEntries)
+    .leftJoin(users, eq(users.id, diaryEntries.createdBy))
+    .where(whereClause)
+    .orderBy(desc(diaryEntries.entryDate), desc(diaryEntries.createdAt))
+    .limit(pageSize)
+    .offset(offset)
+    .all();
+
+  // Batch query photo counts
+  const entryIds = entryRows.map((row) => row.entry.id);
+
+  let photoCountMap: Map<string, number> = new Map();
+  if (entryIds.length > 0) {
+    const photoCounts = db
+      .select({
+        entityId: photos.entityId,
+        count: sql<number>`COUNT(*)`,
+      })
+      .from(photos)
+      .where(and(eq(photos.entityType, 'diary_entry'), inArray(photos.entityId, entryIds)))
+      .groupBy(photos.entityId)
+      .all();
+
+    photoCountMap = new Map(photoCounts.map((r) => [r.entityId, r.count]));
+  }
+
+  // Load area map once
+  const areaMap = loadAreaMap(db);
+
+  // Resolve source entity titles and areas for all entries
+  const items = entryRows.map((row) => {
+    const sourceEntityTitle = resolveSourceEntityTitle(
+      db,
+      row.entry.sourceEntityType,
+      row.entry.sourceEntityId,
+    );
+    const sourceEntityArea = resolveSourceEntityArea(
+      db,
+      row.entry.sourceEntityType,
+      row.entry.sourceEntityId,
+      areaMap,
+    );
+    return toDiarySummary(
+      row.entry,
+      row.user,
+      photoCountMap.get(row.entry.id) ?? 0,
+      sourceEntityTitle,
+      sourceEntityArea,
+      db,
+    );
+  });
+
+  return {
+    items,
+    pagination: {
+      page,
+      pageSize,
+      totalItems,
+      totalPages,
+    },
+  };
+}
+
+/**
+ * Get a single diary entry by ID.
+ * @throws NotFoundError if entry does not exist
+ */
+export function getDiaryEntry(db: DbType, id: string): DiaryEntryDetail {
+  const row = db
+    .select({
+      entry: diaryEntries,
+      user: users,
+    })
+    .from(diaryEntries)
+    .leftJoin(users, eq(users.id, diaryEntries.createdBy))
+    .where(eq(diaryEntries.id, id))
+    .get();
+
+  if (!row) {
+    throw new NotFoundError('Diary entry not found');
+  }
+
+  const photoCount = db
+    .select({ count: sql<number>`COUNT(*)` })
+    .from(photos)
+    .where(and(eq(photos.entityType, 'diary_entry'), eq(photos.entityId, id)))
+    .get();
+
+  const sourceEntityTitle = resolveSourceEntityTitle(
+    db,
+    row.entry.sourceEntityType,
+    row.entry.sourceEntityId,
+  );
+
+  const areaMap = loadAreaMap(db);
+  const sourceEntityArea = resolveSourceEntityArea(
+    db,
+    row.entry.sourceEntityType,
+    row.entry.sourceEntityId,
+    areaMap,
+  );
+
+  return toDiarySummary(
+    row.entry,
+    row.user,
+    photoCount?.count ?? 0,
+    sourceEntityTitle,
+    sourceEntityArea,
+    db,
+  );
+}
+
+/**
+ * Create a new diary entry.
+ * Only manual entry types can be created by users; automatic types are system-generated.
+ * When status='draft', validation is relaxed: body and entryDate are optional.
+ * When status='saved' or omitted, full validation applies.
+ * @throws ValidationError if entryType is automatic
+ * @throws InvalidMetadataError if metadata validation fails
+ */
+export function createDiaryEntry(
+  db: DbType,
+  userId: string,
+  data: CreateDiaryEntryRequest,
+): DiaryEntrySummary {
+  // Validate entry type is manual
+  if (!MANUAL_ENTRY_TYPES.has(data.entryType)) {
+    throw new InvalidEntryTypeError(
+      'Only manual entry types can be created: daily_log, site_visit, delivery, issue, general_note',
+    );
+  }
+
+  // Determine if creating a draft or saved entry
+  const isDraft = data.status === 'draft';
+  const status = data.status ?? 'saved';
+
+  // Validate body: required and non-empty for saved, optional/empty for drafts
+  let trimmedBody: string;
+  if (!isDraft) {
+    // Saved entry requires non-empty body
+    if (!data.body) {
+      throw new ValidationError('Entry body is required');
+    }
+    trimmedBody = data.body.trim();
+    if (trimmedBody.length === 0) {
+      throw new ValidationError('Entry body cannot be empty');
+    }
+  } else {
+    // Draft allows empty or missing body
+    trimmedBody = data.body?.trim() ?? '';
+  }
+
+  // Validate metadata (both drafts and saved entries enforce type validation)
+  validateMetadata(data.entryType, data.metadata, db);
+
+  // Validate metadata size
+  if (data.metadata !== null && data.metadata !== undefined) {
+    if (JSON.stringify(data.metadata).length > 2_097_152) {
+      throw new ValidationError('Metadata must not exceed 2MB when serialized');
+    }
+  }
+
+  // Determine entry date: required for saved, defaults to today for drafts
+  const entryDate =
+    data.entryDate ?? (isDraft ? new Date().toISOString().split('T')[0] : undefined);
+  if (!isDraft && !entryDate) {
+    throw new ValidationError('Entry date is required');
+  }
+
+  // Create entry
+  const id = randomUUID();
+  const now = new Date().toISOString();
+
+  db.insert(diaryEntries)
+    .values({
+      id,
+      entryType: data.entryType,
+      entryDate: entryDate || '',
+      title: data.title || null,
+      body: trimmedBody,
+      metadata: data.metadata ? JSON.stringify(data.metadata) : null,
+      status,
+      isAutomatic: false,
+      sourceEntityType: null,
+      sourceEntityId: null,
+      createdBy: userId,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .run();
+
+  // Fetch created entry
+  const user = db.select().from(users).where(eq(users.id, userId)).get() || null;
+
+  return toDiarySummary(
+    {
+      id,
+      entryType: data.entryType,
+      entryDate: entryDate || '',
+      title: data.title || null,
+      body: trimmedBody,
+      metadata: data.metadata ? JSON.stringify(data.metadata) : null,
+      status,
+      isAutomatic: false,
+      sourceEntityType: null,
+      sourceEntityId: null,
+      createdBy: userId,
+      createdAt: now,
+      updatedAt: now,
+    },
+    user,
+    0,
+    null,
+    null,
+    db,
+  );
+}
+
+/**
+ * Update a diary entry.
+ * Cannot update automatic entries.
+ * Validation rules depend on entry status: drafts have relaxed validation, saved entries have full validation.
+ * @throws NotFoundError if entry does not exist
+ * @throws ImmutableEntryError if entry is automatic or signed
+ * @throws InvalidMetadataError if metadata validation fails
+ */
+export function updateDiaryEntry(
+  db: DbType,
+  id: string,
+  data: UpdateDiaryEntryRequest,
+): DiaryEntrySummary {
+  // Fetch entry
+  const entry = db.select().from(diaryEntries).where(eq(diaryEntries.id, id)).get();
+
+  if (!entry) {
+    throw new NotFoundError('Diary entry not found');
+  }
+
+  // Cannot update automatic entries
+  if (entry.isAutomatic) {
+    throw new ImmutableEntryError();
+  }
+
+  // Cannot update signed entries
+  const metadata = parseMetadata(entry.metadata);
+  const isSigned = Boolean(
+    metadata &&
+    'signatures' in metadata &&
+    Array.isArray(metadata.signatures) &&
+    metadata.signatures.length > 0,
+  );
+  if (isSigned) {
+    throw new ImmutableEntryError('Signed diary entries cannot be modified');
+  }
+
+  // Determine if entry is a draft
+  const currentIsDraft = entry.status === 'draft';
+
+  // Validate body if provided
+  if (data.body !== undefined) {
+    const trimmedBody = data.body.trim();
+    // For saved entries, body must be non-empty. For drafts, empty is allowed.
+    if (!currentIsDraft && trimmedBody.length === 0) {
+      throw new ValidationError('Entry body cannot be empty');
+    }
+  }
+
+  // Validate metadata if provided
+  if (data.metadata !== undefined) {
+    validateMetadata(entry.entryType, data.metadata, db);
+  }
+
+  // Validate metadata size
+  if (data.metadata !== null && data.metadata !== undefined) {
+    if (JSON.stringify(data.metadata).length > 2_097_152) {
+      throw new ValidationError('Metadata must not exceed 2MB when serialized');
+    }
+  }
+
+  // Update entry
+  const now = new Date().toISOString();
+  db.update(diaryEntries)
+    .set({
+      entryDate: data.entryDate ?? entry.entryDate,
+      title: data.title !== undefined ? data.title : entry.title,
+      body: data.body ? data.body.trim() : entry.body,
+      metadata: data.metadata !== undefined ? JSON.stringify(data.metadata) : entry.metadata,
+      updatedAt: now,
+    })
+    .where(eq(diaryEntries.id, id))
+    .run();
+
+  // Fetch updated entry
+  const row = db
+    .select({
+      entry: diaryEntries,
+      user: users,
+    })
+    .from(diaryEntries)
+    .leftJoin(users, eq(users.id, diaryEntries.createdBy))
+    .where(eq(diaryEntries.id, id))
+    .get();
+
+  const photoCount = db
+    .select({ count: sql<number>`COUNT(*)` })
+    .from(photos)
+    .where(and(eq(photos.entityType, 'diary_entry'), eq(photos.entityId, id)))
+    .get();
+
+  const sourceEntityTitle = resolveSourceEntityTitle(
+    db,
+    row!.entry.sourceEntityType,
+    row!.entry.sourceEntityId,
+  );
+
+  const areaMap = loadAreaMap(db);
+  const sourceEntityArea = resolveSourceEntityArea(
+    db,
+    row!.entry.sourceEntityType,
+    row!.entry.sourceEntityId,
+    areaMap,
+  );
+
+  return toDiarySummary(
+    row!.entry,
+    row!.user,
+    photoCount?.count ?? 0,
+    sourceEntityTitle,
+    sourceEntityArea,
+    db,
+  );
+}
+
+/**
+ * Delete a diary entry and cascade-delete associated photos.
+ * @throws NotFoundError if entry does not exist
+ */
+export async function deleteDiaryEntry(
+  db: DbType,
+  id: string,
+  photoStoragePath: string,
+): Promise<void> {
+  // Fetch entry
+  const entry = db.select().from(diaryEntries).where(eq(diaryEntries.id, id)).get();
+
+  if (!entry) {
+    throw new NotFoundError('Diary entry not found');
+  }
+
+  // Delete associated photos
+  await deletePhotosForEntity(db, photoStoragePath, 'diary_entry', id);
+
+  // Delete entry
+  db.delete(diaryEntries).where(eq(diaryEntries.id, id)).run();
+}
+
+/**
+ * Create an automatic diary entry (system-generated on state changes).
+ * For internal use only; not exposed via API.
+ */
+export function createAutomaticDiaryEntry(
+  db: DbType,
+  entryType: string,
+  entryDate: string,
+  title: string,
+  body: string,
+  sourceEntityType: string | null,
+  sourceEntityId: string | null,
+): void {
+  const id = randomUUID();
+  const now = new Date().toISOString();
+
+  db.insert(diaryEntries)
+    .values({
+      id,
+      entryType: entryType as typeof diaryEntries.entryType._.data,
+      entryDate,
+      title,
+      body,
+      metadata: null,
+      status: 'saved',
+      isAutomatic: true,
+      sourceEntityType,
+      sourceEntityId,
+      createdBy: null,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .run();
+}
+
+/**
+ * Promote a draft diary entry to saved status.
+ * Applies optional field overrides from the request, validates the merged entry,
+ * and transitions status to 'saved' atomically.
+ * @throws NotFoundError if entry does not exist
+ * @throws ImmutableEntryError if entry is automatic
+ * @throws AlreadySavedError if entry is already saved
+ * @throws ValidationError if validation fails after applying overrides
+ */
+export function promoteDiaryEntry(
+  db: DbType,
+  id: string,
+  data: PromoteDiaryEntryRequest,
+): DiaryEntryDetail {
+  // Fetch entry
+  const entry = db.select().from(diaryEntries).where(eq(diaryEntries.id, id)).get();
+
+  if (!entry) {
+    throw new NotFoundError('Diary entry not found');
+  }
+
+  // Cannot promote automatic entries
+  if (entry.isAutomatic) {
+    throw new ImmutableEntryError('Automatic entries cannot be promoted');
+  }
+
+  // Cannot promote entries that are already saved
+  if (entry.status === 'saved') {
+    throw new AlreadySavedError();
+  }
+
+  // Compute final values using overrides from request or current entry values
+  const finalEntryDate = data.entryDate ?? entry.entryDate;
+  const finalTitle = data.title !== undefined ? data.title : entry.title;
+  const finalBody = data.body ?? entry.body;
+  const finalMetadata = data.metadata !== undefined ? data.metadata : parseMetadata(entry.metadata);
+
+  // Validate required fields for saved entry
+  if (!finalEntryDate || !/^\d{4}-\d{2}-\d{2}$/.test(finalEntryDate)) {
+    throw new ValidationError('Entry date is required and must be in YYYY-MM-DD format');
+  }
+
+  if (!finalBody || finalBody.trim().length === 0) {
+    throw new ValidationError('Entry body is required and cannot be empty');
+  }
+
+  // Validate type-specific required metadata
+  const entryType = entry.entryType;
+  if (entryType === 'site_visit') {
+    const svm = finalMetadata as SiteVisitMetadata | null;
+    if (!svm || !svm.inspectorName || svm.inspectorName.trim().length === 0) {
+      throw new ValidationError('site_visit entries require non-empty inspectorName in metadata');
+    }
+    if (!svm.outcome || !['pass', 'fail', 'conditional'].includes(svm.outcome)) {
+      throw new ValidationError('site_visit entries require outcome in metadata');
+    }
+  }
+
+  if (entryType === 'issue') {
+    const im = finalMetadata as IssueMetadata | null;
+    if (!im || !im.severity || !['low', 'medium', 'high', 'critical'].includes(im.severity)) {
+      throw new ValidationError('issue entries require severity in metadata');
+    }
+    if (
+      !im.resolutionStatus ||
+      !['open', 'in_progress', 'resolved'].includes(im.resolutionStatus)
+    ) {
+      throw new ValidationError('issue entries require resolutionStatus in metadata');
+    }
+  }
+
+  // Validate merged metadata
+  validateMetadata(entryType, finalMetadata, db);
+
+  // Validate metadata size
+  if (finalMetadata !== null && finalMetadata !== undefined) {
+    if (JSON.stringify(finalMetadata).length > 2_097_152) {
+      throw new ValidationError('Metadata must not exceed 2MB when serialized');
+    }
+  }
+
+  // Update entry atomically to saved status with merged fields
+  const now = new Date().toISOString();
+  db.update(diaryEntries)
+    .set({
+      entryDate: finalEntryDate,
+      title: finalTitle,
+      body: finalBody.trim(),
+      metadata: finalMetadata ? JSON.stringify(finalMetadata) : null,
+      status: 'saved',
+      updatedAt: now,
+    })
+    .where(eq(diaryEntries.id, id))
+    .run();
+
+  // Fetch and return the updated entry
+  return getDiaryEntry(db, id);
+}
+
+/**
+ * Find IDs of orphan draft entries older than a specified number of days.
+ * Used by the cleanup cron job to identify drafts to delete.
+ */
+export function findOrphanDraftIds(db: DbType, olderThanDays: number): string[] {
+  const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000).toISOString();
+  const rows = db
+    .select({ id: diaryEntries.id })
+    .from(diaryEntries)
+    .where(and(eq(diaryEntries.status, 'draft'), sql`${diaryEntries.updatedAt} < ${cutoff}`))
+    .all();
+  return rows.map((r) => r.id);
+}

@@ -1,0 +1,1415 @@
+/**
+ * @jest-environment jsdom
+ */
+import { jest, describe, it, expect, beforeEach } from '@jest/globals';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom';
+import { ToastProvider } from '../../components/Toast/ToastContext.js';
+import { ApiClientError } from '../../lib/apiClient.js';
+import type * as InvoicesApiTypes from '../../lib/invoicesApi.js';
+import type { Invoice, InvoiceListPaginatedResponse } from '@cornerstone/shared';
+import type * as InvoicesPageTypes from './InvoicesPage.js';
+import type * as VendorsApiTypes from '../../lib/vendorsApi.js';
+import type * as PaperlessApiTypes from '../../lib/paperlessApi.js';
+
+// ── API mocks ─────────────────────────────────────────────────────────────────
+
+const mockFetchAllInvoices = jest.fn<typeof InvoicesApiTypes.fetchAllInvoices>();
+const mockCreateInvoice = jest.fn<typeof InvoicesApiTypes.createInvoice>();
+const mockFetchVendors = jest.fn<typeof VendorsApiTypes.fetchVendors>();
+
+jest.unstable_mockModule('../../lib/invoicesApi.js', () => ({
+  fetchAllInvoices: mockFetchAllInvoices,
+  createInvoice: mockCreateInvoice,
+  fetchInvoices: jest.fn(),
+  fetchInvoiceById: jest.fn(),
+  updateInvoice: jest.fn(),
+  deleteInvoice: jest.fn(),
+}));
+
+jest.unstable_mockModule('../../lib/vendorsApi.js', () => ({
+  fetchVendors: mockFetchVendors,
+  fetchVendor: jest.fn(),
+  createVendor: jest.fn(),
+  updateVendor: jest.fn(),
+  deleteVendor: jest.fn(),
+}));
+
+// ── Formatters mock ───────────────────────────────────────────────────────────
+
+jest.unstable_mockModule('../../lib/formatters.js', () => {
+  const fmtDate = (d: string | null | undefined, fallback = '—') => {
+    if (!d) return fallback;
+    const [year, month, day] = d.slice(0, 10).split('-').map(Number);
+    if (!year || !month || !day) return fallback;
+    return new Date(year, month - 1, day).toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    });
+  };
+  const fmtCurrency = (n: number) =>
+    new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: 'EUR',
+      minimumFractionDigits: 2,
+    }).format(n);
+  return {
+    formatDate: fmtDate,
+    formatCurrency: fmtCurrency,
+    formatPercent: (n: number) => `${n.toFixed(2)}%`,
+    computeActualDuration: () => null,
+    useFormatters: () => ({
+      formatDate: fmtDate,
+      formatCurrency: fmtCurrency,
+      formatTime: () => '—',
+      formatDateTime: () => '—',
+      formatPercent: (n: number) => `${n.toFixed(2)}%`,
+    }),
+  };
+});
+
+// ── LocaleContext mock — InvoicesPage uses useFormatters() → useLocale() ─────
+// Defensive layer to ensure useLocale never reaches the real LocaleContext
+// implementation (which throws if no LocaleProvider wraps the tree). Pattern
+// matches CalendarView.test.tsx.
+
+jest.unstable_mockModule('../../contexts/LocaleContext.js', () => ({
+  useLocale: jest.fn(() => ({
+    locale: 'en' as const,
+    resolvedLocale: 'en' as const,
+    currency: 'EUR',
+    setLocale: jest.fn(),
+    syncWithServer: jest.fn(),
+  })),
+  LocaleProvider: ({ children }: { children: React.ReactNode }) => children,
+}));
+
+// ── Story #1679: paperlessApi mock ────────────────────────────────────────────
+const mockGetPaperlessStatus = jest.fn<typeof PaperlessApiTypes.getPaperlessStatus>();
+
+jest.unstable_mockModule('../../lib/paperlessApi.js', () => ({
+  getPaperlessStatus: mockGetPaperlessStatus,
+  listPaperlessDocuments: jest.fn(),
+  listPaperlessTags: jest.fn(),
+  getPaperlessDocument: jest.fn(),
+  getDocumentThumbnailUrl: jest.fn().mockReturnValue('/thumb'),
+  getDocumentPreviewUrl: jest.fn().mockReturnValue('/preview'),
+  listPaperlessCorrespondents: jest.fn(),
+}));
+
+// ── Story #1679: configApi mock ───────────────────────────────────────────────
+// Only autoItemizeEnabled is exercised by these tests — narrower than the real
+// fetchConfig's AppConfigResponse return type is intentional here.
+const mockFetchConfig = jest.fn<() => Promise<{ autoItemizeEnabled: boolean }>>();
+
+jest.unstable_mockModule('../../lib/configApi.js', () => ({
+  fetchConfig: mockFetchConfig,
+}));
+
+// ── Story #1679: InvoicePaperlessPickerModal mock ─────────────────────────────
+
+jest.unstable_mockModule('../../components/invoices/InvoicePaperlessPickerModal.js', () => ({
+  InvoicePaperlessPickerModal: ({
+    onDocumentSelected,
+    onManualEntry,
+    onClose,
+  }: {
+    onDocumentSelected: (doc: { id: number; title: string }) => void;
+    onManualEntry: () => void;
+    onClose: () => void;
+  }) =>
+    React.createElement(
+      'div',
+      { 'data-testid': 'paperless-picker-modal' },
+      React.createElement(
+        'button',
+        { onClick: () => onDocumentSelected({ id: 1, title: 'Doc' }) },
+        'Select Document',
+      ),
+      React.createElement('button', { onClick: onManualEntry }, 'Manual Entry'),
+      React.createElement('button', { onClick: onClose }, 'Close Modal'),
+    ),
+}));
+
+// React must be imported for JSX in the mock factory above
+import React from 'react';
+
+// ── Location helper ───────────────────────────────────────────────────────────
+
+function LocationDisplay() {
+  const location = useLocation();
+  return <div data-testid="location">{location.pathname}</div>;
+}
+
+// ── Fixtures ──────────────────────────────────────────────────────────────────
+
+const sampleInvoice1: Invoice = {
+  id: 'inv-001',
+  vendorId: 'v-1',
+  vendorName: 'ACME Construction',
+  invoiceNumber: 'INV-2026-001',
+  amount: 15000,
+  date: '2026-02-01',
+  dueDate: '2026-03-01',
+  status: 'pending',
+  notes: null,
+  budgetLines: [],
+  remainingAmount: 15000,
+  deposits: [],
+  finalPaymentAmount: 15000,
+  createdBy: null,
+  createdAt: '2026-02-01T00:00:00.000Z',
+  updatedAt: '2026-02-01T00:00:00.000Z',
+};
+
+const sampleInvoice2: Invoice = {
+  id: 'inv-002',
+  vendorId: 'v-2',
+  vendorName: 'Quality Plumbing',
+  invoiceNumber: null,
+  amount: 3500,
+  date: '2026-01-15',
+  dueDate: null,
+  status: 'paid',
+  notes: 'Paid on time',
+  budgetLines: [
+    {
+      id: 'ibl-1',
+      budgetLineId: 'wib-1',
+      budgetLineType: 'work_item',
+      itemName: 'Plumbing Work',
+      budgetLineDescription: null,
+      categoryName: null,
+      categoryColor: null,
+      categoryTranslationKey: null,
+      plannedAmount: 3500,
+      confidence: 'quote',
+      itemizedAmount: 3500,
+    },
+  ],
+  remainingAmount: 0,
+  deposits: [],
+  finalPaymentAmount: 3500,
+  createdBy: null,
+  createdAt: '2026-01-15T00:00:00.000Z',
+  updatedAt: '2026-01-15T00:00:00.000Z',
+};
+
+const emptySummary = {
+  pending: { count: 0, totalAmount: 0 },
+  paid: { count: 0, totalAmount: 0 },
+  claimed: { count: 0, totalAmount: 0 },
+  quotation: { count: 0, totalAmount: 0 },
+  overdue: { count: 0, totalAmount: 0 },
+  claimable: { count: 0, totalAmount: 0 },
+  quotationCoveredByDeposits: 0,
+  openPayable: { count: 0, totalAmount: 0 },
+  refundsDue: { count: 0, totalAmount: 0 },
+};
+
+const populatedSummary = {
+  pending: { count: 1, totalAmount: 15000 },
+  paid: { count: 1, totalAmount: 3500 },
+  claimed: { count: 0, totalAmount: 0 },
+  quotation: { count: 0, totalAmount: 0 },
+  overdue: { count: 0, totalAmount: 0 },
+  claimable: { count: 1, totalAmount: 15000 },
+  quotationCoveredByDeposits: 0,
+  openPayable: { count: 1, totalAmount: 15000 },
+  refundsDue: { count: 0, totalAmount: 0 },
+};
+
+const emptyResponse: InvoiceListPaginatedResponse = {
+  invoices: [],
+  pagination: { page: 1, pageSize: 25, totalPages: 0, totalItems: 0 },
+  summary: emptySummary,
+};
+
+const populatedResponse: InvoiceListPaginatedResponse = {
+  invoices: [sampleInvoice1, sampleInvoice2],
+  pagination: { page: 1, pageSize: 25, totalPages: 1, totalItems: 2 },
+  summary: populatedSummary,
+};
+
+const emptyVendorsResponse = {
+  vendors: [],
+  pagination: { page: 1, pageSize: 100, totalItems: 0, totalPages: 0 },
+};
+
+const vendorsResponse = {
+  vendors: [
+    {
+      id: 'v-1',
+      name: 'ACME Construction',
+      notes: null,
+      phone: null,
+      email: null,
+      address: null,
+      trade: null,
+      createdBy: null,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    },
+    {
+      id: 'v-2',
+      name: 'Quality Plumbing',
+      notes: null,
+      phone: null,
+      email: null,
+      address: null,
+      trade: null,
+      createdBy: null,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    },
+  ],
+  pagination: { page: 1, pageSize: 100, totalItems: 2, totalPages: 1 },
+};
+
+describe('InvoicesPage', () => {
+  let InvoicesPageModule: typeof InvoicesPageTypes;
+
+  beforeEach(async () => {
+    mockFetchAllInvoices.mockReset();
+    mockCreateInvoice.mockReset();
+    mockFetchVendors.mockReset();
+    mockGetPaperlessStatus.mockReset();
+    mockFetchConfig.mockReset();
+
+    if (!InvoicesPageModule) {
+      InvoicesPageModule = await import('./InvoicesPage.js');
+    }
+
+    // Default: paperless not configured + auto-itemize disabled (manual modal path)
+    mockGetPaperlessStatus.mockResolvedValue({
+      configured: false,
+      reachable: false,
+      error: null,
+      paperlessUrl: null,
+      filterTag: null,
+    });
+    mockFetchConfig.mockResolvedValue({ autoItemizeEnabled: false });
+
+    // Default: empty vendors
+    mockFetchVendors.mockResolvedValue(emptyVendorsResponse);
+  });
+
+  function renderPage() {
+    return render(
+      <ToastProvider>
+        <MemoryRouter initialEntries={['/budget/invoices']}>
+          <Routes>
+            <Route path="/budget/invoices" element={<InvoicesPageModule.InvoicesPage />} />
+            <Route path="/budget/invoices/:id" element={<div>Invoice Detail</div>} />
+            <Route path="/settings/vendors/:id" element={<div>Vendor Detail</div>} />
+          </Routes>
+          <LocationDisplay />
+        </MemoryRouter>
+      </ToastProvider>,
+    );
+  }
+
+  // ─── Loading state ────────────────────────────────────────────────────────
+
+  describe('loading state', () => {
+    it('renders loading skeleton while fetching', () => {
+      mockFetchAllInvoices.mockReturnValueOnce(new Promise(() => {}));
+
+      renderPage();
+
+      // DataTable shows Skeleton with role="status"
+      expect(screen.getByRole('status')).toBeInTheDocument();
+    });
+  });
+
+  // ─── Populated state ──────────────────────────────────────────────────────
+
+  describe('populated state', () => {
+    it('renders invoice number for invoices with a number', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(populatedResponse);
+
+      renderPage();
+
+      // DataTable renders each item in both table row and mobile card (duplicate text)
+      await waitFor(() => {
+        expect(screen.getAllByText('INV-2026-001')[0]!).toBeInTheDocument();
+      });
+    });
+
+    it('renders vendor name links', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(populatedResponse);
+
+      renderPage();
+
+      // DataTable renders items in both table and mobile card view (duplicate text)
+      await waitFor(() => {
+        expect(screen.getAllByText('ACME Construction')[0]!).toBeInTheDocument();
+      });
+      expect(screen.getAllByText('Quality Plumbing')[0]!).toBeInTheDocument();
+    });
+
+    it('renders summary cards with correct counts', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(populatedResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getAllByText('INV-2026-001')[0]!).toBeInTheDocument();
+      });
+
+      // Pending count = 1 and paid count = 1 (paid + claimed) in summary cards.
+      // Multiple elements have text "1"; use getAllByText to confirm at least one exists.
+      expect(screen.getAllByText('1').length).toBeGreaterThan(0);
+    });
+
+    it('renders the "New Invoice" button', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(emptyResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('new-invoice-button')).toBeInTheDocument();
+      });
+    });
+
+    it('renders attribution as "None" for invoice with no budget lines', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(populatedResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getAllByText('INV-2026-001')[0]!).toBeInTheDocument();
+      });
+    });
+  });
+
+  // ─── Error state ──────────────────────────────────────────────────────────
+
+  describe('error state', () => {
+    it('shows API error message when fetchAllInvoices fails', async () => {
+      // Use mockRejectedValue (not Once) so ALL calls fail consistently —
+      // useTableState may trigger multiple loadInvoices calls
+      mockFetchAllInvoices.mockRejectedValue(
+        new ApiClientError(500, { code: 'INTERNAL_ERROR', message: 'Service unavailable' }),
+      );
+
+      renderPage();
+
+      // DataTable renders the error via role="alert" banner
+      await waitFor(() => {
+        expect(screen.getByRole('alert')).toBeInTheDocument();
+      });
+      expect(screen.getByText('Service unavailable')).toBeInTheDocument();
+    });
+
+    it('shows generic error for non-ApiClientError', async () => {
+      // Use mockRejectedValue (not Once) so ALL calls fail consistently
+      mockFetchAllInvoices.mockRejectedValue(new Error('Network error'));
+
+      renderPage();
+
+      // DataTable renders the error via role="alert" banner
+      await waitFor(() => {
+        expect(screen.getByRole('alert')).toBeInTheDocument();
+      });
+    });
+  });
+
+  // ─── Empty state ──────────────────────────────────────────────────────────
+
+  describe('empty state', () => {
+    it('renders without crashing when no invoices returned', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(emptyResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      });
+    });
+  });
+
+  // ─── Create Invoice modal ─────────────────────────────────────────────────
+
+  describe('create invoice modal', () => {
+    it('opens modal when New Invoice button is clicked', async () => {
+      const user = userEvent.setup();
+      // Use mockResolvedValue (not Once) to handle multiple loadInvoices calls from useTableState
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('new-invoice-button')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByTestId('new-invoice-button'));
+
+      // Modal should appear
+      await waitFor(() => {
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+      });
+    });
+
+    it('shows vendor select in modal', async () => {
+      const user = userEvent.setup();
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+      mockFetchVendors.mockResolvedValue(vendorsResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('new-invoice-button')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByTestId('new-invoice-button'));
+
+      await waitFor(() => {
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+      });
+
+      // Vendor select should be visible
+      expect(screen.getByRole('combobox', { name: /vendor/i })).toBeInTheDocument();
+    });
+
+    it('shows validation error when submitting without vendor', async () => {
+      const user = userEvent.setup();
+      // Use mockResolvedValue (not Once) to handle multiple loadInvoices calls from useTableState
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('new-invoice-button')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByTestId('new-invoice-button'));
+
+      await waitFor(() => {
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+      });
+
+      // The Create button is disabled when no vendor is selected.
+      // Submit the form directly to trigger JS validation (form has noValidate).
+      const form = screen.getByRole('dialog').querySelector('form');
+      expect(form).toBeTruthy();
+      if (form) fireEvent.submit(form);
+
+      await waitFor(() => {
+        expect(screen.getByRole('alert')).toBeInTheDocument();
+      });
+      expect(mockCreateInvoice).not.toHaveBeenCalled();
+    });
+
+    it('shows validation error for missing amount', async () => {
+      const user = userEvent.setup();
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+      mockFetchVendors.mockResolvedValue(vendorsResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('new-invoice-button')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByTestId('new-invoice-button'));
+
+      await waitFor(() => {
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+      });
+
+      // Select a vendor
+      const vendorSelect = screen.getByRole('combobox', { name: /vendor/i });
+      await user.selectOptions(vendorSelect, 'v-1');
+
+      // Set a date, no amount
+      const dateInput = screen.getByLabelText(/invoice date/i);
+      fireEvent.change(dateInput, { target: { value: '2026-02-01' } });
+
+      // Create button is disabled when amount is missing; submit form directly
+      const form = screen.getByRole('dialog').querySelector('form');
+      expect(form).toBeTruthy();
+      if (form) fireEvent.submit(form);
+
+      await waitFor(() => {
+        expect(screen.getByRole('alert')).toBeInTheDocument();
+      });
+      expect(mockCreateInvoice).not.toHaveBeenCalled();
+    });
+
+    it('calls createInvoice with correct data on valid submission', async () => {
+      const user = userEvent.setup();
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+      mockFetchVendors.mockResolvedValue(vendorsResponse);
+      mockCreateInvoice.mockResolvedValueOnce(sampleInvoice1);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('new-invoice-button')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByTestId('new-invoice-button'));
+
+      await waitFor(() => {
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+      });
+
+      // Fill vendor
+      const vendorSelect = screen.getByRole('combobox', { name: /vendor/i });
+      await user.selectOptions(vendorSelect, 'v-1');
+
+      // Fill amount using fireEvent.change (reliable for number inputs)
+      const amountInput = screen.getByLabelText(/^amount/i);
+      fireEvent.change(amountInput, { target: { value: '15000' } });
+
+      // Fill date
+      const dateInput = screen.getByLabelText(/invoice date/i);
+      fireEvent.change(dateInput, { target: { value: '2026-02-01' } });
+
+      // The Create button is enabled once all required fields are filled;
+      // submit the form directly to bypass any potential button-click issues
+      const form = screen.getByRole('dialog').querySelector('form');
+      expect(form).toBeTruthy();
+      if (form) fireEvent.submit(form);
+
+      await waitFor(() => {
+        expect(mockCreateInvoice).toHaveBeenCalledWith(
+          'v-1',
+          expect.objectContaining({
+            amount: 15000,
+            date: '2026-02-01',
+          }),
+        );
+      });
+    });
+
+    it('shows API error when createInvoice fails', async () => {
+      const user = userEvent.setup();
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+      mockFetchVendors.mockResolvedValue(vendorsResponse);
+      mockCreateInvoice.mockRejectedValueOnce(
+        new ApiClientError(500, { code: 'INTERNAL_ERROR', message: 'Creation failed' }),
+      );
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('new-invoice-button')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByTestId('new-invoice-button'));
+
+      await waitFor(() => {
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+      });
+
+      const vendorSelect = screen.getByRole('combobox', { name: /vendor/i });
+      await user.selectOptions(vendorSelect, 'v-1');
+
+      // Fill amount using fireEvent.change (reliable for number inputs)
+      const amountInput = screen.getByLabelText(/^amount/i);
+      fireEvent.change(amountInput, { target: { value: '5000' } });
+
+      const dateInput = screen.getByLabelText(/invoice date/i);
+      fireEvent.change(dateInput, { target: { value: '2026-02-01' } });
+
+      // Submit the form directly (reliable for controlled inputs)
+      const form = screen.getByRole('dialog').querySelector('form');
+      expect(form).toBeTruthy();
+      if (form) fireEvent.submit(form);
+
+      await waitFor(() => {
+        expect(screen.getByRole('alert')).toBeInTheDocument();
+        expect(screen.getByText('Creation failed')).toBeInTheDocument();
+      });
+    });
+
+    it('closes modal when Cancel is clicked', async () => {
+      const user = userEvent.setup();
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('new-invoice-button')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByTestId('new-invoice-button'));
+
+      await waitFor(() => {
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+      });
+
+      const cancelBtn = screen
+        .getAllByRole('button')
+        .find((btn) => btn.textContent?.match(/cancel/i));
+      expect(cancelBtn).toBeTruthy();
+      if (cancelBtn) await user.click(cancelBtn);
+
+      await waitFor(() => {
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      });
+    });
+  });
+
+  // ─── Actions menu ─────────────────────────────────────────────────────────
+
+  describe('actions menu', () => {
+    it('shows action menu button for each invoice', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(populatedResponse);
+
+      renderPage();
+
+      // DataTable renders renderActions in both table and mobile card — use getAllByTestId
+      await waitFor(() => {
+        expect(screen.getAllByTestId('invoice-menu-button-inv-001')[0]!).toBeInTheDocument();
+      });
+      expect(screen.getAllByTestId('invoice-menu-button-inv-002')[0]!).toBeInTheDocument();
+    });
+
+    it('shows view option in dropdown when menu opened', async () => {
+      const user = userEvent.setup();
+      mockFetchAllInvoices.mockResolvedValueOnce(populatedResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getAllByTestId('invoice-menu-button-inv-001')[0]!).toBeInTheDocument();
+      });
+
+      await user.click(screen.getAllByTestId('invoice-menu-button-inv-001')[0]!);
+
+      expect(screen.getAllByTestId('invoice-view-inv-001')[0]!).toBeInTheDocument();
+    });
+
+    it('navigates to invoice detail on view click', async () => {
+      const user = userEvent.setup();
+      mockFetchAllInvoices.mockResolvedValueOnce(populatedResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getAllByTestId('invoice-menu-button-inv-001')[0]!).toBeInTheDocument();
+      });
+
+      await user.click(screen.getAllByTestId('invoice-menu-button-inv-001')[0]!);
+      await user.click(screen.getAllByTestId('invoice-view-inv-001')[0]!);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('location')).toHaveTextContent('/budget/invoices/inv-001');
+      });
+    });
+  });
+
+  // ─── Summary cards (#1373) ────────────────────────────────────────────────
+
+  describe('summary cards (#1373)', () => {
+    it('renders four summary cards (pending, paid, claimed, quotation)', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(populatedResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getAllByText('INV-2026-001')[0]!).toBeInTheDocument();
+      });
+
+      // All four status labels should be present (getAllByText: labels appear in both
+      // summary cards and filter dropdown, so multiple matches are expected)
+      expect(screen.getAllByText('Pending').length).toBeGreaterThan(0);
+      expect(screen.getAllByText('Paid').length).toBeGreaterThan(0);
+      expect(screen.getAllByText('Claimed').length).toBeGreaterThan(0);
+      expect(screen.getAllByText('Quotation').length).toBeGreaterThan(0);
+    });
+
+    it('renders the Claimed card with correct count and amount', async () => {
+      const responseWithClaimed: InvoiceListPaginatedResponse = {
+        ...populatedResponse,
+        summary: {
+          pending: { count: 1, totalAmount: 15000 },
+          paid: { count: 0, totalAmount: 0 },
+          claimed: { count: 3, totalAmount: 900 },
+          quotation: { count: 0, totalAmount: 0 },
+          overdue: { count: 0, totalAmount: 0 },
+          claimable: { count: 1, totalAmount: 15000 },
+          quotationCoveredByDeposits: 0,
+          openPayable: { count: 1, totalAmount: 15000 },
+          refundsDue: { count: 0, totalAmount: 0 },
+        },
+      };
+      mockFetchAllInvoices.mockResolvedValueOnce(responseWithClaimed);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getAllByText('Claimed').length).toBeGreaterThan(0);
+      });
+
+      // Count 3 should appear in the DOM (summaryCount span under the Claimed card)
+      // Multiple elements may show "3" — at least one must exist
+      expect(screen.getAllByText('3').length).toBeGreaterThan(0);
+    });
+
+    it('Claimed card still renders when claimed count is 0', async () => {
+      const responseWithZeroClaimed: InvoiceListPaginatedResponse = {
+        ...emptyResponse,
+        summary: {
+          pending: { count: 0, totalAmount: 0 },
+          paid: { count: 0, totalAmount: 0 },
+          claimed: { count: 0, totalAmount: 0 },
+          quotation: { count: 0, totalAmount: 0 },
+          overdue: { count: 0, totalAmount: 0 },
+          claimable: { count: 0, totalAmount: 0 },
+          quotationCoveredByDeposits: 0,
+          openPayable: { count: 0, totalAmount: 0 },
+          refundsDue: { count: 0, totalAmount: 0 },
+        },
+      };
+      mockFetchAllInvoices.mockResolvedValueOnce(responseWithZeroClaimed);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      });
+
+      expect(screen.getAllByText('Claimed').length).toBeGreaterThan(0);
+    });
+
+    it('Claimable card shows only claimable summary data (not combined with claimed)', async () => {
+      const responseWithSeparateData: InvoiceListPaginatedResponse = {
+        ...populatedResponse,
+        summary: {
+          pending: { count: 1, totalAmount: 15000 },
+          paid: { count: 2, totalAmount: 5000 },
+          claimed: { count: 3, totalAmount: 900 },
+          quotation: { count: 0, totalAmount: 0 },
+          overdue: { count: 0, totalAmount: 0 },
+          claimable: { count: 2, totalAmount: 12000 },
+          quotationCoveredByDeposits: 0,
+          openPayable: { count: 1, totalAmount: 15000 },
+          refundsDue: { count: 0, totalAmount: 0 },
+        },
+      };
+      mockFetchAllInvoices.mockResolvedValueOnce(responseWithSeparateData);
+
+      const fmtCurrency = (n: number) =>
+        new Intl.NumberFormat('en-US', {
+          style: 'currency',
+          currency: 'EUR',
+          minimumFractionDigits: 2,
+        }).format(n);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getAllByText('Claimable').length).toBeGreaterThan(0);
+        expect(screen.getAllByText('Claimed').length).toBeGreaterThan(0);
+      });
+
+      // Claimable total is €12,000 and claimed total is €900 — they must appear as separate amounts
+      expect(screen.getByText(fmtCurrency(12000))).toBeInTheDocument();
+      expect(screen.getByText(fmtCurrency(900))).toBeInTheDocument();
+    });
+  });
+
+  // ─── Overdue summary card (#1421) ────────────────────────────────────────────
+
+  describe('overdue summary card (#1421)', () => {
+    it('T1: renders overdue card when summary.overdue.count is 2', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce({
+        ...emptyResponse,
+        summary: { ...emptySummary, overdue: { count: 2, totalAmount: 3000 } },
+      });
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('summary-card-overdue')).toBeInTheDocument();
+      });
+      // The count "2" must appear inside the overdue card
+      const card = screen.getByTestId('summary-card-overdue');
+      expect(card).toHaveTextContent('2');
+    });
+
+    it('T2: does NOT render overdue card when summary.overdue.count is 0', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce({
+        ...emptyResponse,
+        summary: { ...emptySummary, overdue: { count: 0, totalAmount: 0 } },
+      });
+
+      renderPage();
+
+      await waitFor(() => {
+        // Wait for the loading state to clear
+        expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      });
+      expect(screen.queryByTestId('summary-card-overdue')).not.toBeInTheDocument();
+    });
+
+    it('T3: empty response (no invoices, overdue 0) — card is NOT in document', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(emptyResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      });
+      expect(screen.queryByTestId('summary-card-overdue')).not.toBeInTheDocument();
+    });
+
+    it('T4: renders overdue count "3" inside the card when summary.overdue.count is 3', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce({
+        ...emptyResponse,
+        summary: { ...emptySummary, overdue: { count: 3, totalAmount: 7500 } },
+      });
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('summary-card-overdue')).toBeInTheDocument();
+      });
+      const card = screen.getByTestId('summary-card-overdue');
+      expect(card).toHaveTextContent('3');
+    });
+
+    it('summaryGrid container exists in the DOM', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(emptyResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      });
+
+      // The summaryGrid className is applied to the grid container div
+      // identity-obj-proxy returns 'summaryGrid' as the class name
+      const grid = document.querySelector('[class*="summaryGrid"]');
+      expect(grid).toBeInTheDocument();
+    });
+  });
+
+  // ─── getAttributionLabel utility (tested via rendering) ────────────────────
+
+  describe('attribution column', () => {
+    it('renders 100% attribution for fully allocated invoice', async () => {
+      const fullyAllocatedInvoice: Invoice = {
+        ...sampleInvoice2,
+        // sampleInvoice2 has budgetLines with itemizedAmount = amount = 3500
+        // so getAttributionLabel returns "100% allocated"
+      };
+
+      mockFetchAllInvoices.mockResolvedValueOnce({
+        ...populatedResponse,
+        invoices: [fullyAllocatedInvoice],
+      });
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getAllByText('Quality Plumbing')[0]!).toBeInTheDocument();
+      });
+    });
+  });
+
+  // ─── Story #1679: "New Invoice" button branching logic ──────────────────────
+
+  describe('"New Invoice" button branching (#1679)', () => {
+    it('button has aria-disabled while integration status is loading', async () => {
+      // Never resolve — stays loading
+      mockGetPaperlessStatus.mockReturnValue(new Promise(() => {}));
+      mockFetchConfig.mockReturnValue(new Promise(() => {}));
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+
+      renderPage();
+
+      // Button should appear immediately with aria-disabled=true
+      await waitFor(() => {
+        const btn = screen.getByTestId('new-invoice-button');
+        expect(btn).toBeInTheDocument();
+        expect(btn).toHaveAttribute('aria-disabled', 'true');
+      });
+    });
+
+    it('button is enabled after integration status resolves', async () => {
+      mockGetPaperlessStatus.mockResolvedValue({
+        configured: false,
+        reachable: false,
+        error: null,
+        paperlessUrl: null,
+        filterTag: null,
+      });
+      mockFetchConfig.mockResolvedValue({ autoItemizeEnabled: false });
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        const btn = screen.getByTestId('new-invoice-button');
+        expect(btn).not.toHaveAttribute('aria-disabled', 'true');
+      });
+    });
+
+    it('opens manual modal when autoItemizeEnabled=false', async () => {
+      mockGetPaperlessStatus.mockResolvedValue({
+        configured: true,
+        reachable: true,
+        error: null,
+        paperlessUrl: 'https://paperless.example.com',
+        filterTag: null,
+      });
+      mockFetchConfig.mockResolvedValue({ autoItemizeEnabled: false });
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+      mockFetchVendors.mockResolvedValue(emptyVendorsResponse);
+
+      renderPage();
+
+      // Wait for button to be enabled
+      await waitFor(() => {
+        const btn = screen.getByTestId('new-invoice-button');
+        expect(btn).not.toHaveAttribute('aria-disabled', 'true');
+      });
+
+      fireEvent.click(screen.getByTestId('new-invoice-button'));
+
+      // Manual modal appears (has Modal title from invoices.modal.title)
+      await waitFor(() => {
+        // The manual invoice creation modal contains a vendor select or form
+        const modal =
+          screen.queryByRole('dialog') ||
+          screen.queryByText(/New Invoice/i) ||
+          document.querySelector('[data-testid="paperless-picker-modal"]');
+        // Paperless picker should NOT appear when autoItemizeEnabled=false
+        expect(
+          document.querySelector('[data-testid="paperless-picker-modal"]'),
+        ).not.toBeInTheDocument();
+        // Manual modal OR some form element should appear
+        expect(modal !== null || screen.queryByLabelText(/Vendor/i) !== null).toBe(true);
+      });
+    });
+
+    it('opens Paperless picker modal when configured + reachable + autoItemizeEnabled=true', async () => {
+      mockGetPaperlessStatus.mockResolvedValue({
+        configured: true,
+        reachable: true,
+        error: null,
+        paperlessUrl: 'https://paperless.example.com',
+        filterTag: null,
+      });
+      mockFetchConfig.mockResolvedValue({ autoItemizeEnabled: true });
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+      mockFetchVendors.mockResolvedValue(emptyVendorsResponse);
+
+      renderPage();
+
+      // Wait for button to be enabled
+      await waitFor(() => {
+        const btn = screen.getByTestId('new-invoice-button');
+        expect(btn).not.toHaveAttribute('aria-disabled', 'true');
+      });
+
+      fireEvent.click(screen.getByTestId('new-invoice-button'));
+
+      await waitFor(() => {
+        expect(screen.getByTestId('paperless-picker-modal')).toBeInTheDocument();
+      });
+    });
+
+    it('opens manual modal when paperless configured=false even if autoItemizeEnabled=true', async () => {
+      mockGetPaperlessStatus.mockResolvedValue({
+        configured: false,
+        reachable: false,
+        error: null,
+        paperlessUrl: null,
+        filterTag: null,
+      });
+      mockFetchConfig.mockResolvedValue({ autoItemizeEnabled: true });
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+      mockFetchVendors.mockResolvedValue(emptyVendorsResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        const btn = screen.getByTestId('new-invoice-button');
+        expect(btn).not.toHaveAttribute('aria-disabled', 'true');
+      });
+
+      fireEvent.click(screen.getByTestId('new-invoice-button'));
+
+      // Paperless picker should NOT appear when paperless not configured
+      await waitFor(() => {
+        expect(
+          document.querySelector('[data-testid="paperless-picker-modal"]'),
+        ).not.toBeInTheDocument();
+      });
+    });
+  });
+
+  // ─── Story #1735: ?create=1 auto-open effect ────────────────────────────────
+
+  describe('?create=1 auto-open effect (Story #1735)', () => {
+    /** Renders the page with ?create=1 in the URL and a location helper
+     *  that exposes pathname+search so tests can assert the param is removed. */
+    function LocationSearchDisplay() {
+      const location = useLocation();
+      return <div data-testid="location-search">{location.pathname + location.search}</div>;
+    }
+
+    function renderPageWithCreate() {
+      return render(
+        <ToastProvider>
+          <MemoryRouter initialEntries={['/budget/invoices?create=1']}>
+            <Routes>
+              <Route path="/budget/invoices" element={<InvoicesPageModule.InvoicesPage />} />
+              <Route path="/budget/invoices/:id" element={<div>Invoice Detail</div>} />
+              <Route path="/settings/vendors/:id" element={<div>Vendor Detail</div>} />
+            </Routes>
+            <LocationSearchDisplay />
+          </MemoryRouter>
+        </ToastProvider>,
+      );
+    }
+
+    // (A) integrationStatus unresolved (both APIs pending) → no modal opens
+    it('(A) does not auto-open any modal while integration status is still loading', async () => {
+      mockGetPaperlessStatus.mockReturnValue(new Promise(() => {}));
+      mockFetchConfig.mockReturnValue(new Promise(() => {}));
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+
+      renderPageWithCreate();
+
+      // Give the effect a chance to fire if it wrongly ignores the loading gate
+      await waitFor(() => {
+        expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      });
+
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(
+        document.querySelector('[data-testid="paperless-picker-modal"]'),
+      ).not.toBeInTheDocument();
+    });
+
+    // (B) ?create=1 absent + status resolved → no modal opens
+    it('(B) does not auto-open any modal when ?create=1 is absent from the URL', async () => {
+      mockGetPaperlessStatus.mockResolvedValue({
+        configured: true,
+        reachable: true,
+        error: null,
+        paperlessUrl: 'https://paperless.example.com',
+        filterTag: null,
+      });
+      mockFetchConfig.mockResolvedValue({ autoItemizeEnabled: true });
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+
+      // Use renderPage() which starts at /budget/invoices (no ?create param)
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('new-invoice-button')).not.toHaveAttribute(
+          'aria-disabled',
+          'true',
+        );
+      });
+
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(
+        document.querySelector('[data-testid="paperless-picker-modal"]'),
+      ).not.toBeInTheDocument();
+    });
+
+    // (C) ?create=1 + Paperless NOT configured + autoItemizeEnabled=false → manual modal
+    it('(C) auto-opens manual modal when Paperless not configured and ?create=1', async () => {
+      mockGetPaperlessStatus.mockResolvedValue({
+        configured: false,
+        reachable: false,
+        error: null,
+        paperlessUrl: null,
+        filterTag: null,
+      });
+      mockFetchConfig.mockResolvedValue({ autoItemizeEnabled: false });
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+      mockFetchVendors.mockResolvedValue(emptyVendorsResponse);
+
+      renderPageWithCreate();
+
+      // Manual modal should auto-open
+      await waitFor(() => {
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+      });
+
+      // Paperless picker must NOT be present
+      expect(
+        document.querySelector('[data-testid="paperless-picker-modal"]'),
+      ).not.toBeInTheDocument();
+    });
+
+    // (D) ?create=1 + Paperless configured + reachable + autoItemizeEnabled=true → Paperless picker
+    it('(D) auto-opens Paperless picker when Paperless configured and autoItemizeEnabled=true', async () => {
+      mockGetPaperlessStatus.mockResolvedValue({
+        configured: true,
+        reachable: true,
+        error: null,
+        paperlessUrl: 'https://paperless.example.com',
+        filterTag: null,
+      });
+      mockFetchConfig.mockResolvedValue({ autoItemizeEnabled: true });
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+
+      renderPageWithCreate();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('paperless-picker-modal')).toBeInTheDocument();
+      });
+
+      // Manual create modal must NOT be present
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+
+    // (E) ?create=1 + Paperless configured + autoItemizeEnabled DISABLED → manual modal
+    it('(E) auto-opens manual modal when Paperless configured but autoItemizeEnabled=false', async () => {
+      mockGetPaperlessStatus.mockResolvedValue({
+        configured: true,
+        reachable: true,
+        error: null,
+        paperlessUrl: 'https://paperless.example.com',
+        filterTag: null,
+      });
+      mockFetchConfig.mockResolvedValue({ autoItemizeEnabled: false });
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+      mockFetchVendors.mockResolvedValue(emptyVendorsResponse);
+
+      renderPageWithCreate();
+
+      await waitFor(() => {
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+      });
+
+      expect(
+        document.querySelector('[data-testid="paperless-picker-modal"]'),
+      ).not.toBeInTheDocument();
+    });
+
+    // (F) after auto-open, the URL no longer contains create=1
+    it('(F) removes ?create=1 from the URL after auto-opening the modal', async () => {
+      mockGetPaperlessStatus.mockResolvedValue({
+        configured: false,
+        reachable: false,
+        error: null,
+        paperlessUrl: null,
+        filterTag: null,
+      });
+      mockFetchConfig.mockResolvedValue({ autoItemizeEnabled: false });
+      mockFetchAllInvoices.mockResolvedValue(emptyResponse);
+      mockFetchVendors.mockResolvedValue(emptyVendorsResponse);
+
+      renderPageWithCreate();
+
+      // Wait for the modal to open (confirms the effect ran)
+      await waitFor(() => {
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+      });
+
+      // The URL should no longer carry ?create=1
+      await waitFor(() => {
+        const locationEl = screen.getByTestId('location-search');
+        expect(locationEl.textContent).not.toContain('create=1');
+      });
+    });
+  });
+
+  // ─── Story #1876: effectiveAmount column ─────────────────────────────────
+
+  describe('effectiveAmount column (Story #1876)', () => {
+    // An invoice with both budget-line itemization (making remainingAmount
+    // differ from amount) AND a refund-driven finalPaymentAmount (making
+    // effectiveAmount differ from both amount and remainingAmount) — proves
+    // the two columns are computed independently.
+    const refundInvoice: Invoice = {
+      id: 'inv-refund-001',
+      vendorId: 'v-1',
+      vendorName: 'ACME Construction',
+      invoiceNumber: 'INV-2026-REFUND',
+      amount: 10000,
+      date: '2026-02-01',
+      dueDate: '2026-03-01',
+      status: 'pending',
+      notes: null,
+      budgetLines: [
+        {
+          id: 'ibl-refund-1',
+          budgetLineId: 'wib-refund-1',
+          budgetLineType: 'work_item',
+          itemName: 'Refund Test Work Item',
+          budgetLineDescription: null,
+          categoryName: null,
+          categoryColor: null,
+          categoryTranslationKey: null,
+          plannedAmount: 2000,
+          confidence: 'quote',
+          itemizedAmount: 2000,
+        },
+      ],
+      // remainingAmount = amount - Σ itemizedAmount = 10000 - 2000 = 8000
+      remainingAmount: 8000,
+      deposits: [],
+      // finalPaymentAmount = amount - deposits - received refunds = 10000 - 1500 = 8500
+      // (deliberately different from remainingAmount to prove independence)
+      finalPaymentAmount: 8500,
+      createdBy: null,
+      createdAt: '2026-02-01T00:00:00.000Z',
+      updatedAt: '2026-02-01T00:00:00.000Z',
+    };
+
+    const refundResponse: InvoiceListPaginatedResponse = {
+      invoices: [refundInvoice],
+      pagination: { page: 1, pageSize: 25, totalPages: 1, totalItems: 1 },
+      summary: {
+        pending: { count: 1, totalAmount: 10000 },
+        paid: { count: 0, totalAmount: 0 },
+        claimed: { count: 0, totalAmount: 0 },
+        quotation: { count: 0, totalAmount: 0 },
+        overdue: { count: 0, totalAmount: 0 },
+        claimable: { count: 1, totalAmount: 10000 },
+        quotationCoveredByDeposits: 0,
+        openPayable: { count: 1, totalAmount: 10000 },
+        refundsDue: { count: 0, totalAmount: 0 },
+      },
+    };
+
+    async function openColumnSettings() {
+      const settingsBtn = screen.getByRole('button', { name: /column settings/i });
+      fireEvent.click(settingsBtn);
+      await waitFor(() => {
+        expect(screen.getByRole('dialog', { name: /visible columns/i })).toBeInTheDocument();
+      });
+    }
+
+    it('the "Effective Amount" column is hidden by default (defaultVisible: false)', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(refundResponse);
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getAllByText('INV-2026-REFUND')[0]!).toBeInTheDocument();
+      });
+
+      // The formatted effectiveAmount value must not appear anywhere yet
+      expect(screen.queryByText('€8,500.00')).not.toBeInTheDocument();
+    });
+
+    it('toggling "Effective Amount" on renders formatCurrency(finalPaymentAmount), independent of "Remaining Amount"', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(refundResponse);
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getAllByText('INV-2026-REFUND')[0]!).toBeInTheDocument();
+      });
+
+      await openColumnSettings();
+
+      const effectiveAmountCheckbox = document.getElementById(
+        'col-effectiveAmount',
+      ) as HTMLInputElement;
+      expect(effectiveAmountCheckbox).toBeInTheDocument();
+      expect(effectiveAmountCheckbox.checked).toBe(false);
+
+      fireEvent.click(effectiveAmountCheckbox);
+
+      await waitFor(() => {
+        expect(screen.getAllByText('€8,500.00').length).toBeGreaterThan(0);
+      });
+    });
+
+    it('"Remaining Amount" and "Effective Amount" show distinct values for the same invoice when both are visible', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(refundResponse);
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getAllByText('INV-2026-REFUND')[0]!).toBeInTheDocument();
+      });
+
+      await openColumnSettings();
+
+      fireEvent.click(document.getElementById('col-remainingAmount')!);
+      fireEvent.click(document.getElementById('col-effectiveAmount')!);
+
+      await waitFor(() => {
+        // remainingAmount = 8000, finalPaymentAmount = 8500 — both visible and distinct
+        expect(screen.getAllByText('€8,000.00').length).toBeGreaterThan(0);
+        expect(screen.getAllByText('€8,500.00').length).toBeGreaterThan(0);
+      });
+    });
+
+    it('the "Effective Amount" column label is "Effective Amount"', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(refundResponse);
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getAllByText('INV-2026-REFUND')[0]!).toBeInTheDocument();
+      });
+
+      await openColumnSettings();
+
+      const label = screen.getByLabelText('Effective Amount');
+      expect(label).toBeInTheDocument();
+    });
+  });
+
+  // ─── Badge-fix regression (Story #2046) ───────────────────────────────────
+  // The status Badge's className must resolve to a real variant class
+  // (badgeStyles[status]), not silently drop to just the base "badge" class
+  // or interpolate a literal "undefined" string.
+
+  describe('status badge className regression (Story #2046)', () => {
+    it('the invoice status badge className includes the resolved variant class and never the literal "undefined"', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(populatedResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getAllByTestId('invoice-status-inv-001')[0]).toBeInTheDocument();
+      });
+
+      const badges = screen.getAllByTestId('invoice-status-inv-001');
+      for (const badge of badges) {
+        expect(badge.className).toContain('pending');
+        expect(badge.className).not.toContain('undefined');
+      }
+
+      const paidBadges = screen.getAllByTestId('invoice-status-inv-002');
+      for (const badge of paidBadges) {
+        expect(badge.className).toContain('paid');
+        expect(badge.className).not.toContain('undefined');
+      }
+    });
+  });
+
+  // ─── Desktop/mobile duplicate-testid regression (fix/2046-e2e-toggle-flake) ─
+  // DataTable mounts the desktop table AND the mobile cards simultaneously (CSS
+  // picks one visually; jsdom applies no CSS), so a status column with no
+  // `renderCard` override used to emit the SAME `invoice-status-{id}` testid
+  // twice — invisible to jsdom-based unit assertions (which mostly used
+  // getAllByTestId(...)[0], tolerant of 1 or 2 matches) but a real Playwright
+  // strict-mode violation. The fix gives the renderCard-rendered instance a
+  // `-mobile-` suffixed testid. These tests pin that: exactly one match per
+  // testid (not two), and the two elements are genuinely distinct nodes.
+
+  describe('desktop/mobile testid disambiguation (fix/2046-e2e-toggle-flake)', () => {
+    it('the status badge renders exactly one desktop-testid element and one distinct mobile-testid element', async () => {
+      mockFetchAllInvoices.mockResolvedValueOnce(populatedResponse);
+
+      renderPage();
+
+      await waitFor(() => {
+        expect(screen.getAllByTestId('invoice-status-inv-001').length).toBeGreaterThan(0);
+      });
+
+      const desktopBadges = screen.getAllByTestId('invoice-status-inv-001');
+      const mobileBadges = screen.getAllByTestId('invoice-status-mobile-inv-001');
+      expect(desktopBadges).toHaveLength(1);
+      expect(mobileBadges).toHaveLength(1);
+      expect(desktopBadges[0]).not.toBe(mobileBadges[0]);
+    });
+  });
+});

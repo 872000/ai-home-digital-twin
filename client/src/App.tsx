@@ -1,0 +1,307 @@
+import './i18n/index.js';
+import { lazy, Suspense, useEffect } from 'react';
+import { BrowserRouter, Routes, Route, Navigate, useParams } from 'react-router-dom';
+import { AppShell } from './components/AppShell/AppShell';
+import { AuthProvider } from './contexts/AuthContext';
+import { ThemeProvider, useTheme } from './contexts/ThemeContext';
+import { LocaleProvider, useLocale } from './contexts/LocaleContext';
+import { useAuth } from './contexts/AuthContext';
+import { AuthGuard } from './components/AuthGuard/AuthGuard';
+import { ToastProvider } from './components/Toast/ToastContext';
+import { ToastList } from './components/Toast/Toast';
+import { ChunkLoadErrorBoundary } from './components/ChunkLoadErrorBoundary/index.js';
+
+/** Redirect helper that resolves route params (e.g. :id) into the target path. */
+function ParamRedirect({ to }: { to: string }) {
+  const params = useParams();
+  const resolved = Object.entries(params).reduce(
+    (path, [key, value]) => path.replace(`:${key}`, value ?? ''),
+    to,
+  );
+  return <Navigate to={resolved} replace />;
+}
+
+/**
+ * Bridge component that syncs theme with server when user authenticates.
+ * Must be placed inside AuthProvider but outside Routes to access useAuth and useTheme.
+ */
+function ThemeServerSync() {
+  const { user } = useAuth();
+  const { syncWithServer } = useTheme();
+
+  useEffect(() => {
+    if (user) {
+      void syncWithServer(user.id);
+    }
+  }, [user, syncWithServer]);
+
+  return null;
+}
+
+/**
+ * Bridge component that syncs locale with server when user authenticates.
+ * Must be placed inside AuthProvider but outside Routes to access useAuth and useLocale.
+ */
+function LocaleServerSync() {
+  const { user } = useAuth();
+  const { syncWithServer } = useLocale();
+
+  useEffect(() => {
+    if (user) {
+      void syncWithServer(user.id);
+    }
+  }, [user, syncWithServer]);
+
+  return null;
+}
+
+const SetupPage = lazy(() => import('./pages/SetupPage/SetupPage'));
+const LoginPage = lazy(() => import('./pages/LoginPage/LoginPage'));
+const DashboardPage = lazy(() => import('./pages/DashboardPage/DashboardPage'));
+const WorkItemsPage = lazy(() => import('./pages/WorkItemsPage/WorkItemsPage'));
+const WorkItemCreatePage = lazy(() => import('./pages/WorkItemCreatePage/WorkItemCreatePage'));
+const WorkItemDetailPage = lazy(() => import('./pages/WorkItemDetailPage/WorkItemDetailPage'));
+const BudgetOverviewPage = lazy(() => import('./pages/BudgetOverviewPage/BudgetOverviewPage'));
+const VendorsPage = lazy(() => import('./pages/VendorsPage/VendorsPage'));
+const VendorDetailPage = lazy(() => import('./pages/VendorDetailPage/VendorDetailPage'));
+const BudgetSourcesPage = lazy(() => import('./pages/BudgetSourcesPage/BudgetSourcesPage'));
+const SubsidyProgramsPage = lazy(() => import('./pages/SubsidyProgramsPage/SubsidyProgramsPage'));
+const TimelinePage = lazy(() => import('./pages/TimelinePage/TimelinePage'));
+const HouseholdItemsPage = lazy(() => import('./pages/HouseholdItemsPage/HouseholdItemsPage'));
+const HouseholdItemCreatePage = lazy(
+  () => import('./pages/HouseholdItemCreatePage/HouseholdItemCreatePage'),
+);
+const HouseholdItemDetailPage = lazy(
+  () => import('./pages/HouseholdItemDetailPage/HouseholdItemDetailPage'),
+);
+const HouseholdItemEditPage = lazy(
+  () => import('./pages/HouseholdItemEditPage/HouseholdItemEditPage'),
+);
+const MilestonesPage = lazy(() => import('./pages/MilestonesPage/MilestonesPage'));
+const MilestoneCreatePage = lazy(() => import('./pages/MilestoneCreatePage/MilestoneCreatePage'));
+const MilestoneDetailPage = lazy(() => import('./pages/MilestoneDetailPage/MilestoneDetailPage'));
+const ManagePage = lazy(() => import('./pages/ManagePage/ManagePage.js'));
+const ProfilePage = lazy(() => import('./pages/ProfilePage/ProfilePage'));
+const UserManagementPage = lazy(() => import('./pages/UserManagementPage/UserManagementPage'));
+const BackupsPage = lazy(() => import('./pages/BackupsPage/BackupsPage'));
+const InvoicesPage = lazy(() => import('./pages/InvoicesPage/InvoicesPage'));
+const InvoiceDetailPage = lazy(() => import('./pages/InvoiceDetailPage/InvoiceDetailPage'));
+const AutoItemizePage = lazy(() => import('./pages/AutoItemizePage/index.js'));
+const ReportWizardPage = lazy(() => import('./pages/ReportWizardPage/index.js'));
+const PaperlessInvoiceReviewPage = lazy(
+  () => import('./pages/PaperlessInvoiceReviewPage/index.js'),
+);
+const DiaryPage = lazy(() => import('./pages/DiaryPage/DiaryPage'));
+const DiaryEntryDetailPage = lazy(
+  () => import('./pages/DiaryEntryDetailPage/DiaryEntryDetailPage'),
+);
+const DiaryEntryCreatePage = lazy(
+  () => import('./pages/DiaryEntryCreatePage/DiaryEntryCreatePage'),
+);
+const DiaryEntryEditPage = lazy(() => import('./pages/DiaryEntryEditPage/DiaryEntryEditPage'));
+const NotFoundPage = lazy(() => import('./pages/NotFoundPage/NotFoundPage'));
+
+export function App() {
+  return (
+    <ChunkLoadErrorBoundary>
+      <BrowserRouter>
+        <ThemeProvider>
+          <LocaleProvider>
+            <ToastProvider>
+              <AuthProvider>
+                <ThemeServerSync />
+                <LocaleServerSync />
+                <Routes>
+                  {/* Auth routes (no AppShell wrapper) */}
+                  <Route
+                    path="setup"
+                    element={
+                      <Suspense fallback={<div>Loading...</div>}>
+                        <SetupPage />
+                      </Suspense>
+                    }
+                  />
+                  <Route
+                    path="login"
+                    element={
+                      <Suspense fallback={<div>Loading...</div>}>
+                        <LoginPage />
+                      </Suspense>
+                    }
+                  />
+
+                  {/* Protected app routes (with AuthGuard and AppShell wrapper) */}
+                  <Route element={<AuthGuard />}>
+                    <Route element={<AppShell />}>
+                      {/* Root redirects to /project */}
+                      <Route index element={<Navigate to="/project" replace />} />
+
+                      {/* Project section */}
+                      <Route path="project">
+                        <Route index element={<Navigate to="overview" replace />} />
+                        <Route path="overview" element={<DashboardPage />} />
+                        <Route path="work-items" element={<WorkItemsPage />} />
+                        <Route path="work-items/new" element={<WorkItemCreatePage />} />
+                        <Route path="work-items/:id" element={<WorkItemDetailPage />} />
+                        <Route path="household-items" element={<HouseholdItemsPage />} />
+                        <Route path="household-items/new" element={<HouseholdItemCreatePage />} />
+                        <Route path="household-items/:id" element={<HouseholdItemDetailPage />} />
+                        <Route
+                          path="household-items/:id/edit"
+                          element={<HouseholdItemEditPage />}
+                        />
+                        <Route path="milestones" element={<MilestonesPage />} />
+                        <Route path="milestones/new" element={<MilestoneCreatePage />} />
+                        <Route path="milestones/:id" element={<MilestoneDetailPage />} />
+                      </Route>
+
+                      {/* Budget section */}
+                      <Route path="budget">
+                        <Route index element={<Navigate to="overview" replace />} />
+                        <Route path="overview" element={<BudgetOverviewPage />} />
+                        <Route
+                          path="categories"
+                          element={<Navigate to="/settings/manage?tab=budget-categories" replace />}
+                        />
+                        <Route path="sources" element={<BudgetSourcesPage />} />
+                        <Route path="subsidies" element={<SubsidyProgramsPage />} />
+                        <Route path="invoices" element={<InvoicesPage />} />
+                        <Route
+                          path="invoices/new/paperless"
+                          element={
+                            <Suspense fallback={<div>Loading...</div>}>
+                              <PaperlessInvoiceReviewPage />
+                            </Suspense>
+                          }
+                        />
+                        <Route path="invoices/:id" element={<InvoiceDetailPage />} />
+                        <Route
+                          path="invoices/:id/auto-itemize/:documentId"
+                          element={
+                            <Suspense fallback={<div>Loading...</div>}>
+                              <AutoItemizePage />
+                            </Suspense>
+                          }
+                        />
+                        <Route path="reports" element={<ReportWizardPage />} />
+                      </Route>
+
+                      {/* Schedule (renamed from Timeline) */}
+                      <Route path="schedule">
+                        <Route index element={<Navigate to="gantt" replace />} />
+                        <Route path="gantt" element={<TimelinePage />} />
+                        <Route path="calendar" element={<TimelinePage />} />
+                      </Route>
+
+                      {/* Diary section */}
+                      <Route path="diary">
+                        <Route
+                          index
+                          element={
+                            <Suspense fallback={<div>Loading...</div>}>
+                              <DiaryPage />
+                            </Suspense>
+                          }
+                        />
+                        <Route
+                          path="new"
+                          element={
+                            <Suspense fallback={<div>Loading...</div>}>
+                              <DiaryEntryCreatePage />
+                            </Suspense>
+                          }
+                        />
+                        <Route
+                          path=":id"
+                          element={
+                            <Suspense fallback={<div>Loading...</div>}>
+                              <DiaryEntryDetailPage />
+                            </Suspense>
+                          }
+                        />
+                        <Route
+                          path=":id/edit"
+                          element={
+                            <Suspense fallback={<div>Loading...</div>}>
+                              <DiaryEntryEditPage />
+                            </Suspense>
+                          }
+                        />
+                      </Route>
+
+                      {/* Settings section */}
+                      <Route path="settings">
+                        <Route index element={<Navigate to="profile" replace />} />
+                        <Route path="profile" element={<ProfilePage />} />
+                        <Route path="manage" element={<ManagePage />} />
+                        <Route path="vendors" element={<VendorsPage />} />
+                        <Route path="vendors/:id" element={<VendorDetailPage />} />
+                        <Route path="users" element={<UserManagementPage />} />
+                        <Route path="backups" element={<BackupsPage />} />
+                      </Route>
+
+                      {/* Legacy redirects — preserve old bookmarks */}
+                      <Route
+                        path="work-items"
+                        element={<Navigate to="/project/work-items" replace />}
+                      />
+                      <Route
+                        path="work-items/new"
+                        element={<Navigate to="/project/work-items/new" replace />}
+                      />
+                      <Route
+                        path="work-items/:id"
+                        element={<ParamRedirect to="/project/work-items/:id" />}
+                      />
+                      <Route
+                        path="household-items"
+                        element={<Navigate to="/project/household-items" replace />}
+                      />
+                      <Route
+                        path="household-items/new"
+                        element={<Navigate to="/project/household-items/new" replace />}
+                      />
+                      <Route
+                        path="household-items/:id"
+                        element={<ParamRedirect to="/project/household-items/:id" />}
+                      />
+                      <Route
+                        path="household-items/:id/edit"
+                        element={<ParamRedirect to="/project/household-items/:id/edit" />}
+                      />
+                      <Route path="invoices" element={<Navigate to="/budget/invoices" replace />} />
+                      <Route
+                        path="invoices/:id"
+                        element={<ParamRedirect to="/budget/invoices/:id" />}
+                      />
+                      <Route path="timeline" element={<Navigate to="/schedule/gantt" replace />} />
+                      <Route path="manage" element={<Navigate to="/settings/manage" replace />} />
+                      <Route path="tags" element={<Navigate to="/settings/manage" replace />} />
+                      <Route path="profile" element={<Navigate to="/settings/profile" replace />} />
+                      <Route
+                        path="admin/users"
+                        element={<Navigate to="/settings/users" replace />}
+                      />
+                      <Route
+                        path="budget/vendors"
+                        element={<Navigate to="/settings/vendors" replace />}
+                      />
+                      <Route
+                        path="budget/vendors/:id"
+                        element={<ParamRedirect to="/settings/vendors/:id" />}
+                      />
+
+                      <Route path="*" element={<NotFoundPage />} />
+                    </Route>
+                  </Route>
+                </Routes>
+                {/* Toast notifications — rendered as a portal to document.body */}
+                <ToastList />
+              </AuthProvider>
+            </ToastProvider>
+          </LocaleProvider>
+        </ThemeProvider>
+      </BrowserRouter>
+    </ChunkLoadErrorBoundary>
+  );
+}

@@ -1,0 +1,114 @@
+---
+sidebar_position: 1
+title: Docker Setup
+---
+
+# Docker Setup
+
+## Docker Run
+
+The simplest way to run Cornerstone:
+
+```bash
+docker run -d \
+  --name cornerstone \
+  -p 3000:3000 \
+  -v cornerstone-data:/app/data \
+  steilerdev/cornerstone:latest
+```
+
+This starts Cornerstone on port 3000 with a persistent volume for the SQLite database.
+
+## Docker Compose (Recommended)
+
+For a more maintainable setup, use Docker Compose:
+
+```bash
+# Download the files
+curl -O https://raw.githubusercontent.com/steilerDev/cornerstone/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/steilerDev/cornerstone/main/.env.example
+
+# Configure your environment
+cp .env.example .env
+# Edit .env with your preferred settings
+
+# Start the application
+docker compose up -d
+```
+
+The default configuration works out of the box -- the only thing you must do is complete the [first-run setup wizard](first-login) in the browser.
+
+## Behind a Reverse Proxy
+
+When deploying behind a reverse proxy (nginx, Caddy, Traefik, etc.), set these environment variables:
+
+```env
+TRUST_PROXY=true
+SECURE_COOKIES=true
+```
+
+`TRUST_PROXY` tells Cornerstone to read forwarded headers (`X-Forwarded-For`, `X-Forwarded-Proto`, etc.). This is required for secure cookies and OIDC redirects to work properly behind a proxy.
+
+:::note Safer proxy handling
+Cornerstone's proxy handling has been tightened: when `TRUST_PROXY=true`, only the **first** proxy hop is trusted (your own reverse proxy), and the rate-limit plugin uses a resilient client identifier that cannot be spoofed by a user-supplied `X-Forwarded-For` header. In short, you still need to set `TRUST_PROXY=true` when running behind nginx/Caddy/Traefik, but that setting no longer exposes rate limiting to header spoofing from the public internet. No configuration change is required to benefit from this -- upgrading to the current release is enough.
+
+This only controls *whose* IP the rate limiter trusts, not *how many* login attempts that IP gets. If several people log in from behind the same home network, they still share one rate-limit bucket even with `TRUST_PROXY=true` set correctly. See [Authentication Rate Limiting](configuration#authentication-rate-limiting) in the Configuration guide to tune `AUTH_RATE_LIMIT_MAX` for your household.
+:::
+
+:::tip Large file uploads
+
+Cornerstone supports photo uploads which can produce large request payloads. Most reverse proxies limit request body size by default (e.g., nginx defaults to 1 MB). Make sure your proxy is configured to allow sufficiently large uploads -- for example, in **nginx**:
+
+```nginx
+client_max_body_size 50M;
+```
+
+Refer to your reverse proxy's documentation for the equivalent setting.
+
+:::
+
+## Data Persistence
+
+Cornerstone stores all data in a single SQLite database file at `/app/data/cornerstone.db` inside the container. Mount a Docker volume or bind-mount to `/app/data` to persist your data across container restarts:
+
+```bash
+# Named volume (recommended)
+-v cornerstone-data:/app/data
+
+# Bind mount
+-v /path/on/host:/app/data
+```
+
+## Health Checks
+
+The Docker image includes a built-in health check that verifies the server is running and the database is accessible:
+
+- **Readiness**: `GET /api/health/ready` -- verifies database access and password hashing
+- **Liveness**: `GET /api/health/live` -- basic server responsiveness check
+
+The health check runs every 30 seconds with a 15-second startup grace period.
+
+## Image Tags
+
+| Tag | Description |
+|-----|-------------|
+| `latest` | Latest stable release |
+| `beta` | Latest beta pre-release |
+| `x.y.z` | Specific stable version (e.g., `1.7.0`) |
+| `x.y` | Latest patch of a minor version (e.g., `1.7`) |
+| `x.y.z-beta.n` | Specific beta version (e.g., `1.7.0-beta.1`) |
+
+## Upgrading
+
+To upgrade, pull the new image and recreate the container:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Your data lives in the mounted volume (see [Data Persistence](#data-persistence)), so it survives the recreate.
+
+:::tip Open tabs recover automatically
+If you have Cornerstone open in a browser tab while you upgrade, the app detects that its JavaScript bundle changed under it and reloads the page automatically the next time you navigate, instead of showing a blank screen. No hard refresh or cache-clearing is needed after an update.
+:::

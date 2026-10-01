@@ -1,0 +1,51 @@
+{
+  "_meta": {
+    "description": "Single source of truth for domain terminology translations. The translator agent enforces these.",
+    "locales": ["de"],
+    "lastUpdated": "2026-08-04"
+  },
+  "terms": {
+    "Work Item": { "de": { "singular": "Arbeitspaket", "plural": "Arbeitspakete" } },
+    "Household Item": { "de": { "singular": "Haushaltsartikel", "plural": "Haushaltsartikel" } },
+    "Vendor": { "de": { "singular": "Auftragnehmer", "plural": "Auftragnehmer" } },
+    "Budget Line": { "de": { "singular": "Budgetposition", "plural": "Budgetpositionen" } },
+    "Budget Source": { "de": { "singular": "Budgetquelle", "plural": "Budgetquellen" } },
+    "Milestone": { "de": { "singular": "Meilenstein", "plural": "Meilensteine" } },
+    "Invoice": { "de": { "singular": "Rechnung", "plural": "Rechnungen" } },
+    "Subsidy": { "de": { "singular": "Förderprogramm", "plural": "Förderprogramme" } },
+    "Dependency": { "de": { "singular": "Abhängigkeit", "plural": "Abhängigkeiten" } },
+    "Subtask": { "de": { "singular": "Teilaufgabe", "plural": "Teilaufgaben" } },
+    "Diary Entry": { "de": { "singular": "Tagebucheintrag", "plural": "Tagebucheinträge" } },
+    "Category": { "de": { "singular": "Kategorie", "plural": "Kategorien" } },
+    "Critical Path": { "de": { "singular": "Kritischer Pfad" } },
+    "Gantt Chart": { "de": { "singular": "Gantt-Diagramm" } },
+    "Dashboard": { "de": { "singular": "Projektübersicht" } },
+    "Quotation": { "de": { "singular": "Angebot", "plural": "Angebote" } },
+    "Area": { "de": { "singular": "Bereich", "plural": "Bereiche" } },
+    "Trade": { "de": { "singular": "Gewerk", "plural": "Gewerke" } },
+    "Unassigned": { "de": { "singular": "Nicht zugewiesen" } },
+    "Deposit": {
+      "de": {
+        "singular": "Abschlagszahlung",
+        "plural": "Abschlagszahlungen",
+        "shortForm": "Abschlag",
+        "shortFormNote": "product-owner-approved (#1917) short-form variant of 'Abschlagszahlung', permitted ONLY under a measured space constraint — do not use elsewhere. Origin: the report PDF's 'abzgl. Abschlag' inline label lives in a 75pt table column. 'Abschlagszahlung' alone already measures 72.85pt, so no qualifier of any length fits alongside it — not 'abzgl.', not 'ohne', not './.'. There is no third option: keeping the full term forces dropping the qualifier, which collapses this label into the separate constituted-deposit label '(Abschlagszahlung)' (#1923 AC2.1) — a different fact ('this row IS a deposit' vs. 'this amount is reduced because deposits were claimed separately'). A future compliance sweep must NOT revert this to 'Abschlagszahlung' without re-measuring the 75pt column budget first; doing so silently breaks the PDF (label wraps mid-bracket, #1959)."
+      }
+    },
+    "Refund": { "de": { "singular": "Rückerstattung", "plural": "Rückerstattungen" } },
+    "Final payment": { "de": { "singular": "Schlusszahlung" } },
+    "Draft": { "de": { "singular": "Entwurf", "plural": "Entwürfe" } },
+    "Annotation": { "de": { "singular": "Annotation", "plural": "Annotationen" } },
+    "Annotate": { "de": { "verb": "annotieren" } },
+    "Callout": { "de": { "singular": "Sprechblase", "plural": "Sprechblasen" } },
+    "Freehand": { "de": { "singular": "Freihand" } },
+    "Funding Source": {
+      "de": { "singular": "Finanzierungsquelle", "plural": "Finanzierungsquellen" }
+    },
+    "Itemize": { "de": { "verb": "aufschlüsseln", "noun": "Aufschlüsselung" } },
+    "Orientation": { "de": { "singular": "Ausrichtung", "plural": "Ausrichtungen" } },
+    "Correspondent": { "de": { "singular": "Korrespondent", "plural": "Korrespondenten" } },
+    "AI": { "de": { "singular": "KI" } },
+    "AI Assistance": { "de": { "singular": "KI-Unterstützung" } }
+  }
+}

@@ -1,0 +1,2557 @@
+import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import { runMigrations } from './migrate.js';
+import * as schema from './schema.js';
+import { eq } from 'drizzle-orm';
+
+describe('User Database Schema & Migration', () => {
+  let sqlite: Database.Database;
+  let db: BetterSQLite3Database<typeof schema>;
+
+  /**
+   * Creates a fresh in-memory database with migrations applied.
+   * Foreign keys are enabled to test CASCADE delete behavior.
+   */
+  function createTestDb() {
+    const sqliteDb = new Database(':memory:');
+    sqliteDb.pragma('journal_mode = WAL');
+    sqliteDb.pragma('foreign_keys = ON'); // Required for CASCADE delete
+    runMigrations(sqliteDb);
+    return { sqlite: sqliteDb, db: drizzle(sqliteDb, { schema }) };
+  }
+
+  beforeEach(() => {
+    const testDb = createTestDb();
+    sqlite = testDb.sqlite;
+    db = testDb.db;
+  });
+
+  afterEach(() => {
+    sqlite.close();
+  });
+
+  describe('Migration Structure', () => {
+    it('creates users table with correct columns', () => {
+      const columns = sqlite.prepare("PRAGMA table_info('users')").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+      }>;
+
+      const columnNames = columns.map((col) => col.name);
+      expect(columnNames).toContain('id');
+      expect(columnNames).toContain('email');
+      expect(columnNames).toContain('display_name');
+      expect(columnNames).toContain('role');
+      expect(columnNames).toContain('auth_provider');
+      expect(columnNames).toContain('password_hash');
+      expect(columnNames).toContain('oidc_subject');
+      expect(columnNames).toContain('deactivated_at');
+      expect(columnNames).toContain('created_at');
+      expect(columnNames).toContain('updated_at');
+
+      // Verify primary key
+      const idCol = columns.find((col) => col.name === 'id');
+      expect(idCol?.pk).toBe(1);
+
+      // Verify NOT NULL constraints
+      const emailCol = columns.find((col) => col.name === 'email');
+      expect(emailCol?.notnull).toBe(1);
+
+      const displayNameCol = columns.find((col) => col.name === 'display_name');
+      expect(displayNameCol?.notnull).toBe(1);
+    });
+
+    it('creates sessions table with correct columns', () => {
+      const columns = sqlite.prepare("PRAGMA table_info('sessions')").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+      }>;
+
+      const columnNames = columns.map((col) => col.name);
+      expect(columnNames).toContain('id');
+      expect(columnNames).toContain('user_id');
+      expect(columnNames).toContain('expires_at');
+      expect(columnNames).toContain('created_at');
+
+      // Verify primary key
+      const idCol = columns.find((col) => col.name === 'id');
+      expect(idCol?.pk).toBe(1);
+
+      // Verify NOT NULL constraints
+      const userIdCol = columns.find((col) => col.name === 'user_id');
+      expect(userIdCol?.notnull).toBe(1);
+
+      const expiresAtCol = columns.find((col) => col.name === 'expires_at');
+      expect(expiresAtCol?.notnull).toBe(1);
+    });
+
+    it('creates required indexes', () => {
+      const indexes = sqlite
+        .prepare("SELECT name, tbl_name FROM sqlite_master WHERE type='index'")
+        .all() as Array<{ name: string; tbl_name: string }>;
+
+      const indexNames = indexes.map((idx) => idx.name);
+      expect(indexNames).toContain('idx_users_oidc_lookup');
+      expect(indexNames).toContain('idx_sessions_user_id');
+      expect(indexNames).toContain('idx_sessions_expires_at');
+
+      // Verify index associations
+      const oidcLookupIdx = indexes.find((idx) => idx.name === 'idx_users_oidc_lookup');
+      expect(oidcLookupIdx?.tbl_name).toBe('users');
+
+      const userIdIdx = indexes.find((idx) => idx.name === 'idx_sessions_user_id');
+      expect(userIdIdx?.tbl_name).toBe('sessions');
+
+      const expiresAtIdx = indexes.find((idx) => idx.name === 'idx_sessions_expires_at');
+      expect(expiresAtIdx?.tbl_name).toBe('sessions');
+    });
+  });
+
+  describe('User Insertion via Drizzle ORM', () => {
+    it('can insert a local user (with password_hash, no oidc_subject)', async () => {
+      const now = new Date().toISOString();
+      const userId = 'user-local-1';
+
+      await db.insert(schema.users).values({
+        id: userId,
+        email: 'local@example.com',
+        displayName: 'Local User',
+        role: 'admin',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hashedpassword',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const users = await db.select().from(schema.users).where(eq(schema.users.id, userId));
+      expect(users).toHaveLength(1);
+      expect(users[0]!.email).toBe('local@example.com');
+      expect(users[0]!.authProvider).toBe('local');
+      expect(users[0]!.passwordHash).toBe('$2b$10$hashedpassword');
+      expect(users[0]!.oidcSubject).toBeNull();
+    });
+
+    it('can insert an OIDC user (with oidc_subject, no password_hash)', async () => {
+      const now = new Date().toISOString();
+      const userId = 'user-oidc-1';
+
+      await db.insert(schema.users).values({
+        id: userId,
+        email: 'oidc@example.com',
+        displayName: 'OIDC User',
+        role: 'member',
+        authProvider: 'oidc',
+        passwordHash: null,
+        oidcSubject: 'oidc-provider-subject-123',
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const users = await db.select().from(schema.users).where(eq(schema.users.id, userId));
+      expect(users).toHaveLength(1);
+      expect(users[0]!.email).toBe('oidc@example.com');
+      expect(users[0]!.authProvider).toBe('oidc');
+      expect(users[0]!.oidcSubject).toBe('oidc-provider-subject-123');
+      expect(users[0]!.passwordHash).toBeNull();
+    });
+  });
+
+  describe('Constraints & Validation', () => {
+    it('enforces email uniqueness constraint', async () => {
+      const now = new Date().toISOString();
+
+      // Insert first user
+      await db.insert(schema.users).values({
+        id: 'user-1',
+        email: 'duplicate@example.com',
+        displayName: 'User One',
+        role: 'admin',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash1',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Verify first insert completed
+      const firstUser = await db.select().from(schema.users).where(eq(schema.users.id, 'user-1'));
+      expect(firstUser).toHaveLength(1);
+
+      // Attempt to insert second user with same email (should throw)
+      let error: Error | undefined;
+      try {
+        await db.insert(schema.users).values({
+          id: 'user-2',
+          email: 'duplicate@example.com',
+          displayName: 'User Two',
+          role: 'member',
+          authProvider: 'local',
+          passwordHash: '$2b$10$hash2',
+          oidcSubject: null,
+          deactivatedAt: null,
+          createdAt: now,
+          updatedAt: now,
+        });
+      } catch (err) {
+        error = err as Error;
+      }
+
+      expect(error).toBeDefined();
+      expect(error?.message).toMatch(/UNIQUE constraint failed/);
+    });
+
+    it('enforces OIDC lookup unique index (duplicate auth_provider + oidc_subject)', async () => {
+      const now = new Date().toISOString();
+
+      // Insert first OIDC user
+      await db.insert(schema.users).values({
+        id: 'user-oidc-1',
+        email: 'oidc1@example.com',
+        displayName: 'OIDC User 1',
+        role: 'admin',
+        authProvider: 'oidc',
+        passwordHash: null,
+        oidcSubject: 'same-oidc-subject',
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Verify first insert completed
+      const firstUser = await db
+        .select()
+        .from(schema.users)
+        .where(eq(schema.users.id, 'user-oidc-1'));
+      expect(firstUser).toHaveLength(1);
+
+      // Attempt to insert second OIDC user with same auth_provider + oidc_subject (should throw)
+      let error: Error | undefined;
+      try {
+        await db.insert(schema.users).values({
+          id: 'user-oidc-2',
+          email: 'oidc2@example.com',
+          displayName: 'OIDC User 2',
+          role: 'member',
+          authProvider: 'oidc',
+          passwordHash: null,
+          oidcSubject: 'same-oidc-subject',
+          deactivatedAt: null,
+          createdAt: now,
+          updatedAt: now,
+        });
+      } catch (err) {
+        error = err as Error;
+      }
+
+      expect(error).toBeDefined();
+      expect(error?.message).toMatch(/UNIQUE constraint failed/);
+    });
+
+    it('allows multiple users with null oidc_subject (partial unique index)', async () => {
+      const now = new Date().toISOString();
+
+      // Insert first local user with null oidc_subject
+      await db.insert(schema.users).values({
+        id: 'user-local-1',
+        email: 'local1@example.com',
+        displayName: 'Local User 1',
+        role: 'admin',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash1',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Insert second local user with null oidc_subject (should succeed)
+      await db.insert(schema.users).values({
+        id: 'user-local-2',
+        email: 'local2@example.com',
+        displayName: 'Local User 2',
+        role: 'member',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash2',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const users = await db.select().from(schema.users);
+      expect(users).toHaveLength(2);
+    });
+
+    it('enforces role CHECK constraint (valid values)', async () => {
+      const now = new Date().toISOString();
+
+      // Test 'admin' role
+      await db.insert(schema.users).values({
+        id: 'user-admin',
+        email: 'admin@example.com',
+        displayName: 'Admin User',
+        role: 'admin',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Test 'member' role
+      await db.insert(schema.users).values({
+        id: 'user-member',
+        email: 'member@example.com',
+        displayName: 'Member User',
+        role: 'member',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const users = await db.select().from(schema.users);
+      expect(users).toHaveLength(2);
+    });
+
+    it('enforces role CHECK constraint (invalid value)', async () => {
+      const now = new Date().toISOString();
+
+      // Attempt to insert invalid role using raw SQL (Drizzle validates enums at runtime)
+      let error: Error | undefined;
+      try {
+        sqlite
+          .prepare(
+            `INSERT INTO users (id, email, display_name, role, auth_provider, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            'user-invalid',
+            'invalid@example.com',
+            'Invalid User',
+            'superadmin',
+            'local',
+            now,
+            now,
+          );
+      } catch (err) {
+        error = err as Error;
+      }
+
+      expect(error).toBeDefined();
+      expect(error?.message).toMatch(/CHECK constraint failed/);
+    });
+
+    it('enforces auth_provider CHECK constraint (valid values)', async () => {
+      const now = new Date().toISOString();
+
+      // Test 'local' provider
+      await db.insert(schema.users).values({
+        id: 'user-local',
+        email: 'local@example.com',
+        displayName: 'Local User',
+        role: 'admin',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Test 'oidc' provider
+      await db.insert(schema.users).values({
+        id: 'user-oidc',
+        email: 'oidc@example.com',
+        displayName: 'OIDC User',
+        role: 'admin',
+        authProvider: 'oidc',
+        passwordHash: null,
+        oidcSubject: 'oidc-sub',
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const users = await db.select().from(schema.users);
+      expect(users).toHaveLength(2);
+    });
+
+    it('enforces auth_provider CHECK constraint (invalid value)', async () => {
+      const now = new Date().toISOString();
+
+      // Attempt to insert invalid auth_provider using raw SQL
+      let error: Error | undefined;
+      try {
+        sqlite
+          .prepare(
+            `INSERT INTO users (id, email, display_name, role, auth_provider, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run('user-invalid', 'invalid@example.com', 'Invalid User', 'admin', 'saml', now, now);
+      } catch (err) {
+        error = err as Error;
+      }
+
+      expect(error).toBeDefined();
+      expect(error?.message).toMatch(/CHECK constraint failed/);
+    });
+
+    it('allows deactivated_at to be null (default)', async () => {
+      const now = new Date().toISOString();
+
+      await db.insert(schema.users).values({
+        id: 'user-active',
+        email: 'active@example.com',
+        displayName: 'Active User',
+        role: 'member',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const users = await db.select().from(schema.users).where(eq(schema.users.id, 'user-active'));
+      expect(users[0]!.deactivatedAt).toBeNull();
+    });
+
+    it('allows deactivated_at to be a timestamp', async () => {
+      const now = new Date().toISOString();
+      const deactivatedAt = '2024-06-01T10:00:00.000Z';
+
+      await db.insert(schema.users).values({
+        id: 'user-deactivated',
+        email: 'deactivated@example.com',
+        displayName: 'Deactivated User',
+        role: 'member',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const users = await db
+        .select()
+        .from(schema.users)
+        .where(eq(schema.users.id, 'user-deactivated'));
+      expect(users[0]!.deactivatedAt).toBe(deactivatedAt);
+    });
+  });
+
+  describe('Foreign Key & CASCADE Delete', () => {
+    it('session references user with CASCADE delete', async () => {
+      const now = new Date().toISOString();
+      const userId = 'user-cascade-test';
+
+      // Insert user
+      await db.insert(schema.users).values({
+        id: userId,
+        email: 'cascade@example.com',
+        displayName: 'Cascade User',
+        role: 'admin',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Insert sessions for the user
+      await db.insert(schema.sessions).values({
+        id: 'session-1',
+        userId,
+        expiresAt: new Date(Date.now() + 3600000).toISOString(),
+        createdAt: now,
+      });
+
+      await db.insert(schema.sessions).values({
+        id: 'session-2',
+        userId,
+        expiresAt: new Date(Date.now() + 3600000).toISOString(),
+        createdAt: now,
+      });
+
+      // Verify sessions exist
+      let sessions = await db
+        .select()
+        .from(schema.sessions)
+        .where(eq(schema.sessions.userId, userId));
+      expect(sessions).toHaveLength(2);
+
+      // Delete user
+      await db.delete(schema.users).where(eq(schema.users.id, userId));
+
+      // Verify sessions are CASCADE deleted
+      sessions = await db.select().from(schema.sessions).where(eq(schema.sessions.userId, userId));
+      expect(sessions).toHaveLength(0);
+    });
+  });
+
+  describe('Query Patterns', () => {
+    it('can query only active users (WHERE deactivated_at IS NULL)', async () => {
+      const now = new Date().toISOString();
+
+      // Insert active user
+      await db.insert(schema.users).values({
+        id: 'user-active',
+        email: 'active@example.com',
+        displayName: 'Active User',
+        role: 'admin',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Insert deactivated user
+      await db.insert(schema.users).values({
+        id: 'user-inactive',
+        email: 'inactive@example.com',
+        displayName: 'Inactive User',
+        role: 'member',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt: '2024-06-01T10:00:00.000Z',
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Query only active users
+      const activeUsers = sqlite
+        .prepare('SELECT id FROM users WHERE deactivated_at IS NULL')
+        .all() as Array<{ id: string }>;
+
+      expect(activeUsers).toHaveLength(1);
+      expect(activeUsers[0]!.id).toBe('user-active');
+    });
+
+    it('can insert a session and query by user_id', async () => {
+      const now = new Date().toISOString();
+      const userId = 'user-session-test';
+
+      // Insert user
+      await db.insert(schema.users).values({
+        id: userId,
+        email: 'session@example.com',
+        displayName: 'Session User',
+        role: 'admin',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Insert session
+      const sessionId = 'session-query-test';
+      const expiresAt = new Date(Date.now() + 3600000).toISOString();
+      await db.insert(schema.sessions).values({
+        id: sessionId,
+        userId,
+        expiresAt,
+        createdAt: now,
+      });
+
+      // Query session by user_id
+      const sessions = await db
+        .select()
+        .from(schema.sessions)
+        .where(eq(schema.sessions.userId, userId));
+
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0]!.id).toBe(sessionId);
+      expect(sessions[0]!.userId).toBe(userId);
+      expect(sessions[0]!.expiresAt).toBe(expiresAt);
+    });
+
+    it('can query sessions by expires_at index', async () => {
+      const now = new Date().toISOString();
+      const userId = 'user-expires-test';
+
+      // Insert user
+      await db.insert(schema.users).values({
+        id: userId,
+        email: 'expires@example.com',
+        displayName: 'Expires User',
+        role: 'admin',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Insert sessions with different expiration times
+      const pastExpiry = new Date(Date.now() - 3600000).toISOString();
+      const futureExpiry = new Date(Date.now() + 3600000).toISOString();
+
+      await db.insert(schema.sessions).values({
+        id: 'session-expired',
+        userId,
+        expiresAt: pastExpiry,
+        createdAt: now,
+      });
+
+      await db.insert(schema.sessions).values({
+        id: 'session-active',
+        userId,
+        expiresAt: futureExpiry,
+        createdAt: now,
+      });
+
+      // Query expired sessions (expires_at < now)
+      const expiredSessions = sqlite
+        .prepare('SELECT id FROM sessions WHERE expires_at < ?')
+        .all(now) as Array<{ id: string }>;
+
+      expect(expiredSessions).toHaveLength(1);
+      expect(expiredSessions[0]!.id).toBe('session-expired');
+    });
+  });
+});
+
+describe('Work Items Database Schema & Migration', () => {
+  let sqlite: Database.Database;
+  let db: BetterSQLite3Database<typeof schema>;
+
+  /**
+   * Creates a fresh in-memory database with migrations applied.
+   * Foreign keys are enabled to test CASCADE delete behavior.
+   */
+  function createTestDb() {
+    const sqliteDb = new Database(':memory:');
+    sqliteDb.pragma('journal_mode = WAL');
+    sqliteDb.pragma('foreign_keys = ON'); // Required for CASCADE delete and SET NULL
+    runMigrations(sqliteDb);
+    return { sqlite: sqliteDb, db: drizzle(sqliteDb, { schema }) };
+  }
+
+  beforeEach(() => {
+    const testDb = createTestDb();
+    sqlite = testDb.sqlite;
+    db = testDb.db;
+  });
+
+  afterEach(() => {
+    sqlite.close();
+  });
+
+  describe('Migration Structure', () => {
+    it('UAT-3.1-01: migration runs successfully', () => {
+      // Verify migration 0002 was recorded
+      const migrations = sqlite
+        .prepare("SELECT name FROM _migrations WHERE name = '0002_create_work_items.sql'")
+        .all() as Array<{ name: string }>;
+
+      expect(migrations).toHaveLength(1);
+      expect(migrations[0]!.name).toBe('0002_create_work_items.sql');
+    });
+
+    it('UAT-3.1-02: all work item tables exist', () => {
+      const tables = sqlite
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('work_items', 'work_item_notes', 'work_item_subtasks', 'work_item_dependencies')",
+        )
+        .all() as Array<{ name: string }>;
+
+      const tableNames = tables.map((t) => t.name).sort();
+      expect(tableNames).toEqual([
+        'work_item_dependencies',
+        'work_item_notes',
+        'work_item_subtasks',
+        'work_items',
+      ]);
+    });
+
+    it('UAT-3.1-03: work_items table has correct columns', () => {
+      const columns = sqlite.prepare("PRAGMA table_info('work_items')").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+        dflt_value: string | null;
+      }>;
+
+      const columnNames = columns.map((col) => col.name);
+      expect(columnNames).toContain('id');
+      expect(columnNames).toContain('title');
+      expect(columnNames).toContain('description');
+      expect(columnNames).toContain('status');
+      expect(columnNames).toContain('start_date');
+      expect(columnNames).toContain('end_date');
+      expect(columnNames).toContain('duration_days');
+      expect(columnNames).toContain('start_after');
+      expect(columnNames).toContain('start_before');
+      expect(columnNames).toContain('assigned_user_id');
+      expect(columnNames).toContain('created_by');
+      expect(columnNames).toContain('created_at');
+      expect(columnNames).toContain('updated_at');
+
+      // Verify primary key
+      const idCol = columns.find((col) => col.name === 'id');
+      expect(idCol?.pk).toBe(1);
+
+      // Verify NOT NULL constraints
+      const titleCol = columns.find((col) => col.name === 'title');
+      expect(titleCol?.notnull).toBe(1);
+
+      const statusCol = columns.find((col) => col.name === 'status');
+      expect(statusCol?.notnull).toBe(1);
+
+      // Verify nullable columns
+      const descriptionCol = columns.find((col) => col.name === 'description');
+      expect(descriptionCol?.notnull).toBe(0);
+
+      const assignedUserCol = columns.find((col) => col.name === 'assigned_user_id');
+      expect(assignedUserCol?.notnull).toBe(0);
+
+      const createdByCol = columns.find((col) => col.name === 'created_by');
+      expect(createdByCol?.notnull).toBe(0);
+    });
+
+    it('UAT-3.1-04: work_items table has area_id and assigned_vendor_id columns', () => {
+      const columns = sqlite.prepare("PRAGMA table_info('work_items')").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+      }>;
+
+      const columnNames = columns.map((col) => col.name);
+      expect(columnNames).toContain('area_id');
+      expect(columnNames).toContain('assigned_vendor_id');
+
+      // Verify area_id is nullable
+      const areaIdCol = columns.find((col) => col.name === 'area_id');
+      expect(areaIdCol?.notnull).toBe(0);
+
+      // Verify assigned_vendor_id is nullable
+      const assignedVendorIdCol = columns.find((col) => col.name === 'assigned_vendor_id');
+      expect(assignedVendorIdCol?.notnull).toBe(0);
+    });
+
+    it('UAT-3.1-05: tags and work_item_tags tables no longer exist (dropped in migration 0028)', () => {
+      const tagsTbl = sqlite
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='tags'")
+        .all() as Array<{ name: string }>;
+      expect(tagsTbl).toHaveLength(0);
+
+      const witTbl = sqlite
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='work_item_tags'")
+        .all() as Array<{ name: string }>;
+      expect(witTbl).toHaveLength(0);
+    });
+
+    it('UAT-3.1-06: work_item_notes table has correct columns', () => {
+      const columns = sqlite.prepare("PRAGMA table_info('work_item_notes')").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+      }>;
+
+      const columnNames = columns.map((col) => col.name);
+      expect(columnNames).toContain('id');
+      expect(columnNames).toContain('work_item_id');
+      expect(columnNames).toContain('content');
+      expect(columnNames).toContain('created_by');
+      expect(columnNames).toContain('created_at');
+      expect(columnNames).toContain('updated_at');
+
+      // Verify primary key
+      const idCol = columns.find((col) => col.name === 'id');
+      expect(idCol?.pk).toBe(1);
+
+      // Verify NOT NULL constraints
+      const workItemIdCol = columns.find((col) => col.name === 'work_item_id');
+      expect(workItemIdCol?.notnull).toBe(1);
+
+      const contentCol = columns.find((col) => col.name === 'content');
+      expect(contentCol?.notnull).toBe(1);
+
+      // Verify nullable columns
+      const createdByCol = columns.find((col) => col.name === 'created_by');
+      expect(createdByCol?.notnull).toBe(0);
+    });
+
+    it('UAT-3.1-07: work_item_subtasks table has correct columns', () => {
+      const columns = sqlite.prepare("PRAGMA table_info('work_item_subtasks')").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+        dflt_value: string | null;
+      }>;
+
+      const columnNames = columns.map((col) => col.name);
+      expect(columnNames).toContain('id');
+      expect(columnNames).toContain('work_item_id');
+      expect(columnNames).toContain('title');
+      expect(columnNames).toContain('is_completed');
+      expect(columnNames).toContain('sort_order');
+      expect(columnNames).toContain('created_at');
+      expect(columnNames).toContain('updated_at');
+
+      // Verify primary key
+      const idCol = columns.find((col) => col.name === 'id');
+      expect(idCol?.pk).toBe(1);
+
+      // Verify NOT NULL constraints
+      const titleCol = columns.find((col) => col.name === 'title');
+      expect(titleCol?.notnull).toBe(1);
+
+      const isCompletedCol = columns.find((col) => col.name === 'is_completed');
+      expect(isCompletedCol?.notnull).toBe(1);
+      expect(isCompletedCol?.dflt_value).toBe('0');
+
+      const sortOrderCol = columns.find((col) => col.name === 'sort_order');
+      expect(sortOrderCol?.notnull).toBe(1);
+      expect(sortOrderCol?.dflt_value).toBe('0');
+    });
+
+    it('UAT-3.1-08: work_item_dependencies has correct structure', () => {
+      const columns = sqlite.prepare("PRAGMA table_info('work_item_dependencies')").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+      }>;
+
+      const columnNames = columns.map((col) => col.name);
+      expect(columnNames).toContain('predecessor_id');
+      expect(columnNames).toContain('successor_id');
+      expect(columnNames).toContain('dependency_type');
+
+      // Verify composite primary key
+      const pkColumns = columns.filter((col) => col.pk > 0).map((col) => col.name);
+      expect(pkColumns).toContain('predecessor_id');
+      expect(pkColumns).toContain('successor_id');
+      expect(pkColumns).toHaveLength(2);
+
+      // Verify NOT NULL constraints
+      const predecessorCol = columns.find((col) => col.name === 'predecessor_id');
+      expect(predecessorCol?.notnull).toBe(1);
+
+      const successorCol = columns.find((col) => col.name === 'successor_id');
+      expect(successorCol?.notnull).toBe(1);
+
+      const typeCol = columns.find((col) => col.name === 'dependency_type');
+      expect(typeCol?.notnull).toBe(1);
+    });
+
+    it('UAT-3.1-09: all required indexes exist', () => {
+      const indexes = sqlite
+        .prepare("SELECT name, tbl_name FROM sqlite_master WHERE type='index'")
+        .all() as Array<{ name: string; tbl_name: string }>;
+
+      const indexNames = indexes.map((idx) => idx.name);
+
+      // Work items indexes
+      expect(indexNames).toContain('idx_work_items_status');
+      expect(indexNames).toContain('idx_work_items_assigned_user_id');
+      expect(indexNames).toContain('idx_work_items_created_at');
+
+      // Work item notes index
+      expect(indexNames).toContain('idx_work_item_notes_work_item_id');
+
+      // Work item subtasks index
+      expect(indexNames).toContain('idx_work_item_subtasks_work_item_id');
+
+      // Work item dependencies index
+      expect(indexNames).toContain('idx_work_item_dependencies_successor_id');
+
+      // Verify index associations
+      const statusIdx = indexes.find((idx) => idx.name === 'idx_work_items_status');
+      expect(statusIdx?.tbl_name).toBe('work_items');
+
+      const notesIdx = indexes.find((idx) => idx.name === 'idx_work_item_notes_work_item_id');
+      expect(notesIdx?.tbl_name).toBe('work_item_notes');
+
+      const subtasksIdx = indexes.find((idx) => idx.name === 'idx_work_item_subtasks_work_item_id');
+      expect(subtasksIdx?.tbl_name).toBe('work_item_subtasks');
+
+      const depsIdx = indexes.find((idx) => idx.name === 'idx_work_item_dependencies_successor_id');
+      expect(depsIdx?.tbl_name).toBe('work_item_dependencies');
+    });
+  });
+
+  describe('Foreign Key Constraints - CASCADE Delete', () => {
+    let testUserId: string;
+
+    beforeEach(async () => {
+      // Create a test user for foreign key references
+      const now = new Date().toISOString();
+      testUserId = 'user-workitem-test';
+
+      await db.insert(schema.users).values({
+        id: testUserId,
+        email: 'workitem@example.com',
+        displayName: 'WorkItem Test User',
+        role: 'admin',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+
+    it('UAT-3.1-10: deleting a work item cascades to notes', async () => {
+      const now = new Date().toISOString();
+      const workItemId = 'work-item-1';
+
+      // Insert work item
+      await db.insert(schema.workItems).values({
+        id: workItemId,
+        title: 'Test Work Item',
+        description: null,
+        status: 'not_started',
+        startDate: null,
+        endDate: null,
+        durationDays: null,
+        startAfter: null,
+        startBefore: null,
+        assignedUserId: null,
+        createdBy: testUserId,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Insert notes
+      await db.insert(schema.workItemNotes).values([
+        {
+          id: 'note-1',
+          workItemId,
+          content: 'Note 1',
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 'note-2',
+          workItemId,
+          content: 'Note 2',
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ]);
+
+      // Verify notes exist
+      let notes = await db
+        .select()
+        .from(schema.workItemNotes)
+        .where(eq(schema.workItemNotes.workItemId, workItemId));
+      expect(notes).toHaveLength(2);
+
+      // Delete work item
+      await db.delete(schema.workItems).where(eq(schema.workItems.id, workItemId));
+
+      // Verify notes are CASCADE deleted
+      notes = await db
+        .select()
+        .from(schema.workItemNotes)
+        .where(eq(schema.workItemNotes.workItemId, workItemId));
+      expect(notes).toHaveLength(0);
+    });
+
+    it('UAT-3.1-11: deleting a work item cascades to subtasks', async () => {
+      const now = new Date().toISOString();
+      const workItemId = 'work-item-2';
+
+      // Insert work item
+      await db.insert(schema.workItems).values({
+        id: workItemId,
+        title: 'Test Work Item',
+        description: null,
+        status: 'not_started',
+        startDate: null,
+        endDate: null,
+        durationDays: null,
+        startAfter: null,
+        startBefore: null,
+        assignedUserId: null,
+        createdBy: testUserId,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Insert subtasks
+      await db.insert(schema.workItemSubtasks).values([
+        {
+          id: 'subtask-1',
+          workItemId,
+          title: 'Subtask 1',
+          isCompleted: false,
+          sortOrder: 0,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 'subtask-2',
+          workItemId,
+          title: 'Subtask 2',
+          isCompleted: false,
+          sortOrder: 1,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ]);
+
+      // Verify subtasks exist
+      let subtasks = await db
+        .select()
+        .from(schema.workItemSubtasks)
+        .where(eq(schema.workItemSubtasks.workItemId, workItemId));
+      expect(subtasks).toHaveLength(2);
+
+      // Delete work item
+      await db.delete(schema.workItems).where(eq(schema.workItems.id, workItemId));
+
+      // Verify subtasks are CASCADE deleted
+      subtasks = await db
+        .select()
+        .from(schema.workItemSubtasks)
+        .where(eq(schema.workItemSubtasks.workItemId, workItemId));
+      expect(subtasks).toHaveLength(0);
+    });
+
+    it('UAT-3.1-12: work_items now has area_id and assigned_vendor_id columns (migration 0028)', async () => {
+      const now = new Date().toISOString();
+      const workItemId = 'work-item-area-test';
+
+      // Insert work item with area_id and assigned_vendor_id as null (no FK violation)
+      await db.insert(schema.workItems).values({
+        id: workItemId,
+        title: 'Test Work Item',
+        description: null,
+        status: 'not_started',
+        startDate: null,
+        endDate: null,
+        durationDays: null,
+        startAfter: null,
+        startBefore: null,
+        assignedUserId: null,
+        areaId: null,
+        assignedVendorId: null,
+        createdBy: testUserId,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Verify work item was inserted and has the expected new columns
+      const workItems = await db
+        .select()
+        .from(schema.workItems)
+        .where(eq(schema.workItems.id, workItemId));
+      expect(workItems).toHaveLength(1);
+      expect(workItems[0]!.areaId).toBeNull();
+      expect(workItems[0]!.assignedVendorId).toBeNull();
+    });
+
+    it('UAT-3.1-13: deleting a work item cascades to dependencies', async () => {
+      const now = new Date().toISOString();
+
+      // Insert work items
+      await db.insert(schema.workItems).values([
+        {
+          id: 'work-item-a',
+          title: 'Work Item A',
+          description: null,
+          status: 'not_started',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 'work-item-b',
+          title: 'Work Item B',
+          description: null,
+          status: 'not_started',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 'work-item-c',
+          title: 'Work Item C',
+          description: null,
+          status: 'not_started',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ]);
+
+      // Insert dependencies: A -> B -> C
+      await db.insert(schema.workItemDependencies).values([
+        {
+          predecessorId: 'work-item-a',
+          successorId: 'work-item-b',
+          dependencyType: 'finish_to_start',
+        },
+        {
+          predecessorId: 'work-item-b',
+          successorId: 'work-item-c',
+          dependencyType: 'finish_to_start',
+        },
+      ]);
+
+      // Verify dependencies exist
+      let dependencies = await db.select().from(schema.workItemDependencies);
+      expect(dependencies).toHaveLength(2);
+
+      // Delete work item B (which is both predecessor and successor)
+      await db.delete(schema.workItems).where(eq(schema.workItems.id, 'work-item-b'));
+
+      // Verify both dependencies involving B are CASCADE deleted
+      dependencies = await db.select().from(schema.workItemDependencies);
+      expect(dependencies).toHaveLength(0);
+
+      // Verify work items A and C are NOT deleted
+      const workItems = await db.select().from(schema.workItems);
+      expect(workItems).toHaveLength(2);
+      expect(workItems.map((wi) => wi.id).sort()).toEqual(['work-item-a', 'work-item-c']);
+    });
+
+    it('UAT-3.1-14: deleting a user sets assigned_user_id to NULL', async () => {
+      const now = new Date().toISOString();
+      const assignedUserId = 'user-assigned-1';
+
+      // Create assigned user
+      await db.insert(schema.users).values({
+        id: assignedUserId,
+        email: 'assigned@example.com',
+        displayName: 'Assigned User',
+        role: 'member',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Insert work item assigned to this user
+      await db.insert(schema.workItems).values({
+        id: 'work-item-4',
+        title: 'Assigned Work Item',
+        description: null,
+        status: 'in_progress',
+        startDate: null,
+        endDate: null,
+        durationDays: null,
+        startAfter: null,
+        startBefore: null,
+        assignedUserId,
+        createdBy: testUserId,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Verify work item is assigned
+      let workItems = await db
+        .select()
+        .from(schema.workItems)
+        .where(eq(schema.workItems.id, 'work-item-4'));
+      expect(workItems[0]!.assignedUserId).toBe(assignedUserId);
+
+      // Delete the assigned user
+      await db.delete(schema.users).where(eq(schema.users.id, assignedUserId));
+
+      // Verify assigned_user_id is SET NULL
+      workItems = await db
+        .select()
+        .from(schema.workItems)
+        .where(eq(schema.workItems.id, 'work-item-4'));
+      expect(workItems).toHaveLength(1);
+      expect(workItems[0]!.assignedUserId).toBeNull();
+    });
+
+    it('UAT-3.1-15: deleting a user sets created_by to NULL', async () => {
+      const now = new Date().toISOString();
+      const noteAuthorId = 'user-note-author-1';
+
+      // Create note author user
+      await db.insert(schema.users).values({
+        id: noteAuthorId,
+        email: 'noteauthor@example.com',
+        displayName: 'Note Author',
+        role: 'member',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Insert work item
+      await db.insert(schema.workItems).values({
+        id: 'work-item-5',
+        title: 'Work Item with Notes',
+        description: null,
+        status: 'not_started',
+        startDate: null,
+        endDate: null,
+        durationDays: null,
+        startAfter: null,
+        startBefore: null,
+        assignedUserId: null,
+        createdBy: testUserId,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Insert note created by this user
+      await db.insert(schema.workItemNotes).values({
+        id: 'note-3',
+        workItemId: 'work-item-5',
+        content: 'Note by author',
+        createdBy: noteAuthorId,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Verify note exists with author
+      const notesBefore = await db
+        .select()
+        .from(schema.workItemNotes)
+        .where(eq(schema.workItemNotes.id, 'note-3'));
+      expect(notesBefore[0]!.createdBy).toBe(noteAuthorId);
+
+      // Delete the note author - should succeed and set created_by to NULL
+      await db.delete(schema.users).where(eq(schema.users.id, noteAuthorId));
+
+      // Verify note still exists but created_by is now NULL
+      const notesAfter = await db
+        .select()
+        .from(schema.workItemNotes)
+        .where(eq(schema.workItemNotes.id, 'note-3'));
+      expect(notesAfter).toHaveLength(1);
+      expect(notesAfter[0]!.createdBy).toBeNull();
+    });
+
+    it('UAT-3.1-16: tags and work_item_tags tables do not exist (removed in migration 0028)', () => {
+      // Tags feature was removed — verify the tables are gone
+      const tagsTbl = sqlite
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='tags'")
+        .all() as Array<{ name: string }>;
+      expect(tagsTbl).toHaveLength(0);
+
+      const witTbl = sqlite
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='work_item_tags'")
+        .all() as Array<{ name: string }>;
+      expect(witTbl).toHaveLength(0);
+    });
+  });
+
+  describe('Check Constraints', () => {
+    let testUserId: string;
+
+    beforeEach(async () => {
+      // Create a test user for foreign key references
+      const now = new Date().toISOString();
+      testUserId = 'user-constraint-test';
+
+      await db.insert(schema.users).values({
+        id: testUserId,
+        email: 'constraint@example.com',
+        displayName: 'Constraint Test User',
+        role: 'admin',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+
+    it('UAT-3.1-17: status CHECK constraint rejects invalid values', () => {
+      const now = new Date().toISOString();
+
+      // Attempt to insert work item with invalid status using raw SQL
+      let error: Error | undefined;
+      try {
+        sqlite
+          .prepare(
+            `INSERT INTO work_items (id, title, status, created_by, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            'work-item-invalid-status',
+            'Test Work Item',
+            'invalid_status',
+            testUserId,
+            now,
+            now,
+          );
+      } catch (err) {
+        error = err as Error;
+      }
+
+      expect(error).toBeDefined();
+      expect(error?.message).toMatch(/CHECK constraint failed/);
+    });
+
+    it('UAT-3.1-18: status CHECK constraint accepts valid values', async () => {
+      const now = new Date().toISOString();
+
+      // Insert work items with all valid status values (blocked removed in Issue #296)
+      await db.insert(schema.workItems).values([
+        {
+          id: 'work-item-not-started',
+          title: 'Not Started',
+          description: null,
+          status: 'not_started',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 'work-item-in-progress',
+          title: 'In Progress',
+          description: null,
+          status: 'in_progress',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 'work-item-completed',
+          title: 'Completed',
+          description: null,
+          status: 'completed',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ]);
+
+      // Verify all inserts succeeded
+      const workItems = await db.select().from(schema.workItems);
+      expect(workItems.length).toBeGreaterThanOrEqual(3);
+    });
+
+    it('UAT-3.1-19: dependency type CHECK constraint rejects invalid values', async () => {
+      const now = new Date().toISOString();
+
+      // Insert work items
+      await db.insert(schema.workItems).values([
+        {
+          id: 'work-item-dep-a',
+          title: 'Work Item A',
+          description: null,
+          status: 'not_started',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 'work-item-dep-b',
+          title: 'Work Item B',
+          description: null,
+          status: 'not_started',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ]);
+
+      // Attempt to insert dependency with invalid type using raw SQL
+      let error: Error | undefined;
+      try {
+        sqlite
+          .prepare(
+            `INSERT INTO work_item_dependencies (predecessor_id, successor_id, dependency_type)
+             VALUES (?, ?, ?)`,
+          )
+          .run('work-item-dep-a', 'work-item-dep-b', 'invalid_type');
+      } catch (err) {
+        error = err as Error;
+      }
+
+      expect(error).toBeDefined();
+      expect(error?.message).toMatch(/CHECK constraint failed/);
+    });
+
+    it('UAT-3.1-20: dependency type CHECK constraint accepts valid values', async () => {
+      const now = new Date().toISOString();
+
+      // Insert work items
+      await db.insert(schema.workItems).values([
+        {
+          id: 'work-item-dep-1',
+          title: 'Work Item 1',
+          description: null,
+          status: 'not_started',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 'work-item-dep-2',
+          title: 'Work Item 2',
+          description: null,
+          status: 'not_started',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 'work-item-dep-3',
+          title: 'Work Item 3',
+          description: null,
+          status: 'not_started',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 'work-item-dep-4',
+          title: 'Work Item 4',
+          description: null,
+          status: 'not_started',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 'work-item-dep-5',
+          title: 'Work Item 5',
+          description: null,
+          status: 'not_started',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ]);
+
+      // Insert dependencies with all valid types
+      await db.insert(schema.workItemDependencies).values([
+        {
+          predecessorId: 'work-item-dep-1',
+          successorId: 'work-item-dep-2',
+          dependencyType: 'finish_to_start',
+        },
+        {
+          predecessorId: 'work-item-dep-2',
+          successorId: 'work-item-dep-3',
+          dependencyType: 'start_to_start',
+        },
+        {
+          predecessorId: 'work-item-dep-3',
+          successorId: 'work-item-dep-4',
+          dependencyType: 'finish_to_finish',
+        },
+        {
+          predecessorId: 'work-item-dep-4',
+          successorId: 'work-item-dep-5',
+          dependencyType: 'start_to_finish',
+        },
+      ]);
+
+      // Verify all inserts succeeded
+      const dependencies = await db.select().from(schema.workItemDependencies);
+      expect(dependencies.length).toBeGreaterThanOrEqual(4);
+    });
+
+    it('UAT-3.1-21: self-reference CHECK constraint prevents loops', async () => {
+      const now = new Date().toISOString();
+
+      // Insert work item
+      await db.insert(schema.workItems).values({
+        id: 'work-item-self-ref',
+        title: 'Work Item',
+        description: null,
+        status: 'not_started',
+        startDate: null,
+        endDate: null,
+        durationDays: null,
+        startAfter: null,
+        startBefore: null,
+        assignedUserId: null,
+        createdBy: testUserId,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Attempt to create self-referential dependency using raw SQL
+      let error: Error | undefined;
+      try {
+        sqlite
+          .prepare(
+            `INSERT INTO work_item_dependencies (predecessor_id, successor_id, dependency_type)
+             VALUES (?, ?, ?)`,
+          )
+          .run('work-item-self-ref', 'work-item-self-ref', 'finish_to_start');
+      } catch (err) {
+        error = err as Error;
+      }
+
+      expect(error).toBeDefined();
+      expect(error?.message).toMatch(/CHECK constraint failed/);
+    });
+  });
+
+  describe('Unique Constraints', () => {
+    it('enforces trade name uniqueness', async () => {
+      // Try inserting a duplicate trade name — the trades table enforces uniqueness on name
+      let error: Error | undefined;
+      try {
+        sqlite
+          .prepare(
+            `INSERT INTO trades (id, name, description, color, sort_order, created_at, updated_at) VALUES (?, ?, NULL, NULL, 999, datetime('now'), datetime('now'))`,
+          )
+          .run('trade-duplicate-test', 'Plumbing'); // 'Plumbing' already seeded
+      } catch (err) {
+        error = err as Error;
+      }
+
+      expect(error).toBeDefined();
+      expect(error?.message).toMatch(/UNIQUE constraint failed/);
+    });
+
+    it('allows duplicate work item titles (no uniqueness constraint)', async () => {
+      const now = new Date().toISOString();
+      const userId = 'user-dup-title-test';
+
+      // Create test user
+      await db.insert(schema.users).values({
+        id: userId,
+        email: 'duptitle@example.com',
+        displayName: 'Dup Title Test User',
+        role: 'admin',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Insert two work items with the same title (should succeed)
+      await db.insert(schema.workItems).values([
+        {
+          id: 'work-item-dup-1',
+          title: 'Duplicate Title',
+          description: null,
+          status: 'not_started',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: userId,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 'work-item-dup-2',
+          title: 'Duplicate Title',
+          description: null,
+          status: 'not_started',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: userId,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ]);
+
+      // Verify both inserts succeeded
+      const workItems = await db.select().from(schema.workItems);
+      const duplicateTitles = workItems.filter((wi) => wi.title === 'Duplicate Title');
+      expect(duplicateTitles).toHaveLength(2);
+    });
+  });
+
+  describe('Data Insertion via Drizzle ORM', () => {
+    let testUserId: string;
+
+    beforeEach(async () => {
+      const now = new Date().toISOString();
+      testUserId = 'user-insert-test';
+
+      await db.insert(schema.users).values({
+        id: testUserId,
+        email: 'insert@example.com',
+        displayName: 'Insert Test User',
+        role: 'admin',
+        authProvider: 'local',
+        passwordHash: '$2b$10$hash',
+        oidcSubject: null,
+        deactivatedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+
+    it('can insert a work item with all fields', async () => {
+      const now = new Date().toISOString();
+      const workItemId = 'work-item-full';
+
+      await db.insert(schema.workItems).values({
+        id: workItemId,
+        title: 'Complete Work Item',
+        description: 'Full description text',
+        status: 'in_progress',
+        startDate: '2024-01-01',
+        endDate: '2024-01-31',
+        durationDays: 30,
+        startAfter: '2023-12-15',
+        startBefore: '2024-01-05',
+        assignedUserId: testUserId,
+        createdBy: testUserId,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const workItems = await db
+        .select()
+        .from(schema.workItems)
+        .where(eq(schema.workItems.id, workItemId));
+      expect(workItems).toHaveLength(1);
+      expect(workItems[0]!.title).toBe('Complete Work Item');
+      expect(workItems[0]!.description).toBe('Full description text');
+      expect(workItems[0]!.status).toBe('in_progress');
+      expect(workItems[0]!.startDate).toBe('2024-01-01');
+      expect(workItems[0]!.endDate).toBe('2024-01-31');
+      expect(workItems[0]!.durationDays).toBe(30);
+      expect(workItems[0]!.startAfter).toBe('2023-12-15');
+      expect(workItems[0]!.startBefore).toBe('2024-01-05');
+      expect(workItems[0]!.assignedUserId).toBe(testUserId);
+      expect(workItems[0]!.createdBy).toBe(testUserId);
+    });
+
+    it('can insert a minimal work item with only required fields', async () => {
+      const now = new Date().toISOString();
+      const workItemId = 'work-item-minimal';
+
+      await db.insert(schema.workItems).values({
+        id: workItemId,
+        title: 'Minimal Work Item',
+        description: null,
+        status: 'not_started',
+        startDate: null,
+        endDate: null,
+        durationDays: null,
+        startAfter: null,
+        startBefore: null,
+        assignedUserId: null,
+        createdBy: testUserId,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const workItems = await db
+        .select()
+        .from(schema.workItems)
+        .where(eq(schema.workItems.id, workItemId));
+      expect(workItems).toHaveLength(1);
+      expect(workItems[0]!.title).toBe('Minimal Work Item');
+      expect(workItems[0]!.description).toBeNull();
+      expect(workItems[0]!.status).toBe('not_started');
+      expect(workItems[0]!.assignedUserId).toBeNull();
+    });
+
+    it('can query default trades seeded by migration 0028', async () => {
+      // Migration 0028 seeds 15 default trades; verify some are present
+      const trades = sqlite
+        .prepare(
+          "SELECT id, name FROM trades WHERE id IN ('trade-plumbing', 'trade-electrical', 'trade-other')",
+        )
+        .all() as Array<{ id: string; name: string }>;
+      expect(trades.length).toBe(3);
+      const ids = trades.map((t) => t.id).sort();
+      expect(ids).toEqual(['trade-electrical', 'trade-other', 'trade-plumbing']);
+    });
+
+    it('can link a vendor to a trade via trade_id FK', async () => {
+      const now = new Date().toISOString();
+      const vendorId = 'vendor-trade-fk-test';
+
+      await db.insert(schema.vendors).values({
+        id: vendorId,
+        name: 'Test Vendor',
+        tradeId: 'trade-plumbing',
+        phone: null,
+        email: null,
+        address: null,
+        notes: null,
+        createdBy: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const vendorRows = await db
+        .select()
+        .from(schema.vendors)
+        .where(eq(schema.vendors.id, vendorId));
+      expect(vendorRows).toHaveLength(1);
+      expect(vendorRows[0]!.tradeId).toBe('trade-plumbing');
+    });
+
+    it('can insert notes on a work item', async () => {
+      const now = new Date().toISOString();
+      const workItemId = 'work-item-with-notes';
+
+      // Insert work item
+      await db.insert(schema.workItems).values({
+        id: workItemId,
+        title: 'Work Item with Notes',
+        description: null,
+        status: 'not_started',
+        startDate: null,
+        endDate: null,
+        durationDays: null,
+        startAfter: null,
+        startBefore: null,
+        assignedUserId: null,
+        createdBy: testUserId,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Insert notes
+      await db.insert(schema.workItemNotes).values([
+        {
+          id: 'note-a',
+          workItemId,
+          content: 'First note',
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 'note-b',
+          workItemId,
+          content: 'Second note',
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ]);
+
+      // Verify notes
+      const notes = await db
+        .select()
+        .from(schema.workItemNotes)
+        .where(eq(schema.workItemNotes.workItemId, workItemId));
+
+      expect(notes).toHaveLength(2);
+      expect(notes.map((n) => n.content).sort()).toEqual(['First note', 'Second note']);
+    });
+
+    it('can insert subtasks on a work item', async () => {
+      const now = new Date().toISOString();
+      const workItemId = 'work-item-with-subtasks';
+
+      // Insert work item
+      await db.insert(schema.workItems).values({
+        id: workItemId,
+        title: 'Work Item with Subtasks',
+        description: null,
+        status: 'not_started',
+        startDate: null,
+        endDate: null,
+        durationDays: null,
+        startAfter: null,
+        startBefore: null,
+        assignedUserId: null,
+        createdBy: testUserId,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Insert subtasks
+      await db.insert(schema.workItemSubtasks).values([
+        {
+          id: 'subtask-a',
+          workItemId,
+          title: 'First subtask',
+          isCompleted: false,
+          sortOrder: 0,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 'subtask-b',
+          workItemId,
+          title: 'Second subtask',
+          isCompleted: true,
+          sortOrder: 1,
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 'subtask-c',
+          workItemId,
+          title: 'Third subtask',
+          isCompleted: false,
+          sortOrder: 2,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ]);
+
+      // Verify subtasks
+      const subtasks = await db
+        .select()
+        .from(schema.workItemSubtasks)
+        .where(eq(schema.workItemSubtasks.workItemId, workItemId));
+
+      expect(subtasks).toHaveLength(3);
+      expect(subtasks.map((s) => s.sortOrder).sort()).toEqual([0, 1, 2]);
+      expect(subtasks.find((s) => s.id === 'subtask-b')?.isCompleted).toBe(true);
+    });
+
+    it('can insert dependencies between work items', async () => {
+      const now = new Date().toISOString();
+
+      // Insert work items
+      const workItemIds = ['work-item-x', 'work-item-y', 'work-item-z'];
+      for (const id of workItemIds) {
+        await db.insert(schema.workItems).values({
+          id,
+          title: `Work Item ${id}`,
+          description: null,
+          status: 'not_started',
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          startAfter: null,
+          startBefore: null,
+          assignedUserId: null,
+          createdBy: testUserId,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+
+      // Insert dependencies: X -> Y -> Z
+      await db.insert(schema.workItemDependencies).values([
+        {
+          predecessorId: 'work-item-x',
+          successorId: 'work-item-y',
+          dependencyType: 'finish_to_start',
+        },
+        {
+          predecessorId: 'work-item-y',
+          successorId: 'work-item-z',
+          dependencyType: 'start_to_start',
+        },
+      ]);
+
+      // Verify dependencies
+      const dependencies = await db.select().from(schema.workItemDependencies);
+      expect(dependencies.length).toBeGreaterThanOrEqual(2);
+
+      const dep1 = dependencies.find(
+        (d) => d.predecessorId === 'work-item-x' && d.successorId === 'work-item-y',
+      );
+      expect(dep1).toBeDefined();
+      expect(dep1?.dependencyType).toBe('finish_to_start');
+
+      const dep2 = dependencies.find(
+        (d) => d.predecessorId === 'work-item-y' && d.successorId === 'work-item-z',
+      );
+      expect(dep2).toBeDefined();
+      expect(dep2?.dependencyType).toBe('start_to_start');
+    });
+  });
+});
+
+// ─── EPIC-05: Budget Schema Tests ─────────────────────────────────────────────
+
+describe('Budget Schema (EPIC-05)', () => {
+  let sqlite: Database.Database;
+  let db: BetterSQLite3Database<typeof schema>;
+
+  function createTestDb() {
+    const sqliteDb = new Database(':memory:');
+    sqliteDb.pragma('journal_mode = WAL');
+    sqliteDb.pragma('foreign_keys = ON');
+    runMigrations(sqliteDb);
+    return { sqlite: sqliteDb, db: drizzle(sqliteDb, { schema }) };
+  }
+
+  beforeEach(() => {
+    const testDb = createTestDb();
+    sqlite = testDb.sqlite;
+    db = testDb.db;
+  });
+
+  afterEach(() => {
+    sqlite.close();
+  });
+
+  // ─── budget_categories table ──────────────────────────────────────────────
+
+  describe('budget_categories table', () => {
+    it('creates budget_categories table with correct columns', () => {
+      const columns = sqlite.prepare("PRAGMA table_info('budget_categories')").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+        dflt_value: string | null;
+      }>;
+
+      const columnNames = columns.map((col) => col.name);
+      expect(columnNames).toContain('id');
+      expect(columnNames).toContain('name');
+      expect(columnNames).toContain('description');
+      expect(columnNames).toContain('color');
+      expect(columnNames).toContain('sort_order');
+      expect(columnNames).toContain('created_at');
+      expect(columnNames).toContain('updated_at');
+
+      // Primary key
+      const idCol = columns.find((col) => col.name === 'id');
+      expect(idCol?.pk).toBe(1);
+
+      // NOT NULL constraints
+      const nameCol = columns.find((col) => col.name === 'name');
+      expect(nameCol?.notnull).toBe(1);
+
+      const createdAtCol = columns.find((col) => col.name === 'created_at');
+      expect(createdAtCol?.notnull).toBe(1);
+
+      const updatedAtCol = columns.find((col) => col.name === 'updated_at');
+      expect(updatedAtCol?.notnull).toBe(1);
+
+      // sort_order defaults to 0
+      const sortOrderCol = columns.find((col) => col.name === 'sort_order');
+      expect(sortOrderCol?.notnull).toBe(1);
+      expect(sortOrderCol?.dflt_value).toBe('0');
+    });
+
+    it('enforces UNIQUE constraint on name column', async () => {
+      // Use a name that does not conflict with the 10 seeded categories.
+      // better-sqlite3 is synchronous and throws (not rejects), so use try/catch.
+      const now = new Date().toISOString();
+
+      await db.insert(schema.budgetCategories).values({
+        id: 'cat-schema-1',
+        name: 'Test Schema Cat A',
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      let error: Error | undefined;
+      try {
+        await db.insert(schema.budgetCategories).values({
+          id: 'cat-schema-2',
+          name: 'Test Schema Cat A', // Duplicate name
+          createdAt: now,
+          updatedAt: now,
+        });
+      } catch (err) {
+        error = err as Error;
+      }
+
+      expect(error).toBeDefined();
+      expect(error?.message).toMatch(/UNIQUE constraint failed/);
+    });
+
+    it('enforces UNIQUE constraint on seeded name (Materials)', async () => {
+      // 'Materials' is already seeded by the migration; re-inserting must fail.
+      // better-sqlite3 throws synchronously, so use try/catch.
+      const now = new Date().toISOString();
+
+      let error: Error | undefined;
+      try {
+        await db.insert(schema.budgetCategories).values({
+          id: 'cat-schema-dup',
+          name: 'Materials',
+          createdAt: now,
+          updatedAt: now,
+        });
+      } catch (err) {
+        error = err as Error;
+      }
+
+      expect(error).toBeDefined();
+      expect(error?.message).toMatch(/UNIQUE constraint failed/);
+    });
+
+    it('can insert a category with all optional fields', async () => {
+      const now = new Date().toISOString();
+
+      await db.insert(schema.budgetCategories).values({
+        id: 'cat-full',
+        name: 'Test Schema Full Cat',
+        description: 'Construction labor costs',
+        color: '#3B82F6',
+        sortOrder: 5,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const rows = await db
+        .select()
+        .from(schema.budgetCategories)
+        .where(eq(schema.budgetCategories.id, 'cat-full'));
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.name).toBe('Test Schema Full Cat');
+      expect(rows[0]!.description).toBe('Construction labor costs');
+      expect(rows[0]!.color).toBe('#3B82F6');
+      expect(rows[0]!.sortOrder).toBe(5);
+    });
+
+    it('can insert a category with null optional fields', async () => {
+      const now = new Date().toISOString();
+
+      await db.insert(schema.budgetCategories).values({
+        id: 'cat-minimal',
+        name: 'Test Schema Minimal Cat',
+        description: null,
+        color: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const rows = await db
+        .select()
+        .from(schema.budgetCategories)
+        .where(eq(schema.budgetCategories.id, 'cat-minimal'));
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.description).toBeNull();
+      expect(rows[0]!.color).toBeNull();
+      expect(rows[0]!.sortOrder).toBe(0); // Default value
+    });
+  });
+
+  // ─── vendors table ────────────────────────────────────────────────────────
+
+  describe('vendors table', () => {
+    it('creates vendors table with correct columns', () => {
+      const columns = sqlite.prepare("PRAGMA table_info('vendors')").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+      }>;
+
+      const columnNames = columns.map((col) => col.name);
+      expect(columnNames).toContain('id');
+      expect(columnNames).toContain('name');
+      expect(columnNames).toContain('trade_id');
+      expect(columnNames).not.toContain('specialty');
+      expect(columnNames).toContain('phone');
+      expect(columnNames).toContain('email');
+      expect(columnNames).toContain('address');
+      expect(columnNames).toContain('notes');
+      expect(columnNames).toContain('created_by');
+      expect(columnNames).toContain('created_at');
+      expect(columnNames).toContain('updated_at');
+
+      const idCol = columns.find((col) => col.name === 'id');
+      expect(idCol?.pk).toBe(1);
+
+      const nameCol = columns.find((col) => col.name === 'name');
+      expect(nameCol?.notnull).toBe(1);
+    });
+
+    it('can insert a vendor with all fields', async () => {
+      const now = new Date().toISOString();
+
+      await db.insert(schema.vendors).values({
+        id: 'vendor-1',
+        name: 'ABC Construction',
+        tradeId: 'trade-electrical',
+        phone: '555-1234',
+        email: 'abc@construction.com',
+        address: '123 Main St',
+        notes: 'Reliable contractor',
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const rows = await db.select().from(schema.vendors).where(eq(schema.vendors.id, 'vendor-1'));
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.name).toBe('ABC Construction');
+      expect(rows[0]!.tradeId).toBe('trade-electrical');
+    });
+
+    it('creates idx_vendors_new_name index', () => {
+      // Migration 0028 recreates the vendors table as vendors_new, then renames it.
+      // The index is created as idx_vendors_new_name and retains that name after rename.
+      const indexes = sqlite
+        .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='vendors'")
+        .all() as Array<{ name: string }>;
+
+      const indexNames = indexes.map((idx) => idx.name);
+      expect(indexNames).toContain('idx_vendors_new_name');
+    });
+  });
+
+  // ─── invoices table ───────────────────────────────────────────────────────
+
+  describe('invoices table', () => {
+    it('creates invoices table with correct columns', () => {
+      const columns = sqlite.prepare("PRAGMA table_info('invoices')").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+      }>;
+
+      const columnNames = columns.map((col) => col.name);
+      expect(columnNames).toContain('id');
+      expect(columnNames).toContain('vendor_id');
+      expect(columnNames).toContain('invoice_number');
+      expect(columnNames).toContain('amount');
+      expect(columnNames).toContain('date');
+      expect(columnNames).toContain('due_date');
+      expect(columnNames).toContain('status');
+      expect(columnNames).toContain('notes');
+      expect(columnNames).toContain('created_by');
+      expect(columnNames).toContain('created_at');
+      expect(columnNames).toContain('updated_at');
+
+      const amountCol = columns.find((col) => col.name === 'amount');
+      expect(amountCol?.notnull).toBe(1);
+
+      const dateCol = columns.find((col) => col.name === 'date');
+      expect(dateCol?.notnull).toBe(1);
+    });
+
+    it('can insert an invoice and CASCADE deletes when vendor is deleted', async () => {
+      const now = new Date().toISOString();
+
+      // Insert vendor
+      await db.insert(schema.vendors).values({
+        id: 'vendor-for-invoice',
+        name: 'Test Vendor',
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Insert invoice
+      await db.insert(schema.invoices).values({
+        id: 'invoice-1',
+        vendorId: 'vendor-for-invoice',
+        amount: 5000.0,
+        date: '2026-01-15',
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Verify invoice exists
+      const invoicesBefore = await db
+        .select()
+        .from(schema.invoices)
+        .where(eq(schema.invoices.id, 'invoice-1'));
+      expect(invoicesBefore).toHaveLength(1);
+
+      // Delete vendor (should cascade)
+      await db.delete(schema.vendors).where(eq(schema.vendors.id, 'vendor-for-invoice'));
+
+      // Invoice should be gone
+      const invoicesAfter = await db
+        .select()
+        .from(schema.invoices)
+        .where(eq(schema.invoices.id, 'invoice-1'));
+      expect(invoicesAfter).toHaveLength(0);
+    });
+
+    it('creates idx_invoices_vendor_id, idx_invoices_status, and idx_invoices_date indexes', () => {
+      const indexes = sqlite
+        .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='invoices'")
+        .all() as Array<{ name: string }>;
+
+      const indexNames = indexes.map((idx) => idx.name);
+      expect(indexNames).toContain('idx_invoices_vendor_id');
+      expect(indexNames).toContain('idx_invoices_status');
+      expect(indexNames).toContain('idx_invoices_date');
+    });
+  });
+
+  // ─── budget_sources table ─────────────────────────────────────────────────
+
+  describe('budget_sources table', () => {
+    it('creates budget_sources table with correct columns', () => {
+      const columns = sqlite.prepare("PRAGMA table_info('budget_sources')").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+      }>;
+
+      const columnNames = columns.map((col) => col.name);
+      expect(columnNames).toContain('id');
+      expect(columnNames).toContain('name');
+      expect(columnNames).toContain('source_type');
+      expect(columnNames).toContain('total_amount');
+      expect(columnNames).toContain('interest_rate');
+      expect(columnNames).toContain('terms');
+      expect(columnNames).toContain('notes');
+      expect(columnNames).toContain('status');
+      expect(columnNames).toContain('created_by');
+      expect(columnNames).toContain('created_at');
+      expect(columnNames).toContain('updated_at');
+
+      const nameCol = columns.find((col) => col.name === 'name');
+      expect(nameCol?.notnull).toBe(1);
+
+      const totalAmountCol = columns.find((col) => col.name === 'total_amount');
+      expect(totalAmountCol?.notnull).toBe(1);
+    });
+
+    it('can insert a budget source', async () => {
+      const now = new Date().toISOString();
+
+      await db.insert(schema.budgetSources).values({
+        id: 'source-1',
+        name: 'Bank Loan',
+        sourceType: 'bank_loan',
+        totalAmount: 200000.0,
+        interestRate: 3.5,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const rows = await db
+        .select()
+        .from(schema.budgetSources)
+        .where(eq(schema.budgetSources.id, 'source-1'));
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.name).toBe('Bank Loan');
+      expect(rows[0]!.sourceType).toBe('bank_loan');
+      expect(rows[0]!.totalAmount).toBe(200000.0);
+      expect(rows[0]!.status).toBe('active'); // Default value
+    });
+  });
+
+  // ─── subsidy_programs table ───────────────────────────────────────────────
+
+  describe('subsidy_programs table', () => {
+    it('creates subsidy_programs table with correct columns', () => {
+      const columns = sqlite.prepare("PRAGMA table_info('subsidy_programs')").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+      }>;
+
+      const columnNames = columns.map((col) => col.name);
+      expect(columnNames).toContain('id');
+      expect(columnNames).toContain('name');
+      expect(columnNames).toContain('description');
+      expect(columnNames).toContain('eligibility');
+      expect(columnNames).toContain('reduction_type');
+      expect(columnNames).toContain('reduction_value');
+      expect(columnNames).toContain('application_status');
+      expect(columnNames).toContain('application_deadline');
+      expect(columnNames).toContain('notes');
+      expect(columnNames).toContain('created_at');
+      expect(columnNames).toContain('updated_at');
+    });
+
+    it('can insert a subsidy program', async () => {
+      const now = new Date().toISOString();
+
+      await db.insert(schema.subsidyPrograms).values({
+        id: 'subsidy-1',
+        name: 'Green Energy Rebate',
+        description: 'Rebate for solar installation',
+        reductionType: 'percentage',
+        reductionValue: 15.0,
+        applicationStatus: 'eligible',
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const rows = await db
+        .select()
+        .from(schema.subsidyPrograms)
+        .where(eq(schema.subsidyPrograms.id, 'subsidy-1'));
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.name).toBe('Green Energy Rebate');
+      expect(rows[0]!.reductionType).toBe('percentage');
+      expect(rows[0]!.reductionValue).toBe(15.0);
+      expect(rows[0]!.applicationStatus).toBe('eligible'); // Default
+    });
+  });
+
+  // ─── subsidy_program_categories junction table ────────────────────────────
+
+  describe('subsidy_program_categories table', () => {
+    it('creates subsidy_program_categories table with composite primary key', () => {
+      const columns = sqlite
+        .prepare("PRAGMA table_info('subsidy_program_categories')")
+        .all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+      }>;
+
+      const columnNames = columns.map((col) => col.name);
+      expect(columnNames).toContain('subsidy_program_id');
+      expect(columnNames).toContain('budget_category_id');
+
+      // Both are part of composite PK
+      const subsidyCol = columns.find((col) => col.name === 'subsidy_program_id');
+      expect(subsidyCol?.pk).toBeGreaterThan(0);
+
+      const categoryCol = columns.find((col) => col.name === 'budget_category_id');
+      expect(categoryCol?.pk).toBeGreaterThan(0);
+    });
+
+    it('links subsidy programs to budget categories', async () => {
+      const now = new Date().toISOString();
+
+      await db.insert(schema.budgetCategories).values({
+        id: 'cat-a',
+        name: 'Insulation',
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      await db.insert(schema.subsidyPrograms).values({
+        id: 'prog-a',
+        name: 'Energy Efficiency Subsidy',
+        reductionType: 'fixed',
+        reductionValue: 500,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      await db.insert(schema.subsidyProgramCategories).values({
+        subsidyProgramId: 'prog-a',
+        budgetCategoryId: 'cat-a',
+      });
+
+      const rows = await db.select().from(schema.subsidyProgramCategories);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.subsidyProgramId).toBe('prog-a');
+      expect(rows[0]!.budgetCategoryId).toBe('cat-a');
+    });
+
+    it('CASCADE deletes junction rows when budget_category is deleted', async () => {
+      const now = new Date().toISOString();
+
+      await db.insert(schema.budgetCategories).values({
+        id: 'cat-cascade',
+        name: 'Cascade Category',
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      await db.insert(schema.subsidyPrograms).values({
+        id: 'prog-cascade',
+        name: 'Cascade Program',
+        reductionType: 'percentage',
+        reductionValue: 5,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      await db.insert(schema.subsidyProgramCategories).values({
+        subsidyProgramId: 'prog-cascade',
+        budgetCategoryId: 'cat-cascade',
+      });
+
+      // Verify it exists
+      const before = await db.select().from(schema.subsidyProgramCategories);
+      expect(before).toHaveLength(1);
+
+      // Delete the category
+      await db.delete(schema.budgetCategories).where(eq(schema.budgetCategories.id, 'cat-cascade'));
+
+      // Junction row should be gone
+      const after = await db.select().from(schema.subsidyProgramCategories);
+      expect(after).toHaveLength(0);
+    });
+
+    it('CASCADE deletes junction rows when subsidy_program is deleted', async () => {
+      const now = new Date().toISOString();
+
+      await db.insert(schema.budgetCategories).values({
+        id: 'cat-b',
+        name: 'Another Category',
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      await db.insert(schema.subsidyPrograms).values({
+        id: 'prog-b',
+        name: 'Another Program',
+        reductionType: 'percentage',
+        reductionValue: 5,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      await db.insert(schema.subsidyProgramCategories).values({
+        subsidyProgramId: 'prog-b',
+        budgetCategoryId: 'cat-b',
+      });
+
+      // Delete the subsidy program
+      await db.delete(schema.subsidyPrograms).where(eq(schema.subsidyPrograms.id, 'prog-b'));
+
+      // Junction row should be gone
+      const after = await db.select().from(schema.subsidyProgramCategories);
+      expect(after).toHaveLength(0);
+    });
+  });
+
+  // ─── work_item_vendors junction table ────────────────────────────────────
+  // NOTE: Story 5.9 — work_item_vendors was dropped in migration 0005_budget_rework.sql.
+  // Vendor-to-work-item relationships are now expressed via work_item_budgets.vendor_id.
+
+  describe('work_item_vendors table (dropped in Story 5.9)', () => {
+    it('work_item_vendors table does not exist after Story 5.9 migration', () => {
+      const table = sqlite
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='work_item_vendors'")
+        .get();
+
+      expect(table).toBeUndefined();
+    });
+  });
+
+  // ─── work_item_subsidies junction table ──────────────────────────────────
+
+  describe('work_item_subsidies table', () => {
+    it('creates work_item_subsidies table with composite primary key', () => {
+      const columns = sqlite.prepare("PRAGMA table_info('work_item_subsidies')").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+      }>;
+
+      const columnNames = columns.map((col) => col.name);
+      expect(columnNames).toContain('work_item_id');
+      expect(columnNames).toContain('subsidy_program_id');
+    });
+
+    it('creates idx_work_item_subsidies_subsidy_program_id index', () => {
+      const indexes = sqlite
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='work_item_subsidies'",
+        )
+        .all() as Array<{ name: string }>;
+
+      const indexNames = indexes.map((idx) => idx.name);
+      expect(indexNames).toContain('idx_work_item_subsidies_subsidy_program_id');
+    });
+  });
+});

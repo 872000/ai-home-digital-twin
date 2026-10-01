@@ -1,0 +1,55 @@
+/* LoginPage-specific styles (SSO button, divider) */
+/* Shared auth styles are in ../shared/AuthPage.module.css */
+
+.ssoButton {
+  width: 100%;
+  padding: 0.625rem 1rem;
+  background-color: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-size: 0.875rem;
+  font-weight: var(--font-weight-medium);
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.375rem;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.ssoButton:hover:not(:disabled) {
+  background-color: var(--color-bg-secondary);
+  border-color: var(--color-text-placeholder);
+}
+
+.ssoButton:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus-subtle);
+  border-color: var(--color-primary);
+}
+
+.ssoButton:disabled {
+  background-color: var(--color-bg-tertiary);
+  color: var(--color-text-placeholder);
+  cursor: not-allowed;
+}
+
+.divider {
+  display: flex;
+  align-items: center;
+  text-align: center;
+  margin: 1.5rem 0 1rem;
+}
+
+.divider::before,
+.divider::after {
+  content: '';
+  flex: 1;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.dividerText {
+  padding: 0 1rem;
+  color: var(--color-text-muted);
+  font-size: 0.875rem;
+}

@@ -1,0 +1,986 @@
+/**
+ * Cornerstone Design Token System
+ *
+ * 3-layer architecture:
+ *   Layer 1 — Palette: raw named color scales (source of truth)
+ *   Layer 2 — Semantic: purpose-driven aliases using var() references
+ *   Layer 3 — Dark mode stubs: overrides scoped to [data-theme="dark"]
+ *
+ * All values verified against the 25 CSS Module files in client/src/.
+ * Do NOT hardcode these values in component CSS — always reference Layer 2
+ * semantic tokens (or Layer 1 palette tokens when no semantic alias fits).
+ */
+
+/* ============================================================
+ * LAYER 1 — PALETTE (raw color scales)
+ * ============================================================ */
+
+:root {
+  /* --- Grayscale --- */
+  --color-white: #ffffff;
+  --color-black: #000000;
+
+  --color-gray-50: #f9fafb;
+  --color-gray-100: #f3f4f6;
+  --color-gray-200: #e5e7eb;
+  --color-gray-300: #d1d5db;
+  --color-gray-400: #9ca3af;
+  --color-gray-500: #6b7280;
+  --color-gray-600: #4b5563;
+  --color-gray-700: #374151;
+  --color-gray-800: #1f2937;
+  --color-gray-900: #111827;
+
+  /* --- Blue --- */
+  --color-blue-100: #dbeafe;
+  --color-blue-200: #bfdbfe;
+  --color-blue-400: #60a5fa;
+  --color-blue-500: #3b82f6;
+  --color-blue-600: #2563eb;
+  --color-blue-700: #1d4ed8;
+  --color-blue-800: #1e40af;
+
+  /* --- Red --- */
+  --color-red-50: #fef2f2;
+  --color-red-100: #fee2e2;
+  --color-red-200: #fecaca;
+  --color-red-400: #ef4444;
+  --color-red-500: #dc2626;
+  --color-red-600: #b91c1c;
+  --color-red-700: #991b1b;
+
+  /* --- Green ---
+   * Note: these values map to Tailwind's mixed green/emerald scales.
+   * --color-green-100 (#d1fae5) = Tailwind emerald-100
+   * --color-green-150 (#dcfce7) = Tailwind green-100 (non-standard step, kept for semantic alias continuity)
+   */
+  --color-green-50: #f0fdf4;
+  --color-green-100: #d1fae5;
+  --color-green-150: #dcfce7;
+  --color-green-200: #bbf7d0;
+  --color-green-500: #10b981;
+  --color-green-600: #059669;
+  --color-green-700: #166534;
+  --color-green-900: #065f46;
+
+  /* --- Dark Palette (used exclusively in dark theme overrides) --- */
+  /* Slate scale — backgrounds, borders, text in dark mode */
+  --color-slate-900: #0f172a;
+  --color-slate-800: #1a1a2e;
+  --color-slate-700: #16213e;
+  --color-slate-600: #1e293b;
+  --color-slate-500: #334155;
+  --color-slate-400: #475569;
+  --color-slate-300: #64748b;
+  --color-slate-200: #94a3b8;
+  --color-slate-150: #cbd5e1;
+  --color-slate-100: #e2e8f0;
+  --color-slate-50: #f1f5f9;
+
+  /* Blue scale additions — dark mode primary variants */
+  --color-blue-300: #93c5fd;
+
+  /* Red scale additions — dark mode danger variants */
+  --color-red-300: #fca5a5;
+
+  /* Orange scale — critical path accent, warning text */
+  --color-orange-300: #fdba74;
+  --color-orange-400: #fb923c;
+  --color-orange-700: #c2410c;
+
+  /* Amber scale — household item scheduled status */
+  --color-amber-100: #fef3c7;
+  --color-amber-300: #fcd34d;
+  --color-amber-800: #92400e;
+
+  /* Emerald scale — dark mode success variants */
+  --color-emerald-400: #34d399;
+  --color-emerald-300: #6ee7b7;
+  --color-emerald-200: #a7f3d0;
+
+  /* ============================================================
+   * LAYER 2 — SEMANTIC TOKENS (purpose-driven)
+   * ============================================================ */
+
+  /* --- Backgrounds --- */
+  --color-bg-primary: var(--color-white);
+  --color-bg-secondary: var(--color-gray-50);
+  --color-bg-tertiary: var(--color-gray-100);
+  --color-bg-inverse: var(--color-gray-800);
+  --color-bg-hover: var(--color-gray-50);
+
+  /* --- Text --- */
+  --color-text-primary: var(--color-gray-900);
+  --color-text-secondary: var(--color-gray-700);
+  --color-text-body: var(--color-gray-700);
+  --color-text-muted: var(--color-gray-500);
+  --color-text-subtle: var(--color-gray-600);
+  --color-text-inverse: var(--color-white);
+  --color-text-placeholder: var(--color-gray-400);
+  --color-text-disabled: var(--color-gray-400);
+  --color-text-quoted: var(--color-gray-500);
+
+  /* --- Borders --- */
+  --color-border: var(--color-gray-200);
+  --color-border-strong: var(--color-gray-300);
+  --color-border-focus: var(--color-blue-500);
+
+  /* --- Primary action (blue) --- */
+  --color-primary: var(--color-blue-500);
+  --color-primary-hover: var(--color-blue-600);
+  --color-primary-active: var(--color-blue-700);
+  --color-primary-text: var(--color-white);
+  --color-primary-bg: var(--color-blue-100);
+  --color-primary-bg-hover: var(--color-blue-200);
+  --color-primary-badge-text: var(--color-blue-800);
+
+  /* --- Danger / Error (red) --- */
+  --color-danger: var(--color-red-500);
+  --color-danger-hover: var(--color-red-600);
+  --color-danger-active: var(--color-red-700);
+  --color-danger-text: var(--color-white);
+  --color-danger-bg: var(--color-red-50);
+  --color-danger-bg-strong: var(--color-red-100);
+  --color-danger-border: var(--color-red-200);
+  --color-danger-text-on-light: var(--color-red-700);
+  --color-danger-input-border: var(--color-red-400);
+
+  /* --- Warning (orange/amber) --- */
+  --color-warning: var(--color-orange-400);
+  --color-warning-bg: #fff7ed;
+  --color-warning-text-on-light: var(--color-orange-700);
+  --color-warning-badge-bg: rgba(251, 146, 60, 0.15);
+
+  /* --- Success (green) --- */
+  --color-success: var(--color-green-500);
+  --color-success-hover: var(--color-green-600);
+  --color-success-text: var(--color-white);
+  --color-success-bg: var(--color-green-50);
+  --color-success-border: var(--color-green-200);
+  --color-success-text-on-light: var(--color-green-700);
+  --color-success-badge-bg: var(--color-green-100);
+  --color-success-badge-bg-alt: var(--color-green-150);
+  --color-success-badge-text: var(--color-green-900);
+
+  /* --- Sidebar / inverse surface --- */
+  --color-sidebar-bg: var(--color-gray-800);
+  --color-sidebar-text: var(--color-gray-50);
+  --color-sidebar-hover: var(--color-gray-700);
+  --color-sidebar-active: var(--color-blue-500);
+  --color-sidebar-focus-ring: var(--color-blue-400);
+  --color-sidebar-separator: var(--color-gray-700);
+
+  /* --- Focus ring --- */
+  --color-focus-ring: rgba(59, 130, 246, 0.3);
+  --color-focus-ring-subtle: rgba(59, 130, 246, 0.1);
+  --color-focus-ring-danger: rgba(220, 38, 38, 0.1);
+  --color-focus-ring-primary-alt: rgba(37, 99, 235, 0.1);
+
+  /* --- Overlay / backdrop --- */
+  --color-overlay: rgba(0, 0, 0, 0.5);
+  --color-overlay-light: rgba(0, 0, 0, 0.1);
+  --color-overlay-medium: rgba(0, 0, 0, 0.15);
+  --color-overlay-danger: rgba(153, 27, 27, 0.1);
+  --color-overlay-delete: rgba(220, 38, 38, 0.1);
+
+  /* ============================================================
+   * LAYER 2 — COMPONENT-SPECIFIC STATUS TOKENS
+   * ============================================================ */
+
+  /* Status badge: Not Started */
+  --color-status-not-started-bg: var(--color-gray-200);
+  --color-status-not-started-text: var(--color-gray-700);
+
+  /* Status badge: In Progress */
+  --color-status-in-progress-bg: var(--color-blue-100);
+  --color-status-in-progress-text: var(--color-blue-800);
+
+  /* Status badge: Completed */
+  --color-status-completed-bg: var(--color-green-100);
+  --color-status-completed-text: var(--color-green-900);
+
+  /* Status badge: Blocked */
+  --color-status-blocked-bg: var(--color-red-100);
+  --color-status-blocked-text: var(--color-red-700);
+
+  /* Role badge: Admin */
+  --color-role-admin-bg: var(--color-blue-100);
+  --color-role-admin-text: var(--color-blue-800);
+
+  /* Role badge: Member */
+  --color-role-member-bg: var(--color-gray-100);
+  --color-role-member-text: var(--color-gray-700);
+
+  /* User status badge: Active */
+  --color-user-active-bg: var(--color-green-150);
+  --color-user-active-text: var(--color-green-700);
+
+  /* User status badge: Inactive */
+  --color-user-inactive-bg: var(--color-red-100);
+  --color-user-inactive-text: var(--color-red-700);
+
+  /* HI Status: Planned (gray) */
+  --color-hi-status-planned-bg: var(--color-gray-200);
+  --color-hi-status-planned-text: var(--color-gray-700);
+
+  /* HI Status: Purchased (blue) */
+  --color-hi-status-purchased-bg: var(--color-blue-100);
+  --color-hi-status-purchased-text: var(--color-blue-800);
+
+  /* HI Status: Scheduled (amber) */
+  --color-hi-status-scheduled-bg: var(--color-amber-100);
+  --color-hi-status-scheduled-text: var(--color-amber-800);
+
+  /* HI Status: Arrived (green) */
+  --color-hi-status-arrived-bg: var(--color-green-100);
+  --color-hi-status-arrived-text: var(--color-green-900);
+
+  /* Document Attachment Type: Quotation (purple) */
+  --color-attachment-quotation-bg: #e9d5ff;
+  --color-attachment-quotation-text: #6b21a8;
+
+  /* Document Attachment Type: Deposit (teal) */
+  --color-attachment-deposit-bg: #ccfbf1;
+  --color-attachment-deposit-text: #134e4a;
+
+  /* Document Attachment Type: Invoice (cyan) */
+  --color-attachment-invoice-bg: #cffafe;
+  --color-attachment-invoice-text: #0c4a6e;
+
+  /* ============================================================
+   * LAYER 2 — SHADOWS
+   * ============================================================ */
+
+  /* Card / surface shadows */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.1), 0 1px 2px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.1);
+  --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.1), 0 4px 6px rgba(0, 0, 0, 0.05);
+  --shadow-xl: 0 20px 25px rgba(0, 0, 0, 0.15);
+  --shadow-xl-strong: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+  --shadow-2xl: 0 20px 25px rgba(0, 0, 0, 0.2);
+  --shadow-inset-deep: 0 10px 25px rgba(0, 0, 0, 0.2);
+  --shadow-kbd: 0 1px 0 rgba(0, 0, 0, 0.05);
+
+  /* Focus rings (box-shadow form) */
+  --shadow-focus: 0 0 0 3px rgba(59, 130, 246, 0.3);
+  --shadow-focus-subtle: 0 0 0 3px rgba(59, 130, 246, 0.1);
+  --shadow-focus-primary-alt: 0 0 0 3px rgba(37, 99, 235, 0.1);
+  --shadow-focus-danger: 0 0 0 3px rgba(220, 38, 38, 0.1);
+
+  /* Text overlay shadow */
+  --shadow-text-overlay: 0 1px 3px rgba(0, 0, 0, 0.6);
+
+  /* ============================================================
+   * LAYER 2 — SPACING
+   * ============================================================ */
+
+  --spacing-0: 0;
+  --spacing-px: 1px;
+  --spacing-0-5: 0.125rem; /* 2px */
+  --spacing-1: 0.25rem; /* 4px */
+  --spacing-1-5: 0.375rem; /* 6px */
+  --spacing-2: 0.5rem; /* 8px */
+  --spacing-2-5: 0.625rem; /* 10px */
+  --spacing-3: 0.75rem; /* 12px */
+  --spacing-4: 1rem; /* 16px */
+  --spacing-5: 1.25rem; /* 20px */
+  --spacing-6: 1.5rem; /* 24px */
+  --spacing-7: 1.75rem; /* 28px */
+  --spacing-8: 2rem; /* 32px */
+  --spacing-10: 2.5rem; /* 40px */
+  --spacing-12: 3rem; /* 48px */
+  --spacing-16: 4rem; /* 64px */
+
+  /* ============================================================
+   * LAYER 2 — BORDER RADIUS
+   * ============================================================ */
+
+  --radius-sm: 0.25rem; /* 4px — small elements, badges, kbd */
+  --radius-md: 0.375rem; /* 6px — inputs, buttons, dropdowns */
+  --radius-lg: 0.5rem; /* 8px — cards, modals, sections */
+  --radius-circle: 50%; /* circles */
+  --radius-full: 9999px; /* pills (tags, status badges) */
+
+  /* ============================================================
+   * LAYER 2 — TRANSITIONS
+   * ============================================================ */
+
+  --transition-fast: 0.1s ease; /* opacity fade (sidebar close button) */
+  --transition-normal: 0.15s ease; /* most interactive elements */
+  --transition-medium: 0.2s ease; /* hover effects on larger elements */
+  --transition-slow: 0.3s ease; /* sidebar slide, modals */
+
+  /* Specific multi-property transitions used in form inputs */
+  --transition-input: border-color var(--transition-normal), box-shadow var(--transition-normal);
+  --transition-button:
+    background-color var(--transition-normal), box-shadow var(--transition-normal);
+  --transition-button-border:
+    background-color var(--transition-normal), border-color var(--transition-normal);
+
+  /* ============================================================
+   * LAYER 2 — TYPOGRAPHY
+   * ============================================================ */
+
+  --font-size-2xs: 0.8125rem; /* 13px — between xs and sm */
+  --font-size-xs: 0.75rem; /* 12px */
+  --font-size-sm: 0.875rem; /* 14px */
+  --font-size-base: 1rem; /* 16px */
+  --font-size-lg: 1.125rem; /* 18px */
+  --font-size-xl: 1.25rem; /* 20px */
+  --font-size-2xl: 1.5rem; /* 24px */
+  --font-size-3xl: 1.875rem; /* 30px */
+  --font-size-4xl: 2rem; /* 32px */
+
+  --font-weight-normal: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+
+  /* ============================================================
+   * LAYER 2 — Z-INDEX SCALE
+   * ============================================================ */
+
+  --z-raised: 1; /* local stacking-context raise, e.g. lifting a focused row above unfocused siblings */
+  --z-dropdown: 10;
+  --z-overlay: 50;
+  --z-sidebar: 100;
+  --z-modal: 1000;
+
+  /* ============================================================
+   * LAYER 2 — BUDGET BAR TOKENS
+   * ============================================================ */
+  --color-budget-claimed: var(--color-success);
+  --color-budget-paid: var(--color-primary);
+  --color-budget-pending: var(--color-primary-bg);
+  --color-budget-projected: var(--color-primary-bg-hover);
+  --color-budget-allocated: rgba(59, 130, 246, 0.15);
+  --color-budget-projected-uncertainty: color-mix(
+    in srgb,
+    var(--color-budget-projected) 50%,
+    transparent
+  );
+  --color-budget-track: var(--color-bg-tertiary);
+  --color-budget-overflow: var(--color-danger-bg-strong);
+
+  /* ============================================================
+   * LAYER 2 — SOURCE BUDGET LINE PANEL SURFACE TOKENS
+   * ============================================================ */
+
+  /* Area group container tint */
+  --color-surface-area-tint: var(--color-gray-50);
+
+  /* Parent item card tint */
+  --color-surface-item-tint: var(--color-white);
+
+  /* ============================================================
+   * LAYER 2 — BUDGET SOURCE BADGE TOKENS
+   * 10-slot palette: slot 0 is Unassigned (gray/neutral),
+   * slots 1–9 are distinct colors for named sources.
+   * ============================================================ */
+
+  /* Slot 0: Unassigned (gray) */
+  --color-source-0-bg: var(--color-gray-200);
+  --color-source-0-text: var(--color-gray-700);
+  --color-source-0-dot: var(--color-gray-500);
+
+  /* Slot 1: Blue */
+  --color-source-1-bg: var(--color-blue-100);
+  --color-source-1-text: var(--color-blue-800);
+  --color-source-1-dot: var(--color-blue-500);
+
+  /* Slot 2: Green */
+  --color-source-2-bg: var(--color-green-100);
+  --color-source-2-text: var(--color-green-900);
+  --color-source-2-dot: var(--color-green-500);
+
+  /* Slot 3: Red */
+  --color-source-3-bg: var(--color-red-100);
+  --color-source-3-text: var(--color-red-700);
+  --color-source-3-dot: var(--color-red-500);
+
+  /* Slot 4: Amber */
+  --color-source-4-bg: var(--color-amber-100);
+  --color-source-4-text: var(--color-amber-800);
+  --color-source-4-dot: var(--color-amber-300);
+
+  /* Slot 5: Purple */
+  --color-source-5-bg: #e9d5ff;
+  --color-source-5-text: #6b21a8;
+  --color-source-5-dot: #a855f7;
+
+  /* Slot 6: Cyan */
+  --color-source-6-bg: #cffafe;
+  --color-source-6-text: #0c4a6e;
+  --color-source-6-dot: #06b6d4;
+
+  /* Slot 7: Pink */
+  --color-source-7-bg: var(--color-blue-100);
+  --color-source-7-text: var(--color-blue-800);
+  --color-source-7-dot: #ec4899;
+
+  /* Slot 8: Teal */
+  --color-source-8-bg: #ccfbf1;
+  --color-source-8-text: #134e4a;
+  --color-source-8-dot: #14b8a6;
+
+  /* Slot 9: Orange */
+  --color-source-9-bg: #fed7aa;
+  --color-source-9-text: #9a3412;
+  --color-source-9-dot: #f97316;
+
+  /* ============================================================
+   * LAYER 2 — GANTT CHART TOKENS
+   * ============================================================ */
+
+  /* Bar fill colors by work item status */
+  --color-gantt-bar-not-started: var(--color-gray-400);
+  --color-gantt-bar-in-progress: var(--color-blue-500);
+  --color-gantt-bar-completed: var(--color-green-500);
+  --color-gantt-bar-blocked: var(--color-red-500);
+
+  /* Today marker line */
+  --color-gantt-today-marker: var(--color-danger);
+
+  /* Grid line colors */
+  --color-gantt-grid-minor: var(--color-border);
+  --color-gantt-grid-major: var(--color-border-strong);
+
+  /* Row stripe backgrounds */
+  --color-gantt-row-even: var(--color-bg-primary);
+  --color-gantt-row-odd: var(--color-bg-secondary);
+
+  /* Dependency arrows */
+  --color-gantt-arrow-default: var(--color-gray-500);
+  --color-gantt-arrow-critical: var(--color-orange-400);
+  /* Milestone linkage arrows (dashed, uses milestone accent color) */
+  --color-gantt-arrow-milestone: var(--color-blue-500);
+
+  /* Critical path bar border overlay */
+  --color-gantt-bar-critical-border: var(--color-orange-400);
+
+  /* ============================================================
+   * LAYER 2 — GANTT TOOLTIP TOKENS
+   * ============================================================ */
+
+  --color-tooltip-subdued: rgba(255, 255, 255, 0.55);
+  --color-tooltip-bullet: rgba(255, 255, 255, 0.4);
+  --color-tooltip-separator: rgba(255, 255, 255, 0.15);
+  --color-tooltip-status-not-started-bg: rgba(156, 163, 175, 0.25);
+  --color-tooltip-status-in-progress-bg: rgba(59, 130, 246, 0.3);
+  --color-tooltip-status-completed-bg: rgba(16, 185, 129, 0.3);
+  --color-tooltip-status-late-bg: rgba(239, 68, 68, 0.3);
+
+  /* ============================================================
+   * LAYER 2 — PHOTO VIEWER/OVERLAY TOKENS (theme-invariant)
+   * ============================================================ */
+
+  --color-photo-overlay-caption: rgba(0, 0, 0, 0.8);
+  --color-photo-control-bg: rgba(0, 0, 0, 0.5);
+  --color-photo-control-bg-hover: rgba(0, 0, 0, 0.8);
+  --color-photo-bar-bg: rgba(0, 0, 0, 0.7);
+  --color-photo-border: rgba(255, 255, 255, 0.1);
+  --color-photo-focus-ring: rgba(255, 255, 255, 0.6);
+  --color-photo-active-bg: rgba(255, 255, 255, 0.25);
+  --color-photo-action-primary-bg: rgba(59, 130, 246, 0.9);
+  --color-photo-action-danger-bg: rgba(220, 38, 38, 0.9);
+
+  /* ============================================================
+   * LAYER 1-B — HOUSEHOLD ITEM GANTT TOKENS
+   * ============================================================ */
+
+  /* Circle marker — pending delivery (amber) */
+  --color-gantt-hi-fill: var(--color-amber-100);
+  --color-gantt-hi-stroke: var(--color-amber-800);
+
+  /* Circle marker — arrived (green) */
+  --color-gantt-hi-arrived-fill: var(--color-green-100);
+  --color-gantt-hi-arrived-stroke: var(--color-green-600);
+
+  /* Hover glow effect */
+  --color-gantt-hi-hover-glow: rgba(245, 158, 11, 0.25);
+
+  /* ============================================================
+   * LAYER 2 — MILESTONE TOKENS
+   * ============================================================ */
+
+  /* Diamond marker — incomplete (outlined) */
+  --color-milestone-incomplete-fill: transparent;
+  --color-milestone-incomplete-stroke: var(--color-blue-500);
+
+  /* Diamond marker — completed (filled) */
+  --color-milestone-complete-fill: var(--color-green-500);
+  --color-milestone-complete-stroke: var(--color-green-600);
+
+  /* Diamond marker — late (projected date exceeds target date) */
+  --color-milestone-late-fill: var(--color-danger);
+  --color-milestone-late-stroke: var(--color-danger-hover);
+
+  /* Diamond hover glow */
+  --color-milestone-hover-glow: rgba(59, 130, 246, 0.25);
+  --color-milestone-complete-hover-glow: rgba(16, 185, 129, 0.25);
+  --color-milestone-late-hover-glow: rgba(220, 38, 38, 0.25);
+
+  /* ============================================================
+   * LAYER 2 — TOAST NOTIFICATION TOKENS
+   * ============================================================ */
+
+  /* Toast: Success */
+  --color-toast-success-bg: var(--color-green-50);
+  --color-toast-success-border: var(--color-green-200);
+
+  /* Toast: Info */
+  --color-toast-info-bg: var(--color-blue-100);
+  --color-toast-info-border: var(--color-blue-200);
+
+  /* Toast: Error */
+  --color-toast-error-bg: var(--color-red-50);
+  --color-toast-error-border: var(--color-red-200);
+
+  /* ============================================================
+   * LAYER 2 — DIARY ENTRY TYPE TOKENS
+   * ============================================================ */
+
+  /* Entry type: daily_log (blue) */
+  --color-diary-daily-log-bg: var(--color-blue-100);
+  --color-diary-daily-log-text: var(--color-blue-800);
+
+  /* Entry type: site_visit (teal) */
+  --color-diary-site-visit-bg: #ccfbf1;
+  --color-diary-site-visit-text: #134e4a;
+
+  /* Entry type: delivery (amber) */
+  --color-diary-delivery-bg: var(--color-amber-100);
+  --color-diary-delivery-text: var(--color-amber-800);
+
+  /* Entry type: issue (red) */
+  --color-diary-issue-bg: var(--color-red-100);
+  --color-diary-issue-text: var(--color-red-700);
+
+  /* Entry type: general_note (gray) */
+  --color-diary-general-note-bg: var(--color-gray-100);
+  --color-diary-general-note-text: var(--color-gray-700);
+
+  /* Automatic entry type (all auto types use this) */
+  --color-diary-automatic-bg: var(--color-bg-tertiary);
+  --color-diary-automatic-text: var(--color-text-secondary);
+  --color-diary-automatic-border: var(--color-border-strong);
+
+  /* ============================================================
+   * LAYER 2 — DIARY OUTCOME BADGES
+   * ============================================================ */
+
+  /* Outcome: pass (green) */
+  --color-diary-outcome-pass-bg: var(--color-green-100);
+  --color-diary-outcome-pass-text: var(--color-green-900);
+
+  /* Outcome: fail (red) */
+  --color-diary-outcome-fail-bg: var(--color-red-100);
+  --color-diary-outcome-fail-text: var(--color-red-700);
+
+  /* Outcome: conditional (amber) */
+  --color-diary-outcome-conditional-bg: var(--color-amber-100);
+  --color-diary-outcome-conditional-text: var(--color-amber-800);
+
+  /* ============================================================
+   * LAYER 2 — DIARY SEVERITY BADGES
+   * ============================================================ */
+
+  /* Severity: low (green) */
+  --color-diary-severity-low-bg: var(--color-green-100);
+  --color-diary-severity-low-text: var(--color-green-900);
+
+  /* Severity: medium (amber) */
+  --color-diary-severity-medium-bg: var(--color-amber-100);
+  --color-diary-severity-medium-text: var(--color-amber-800);
+
+  /* Severity: high (orange) */
+  --color-diary-severity-high-bg: #fed7aa;
+  --color-diary-severity-high-text: #92400e;
+
+  /* Severity: critical (red) */
+  --color-diary-severity-critical-bg: var(--color-red-100);
+  --color-diary-severity-critical-text: var(--color-red-700);
+
+  /* ============================================================
+   * LAYER 2 — CALENDAR ITEM PALETTE TOKENS
+   * 8 visually distinct, brand-compatible colors for item differentiation.
+   * Used as background fill for CalendarItem bars; text must remain readable.
+   * ============================================================ */
+
+  /* 1. Blue */
+  --calendar-item-1-bg: #dbeafe;
+  --calendar-item-1-text: #1e40af;
+
+  /* 2. Green */
+  --calendar-item-2-bg: #d1fae5;
+  --calendar-item-2-text: #065f46;
+
+  /* 3. Orange */
+  --calendar-item-3-bg: #ffedd5;
+  --calendar-item-3-text: #9a3412;
+
+  /* 4. Purple */
+  --calendar-item-4-bg: #ede9fe;
+  --calendar-item-4-text: #4c1d95;
+
+  /* 5. Teal */
+  --calendar-item-5-bg: #ccfbf1;
+  --calendar-item-5-text: #134e4a;
+
+  /* 6. Rose */
+  --calendar-item-6-bg: #ffe4e6;
+  --calendar-item-6-text: #881337;
+
+  /* 7. Amber */
+  --calendar-item-7-bg: #fef3c7;
+  --calendar-item-7-text: #78350f;
+
+  /* 8. Indigo */
+  --calendar-item-8-bg: #e0e7ff;
+  --calendar-item-8-text: #312e81;
+}
+
+/* ============================================================
+ * LAYER 3 — DARK MODE OVERRIDES
+ * Scoped to [data-theme="dark"] on <html> — set by ThemeContext.
+ * Only semantic tokens need overriding; palette tokens remain unchanged.
+ * ============================================================ */
+
+[data-theme='dark'] {
+  /* --- Backgrounds --- */
+  --color-bg-primary: var(--color-slate-800);
+  --color-bg-secondary: var(--color-slate-700);
+  --color-bg-tertiary: var(--color-slate-600);
+  --color-bg-inverse: var(--color-gray-100);
+  --color-bg-hover: var(--color-slate-600);
+
+  /* --- Source Budget Line Panel surface tints (dark mode) --- */
+  --color-surface-area-tint: var(--color-slate-700);
+  --color-surface-item-tint: var(--color-slate-800);
+
+  /* --- Text --- */
+  --color-text-primary: var(--color-slate-50);
+  --color-text-secondary: var(--color-slate-150);
+  --color-text-body: var(--color-slate-200);
+  --color-text-muted: var(--color-slate-300);
+  --color-text-subtle: var(--color-slate-200);
+  --color-text-inverse: var(--color-gray-900);
+  --color-text-placeholder: var(--color-slate-400);
+  --color-text-disabled: var(--color-slate-400);
+  --color-text-quoted: var(--color-slate-200);
+
+  /* --- Borders --- */
+  --color-border: var(--color-slate-500);
+  --color-border-strong: var(--color-slate-400);
+  --color-border-focus: var(--color-blue-400);
+
+  /* --- Primary action --- */
+  --color-primary: var(--color-blue-400);
+  --color-primary-hover: var(--color-blue-500);
+  --color-primary-active: var(--color-blue-600);
+  --color-primary-text: var(--color-gray-900);
+  --color-primary-bg: rgba(59, 130, 246, 0.15);
+  --color-primary-bg-hover: rgba(59, 130, 246, 0.25);
+  --color-primary-badge-text: var(--color-blue-300);
+
+  /* --- Warning --- */
+  --color-warning: var(--color-orange-300);
+  --color-warning-bg: rgba(251, 146, 60, 0.1);
+  --color-warning-text-on-light: var(--color-orange-300);
+  --color-warning-badge-bg: rgba(251, 146, 60, 0.2);
+
+  /* --- Danger / Error --- */
+  --color-danger: var(--color-red-400);
+  --color-danger-hover: var(--color-red-400);
+  --color-danger-active: var(--color-red-500);
+  --color-danger-text: var(--color-gray-900);
+  --color-danger-bg: rgba(239, 68, 68, 0.1);
+  --color-danger-bg-strong: rgba(239, 68, 68, 0.2);
+  --color-danger-border: rgba(239, 68, 68, 0.3);
+  --color-danger-text-on-light: var(--color-red-300);
+  --color-danger-input-border: var(--color-red-400);
+
+  /* --- Success --- */
+  --color-success: var(--color-emerald-400);
+  --color-success-hover: var(--color-green-500);
+  --color-success-text: var(--color-white);
+  --color-success-bg: rgba(16, 185, 129, 0.1);
+  --color-success-border: rgba(16, 185, 129, 0.3);
+  --color-success-text-on-light: var(--color-emerald-300);
+  --color-success-badge-bg: rgba(16, 185, 129, 0.15);
+  --color-success-badge-bg-alt: rgba(16, 185, 129, 0.2);
+  --color-success-badge-text: var(--color-emerald-200);
+
+  /* --- Sidebar --- */
+  --color-sidebar-bg: var(--color-slate-900);
+  --color-sidebar-text: var(--color-slate-100);
+  --color-sidebar-hover: var(--color-slate-600);
+  --color-sidebar-active: var(--color-blue-500);
+  --color-sidebar-focus-ring: var(--color-blue-400);
+  --color-sidebar-separator: var(--color-slate-500);
+
+  /* --- Focus rings --- */
+  --color-focus-ring: rgba(96, 165, 250, 0.4);
+  --color-focus-ring-subtle: rgba(96, 165, 250, 0.15);
+  --color-focus-ring-danger: rgba(239, 68, 68, 0.15);
+  --color-focus-ring-primary-alt: rgba(96, 165, 250, 0.15);
+
+  /* --- Overlay / backdrop --- */
+  --color-overlay: rgba(0, 0, 0, 0.7);
+  --color-overlay-light: rgba(0, 0, 0, 0.3);
+  --color-overlay-medium: rgba(0, 0, 0, 0.4);
+  --color-overlay-danger: rgba(239, 68, 68, 0.15);
+  --color-overlay-delete: rgba(239, 68, 68, 0.15);
+
+  /* --- Status badges --- */
+  --color-status-not-started-bg: var(--color-slate-500);
+  --color-status-not-started-text: var(--color-slate-200);
+  --color-status-in-progress-bg: rgba(59, 130, 246, 0.2);
+  --color-status-in-progress-text: var(--color-blue-300);
+  --color-status-completed-bg: rgba(16, 185, 129, 0.15);
+  --color-status-completed-text: var(--color-emerald-200);
+  --color-status-blocked-bg: rgba(239, 68, 68, 0.15);
+  --color-status-blocked-text: var(--color-red-300);
+
+  /* --- Role badges --- */
+  --color-role-admin-bg: rgba(59, 130, 246, 0.2);
+  --color-role-admin-text: var(--color-blue-300);
+  --color-role-member-bg: var(--color-slate-500);
+  --color-role-member-text: var(--color-slate-200);
+
+  /* --- User status badges --- */
+  --color-user-active-bg: rgba(16, 185, 129, 0.15);
+  --color-user-active-text: var(--color-emerald-300);
+  --color-user-inactive-bg: rgba(239, 68, 68, 0.15);
+  --color-user-inactive-text: var(--color-red-300);
+
+  /* --- Household item status badges --- */
+  --color-hi-status-planned-bg: var(--color-slate-500);
+  --color-hi-status-planned-text: var(--color-slate-100);
+  --color-hi-status-purchased-bg: rgba(59, 130, 246, 0.2);
+  --color-hi-status-purchased-text: var(--color-blue-300);
+  --color-hi-status-scheduled-bg: rgba(245, 158, 11, 0.2);
+  --color-hi-status-scheduled-text: var(--color-amber-300);
+  --color-hi-status-arrived-bg: rgba(16, 185, 129, 0.15);
+  --color-hi-status-arrived-text: var(--color-emerald-200);
+
+  /* --- Budget source badge tokens (dark mode) --- */
+  --color-source-0-bg: var(--color-slate-500);
+  --color-source-0-text: var(--color-slate-100);
+  --color-source-0-dot: var(--color-slate-300);
+
+  --color-source-1-bg: rgba(59, 130, 246, 0.2);
+  --color-source-1-text: var(--color-blue-300);
+  --color-source-1-dot: var(--color-blue-300);
+
+  --color-source-2-bg: rgba(16, 185, 129, 0.15);
+  --color-source-2-text: var(--color-emerald-200);
+  --color-source-2-dot: var(--color-emerald-400);
+
+  --color-source-3-bg: rgba(239, 68, 68, 0.15);
+  --color-source-3-text: var(--color-red-300);
+  --color-source-3-dot: var(--color-red-400);
+
+  --color-source-4-bg: rgba(245, 158, 11, 0.2);
+  --color-source-4-text: var(--color-amber-300);
+  --color-source-4-dot: var(--color-amber-300);
+
+  --color-source-5-bg: rgba(168, 85, 247, 0.2);
+  --color-source-5-text: #e9d5ff;
+  --color-source-5-dot: #a855f7;
+
+  --color-source-6-bg: rgba(34, 211, 238, 0.15);
+  --color-source-6-text: #cffafe;
+  --color-source-6-dot: #06b6d4;
+
+  --color-source-7-bg: rgba(59, 130, 246, 0.2);
+  --color-source-7-text: var(--color-blue-300);
+  --color-source-7-dot: #ec4899;
+
+  --color-source-8-bg: rgba(20, 184, 166, 0.15);
+  --color-source-8-text: #ccfbf1;
+  --color-source-8-dot: #14b8a6;
+
+  --color-source-9-bg: rgba(249, 115, 22, 0.2);
+  --color-source-9-text: #fed7aa;
+  --color-source-9-dot: #f97316;
+
+  /* --- Document Attachment Type (dark mode) --- */
+  --color-attachment-quotation-bg: rgba(168, 85, 247, 0.2);
+  --color-attachment-quotation-text: #e9d5ff;
+
+  --color-attachment-deposit-bg: rgba(20, 184, 166, 0.15);
+  --color-attachment-deposit-text: #ccfbf1;
+
+  --color-attachment-invoice-bg: rgba(34, 211, 238, 0.15);
+  --color-attachment-invoice-text: #cffafe;
+
+  /* --- Shadows (deeper/darker in dark mode) --- */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3), 0 1px 2px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.3), 0 4px 6px rgba(0, 0, 0, 0.2);
+  --shadow-xl: 0 20px 25px rgba(0, 0, 0, 0.4);
+  --shadow-xl-strong: 0 20px 25px -5px rgba(0, 0, 0, 0.3), 0 10px 10px -5px rgba(0, 0, 0, 0.2);
+  --shadow-2xl: 0 20px 25px rgba(0, 0, 0, 0.5);
+  --shadow-inset-deep: 0 10px 25px rgba(0, 0, 0, 0.4);
+  --shadow-kbd: 0 1px 0 rgba(255, 255, 255, 0.1);
+  --shadow-focus: 0 0 0 3px rgba(96, 165, 250, 0.4);
+  --shadow-focus-subtle: 0 0 0 3px rgba(96, 165, 250, 0.15);
+  --shadow-focus-primary-alt: 0 0 0 3px rgba(96, 165, 250, 0.15);
+  --shadow-focus-danger: 0 0 0 3px rgba(239, 68, 68, 0.15);
+
+  /* --- Budget bar --- */
+  --color-budget-claimed: var(--color-emerald-400);
+  --color-budget-paid: var(--color-blue-400);
+  --color-budget-pending: rgba(59, 130, 246, 0.15);
+  --color-budget-projected: rgba(59, 130, 246, 0.25);
+  --color-budget-allocated: rgba(96, 165, 250, 0.35);
+  --color-budget-projected-uncertainty: color-mix(
+    in srgb,
+    var(--color-budget-projected) 55%,
+    transparent
+  );
+  --color-budget-track: var(--color-slate-600);
+  --color-budget-overflow: rgba(239, 68, 68, 0.2);
+
+  /* --- Gantt chart --- */
+  --color-gantt-bar-not-started: var(--color-slate-400);
+  --color-gantt-bar-in-progress: var(--color-blue-400);
+  --color-gantt-bar-completed: var(--color-emerald-400);
+  --color-gantt-bar-blocked: var(--color-red-400);
+  /* today marker, grid lines, and row colors inherit from semantic tokens
+     that already have dark mode overrides (--color-danger, --color-border,
+     --color-border-strong, --color-bg-primary, --color-bg-secondary) */
+  --color-gantt-today-marker: var(--color-danger);
+  --color-gantt-grid-minor: var(--color-border);
+  --color-gantt-grid-major: var(--color-border-strong);
+  --color-gantt-row-even: var(--color-bg-primary);
+  --color-gantt-row-odd: var(--color-bg-secondary);
+
+  /* Dependency arrows (brighter in dark mode for contrast) */
+  --color-gantt-arrow-default: var(--color-slate-400);
+  --color-gantt-arrow-critical: var(--color-orange-300);
+  --color-gantt-arrow-milestone: var(--color-blue-400);
+
+  /* Critical path bar accent stripe (warmer orange in dark mode) */
+  --color-gantt-bar-critical-border: var(--color-orange-300);
+
+  /* --- Gantt tooltip tokens (dark mode) --- */
+  --color-tooltip-subdued: rgba(0, 0, 0, 0.5);
+  --color-tooltip-bullet: rgba(0, 0, 0, 0.3);
+  --color-tooltip-separator: rgba(0, 0, 0, 0.15);
+  --color-tooltip-status-not-started-bg: rgba(107, 114, 128, 0.2);
+  --color-tooltip-status-in-progress-bg: rgba(59, 130, 246, 0.15);
+  --color-tooltip-status-completed-bg: rgba(16, 185, 129, 0.15);
+  --color-tooltip-status-late-bg: rgba(239, 68, 68, 0.15);
+
+  /* Household item circle markers */
+  --color-gantt-hi-fill: rgba(245, 158, 11, 0.2);
+  --color-gantt-hi-stroke: var(--color-amber-300);
+  --color-gantt-hi-arrived-fill: rgba(16, 185, 129, 0.15);
+  --color-gantt-hi-arrived-stroke: var(--color-emerald-400);
+  --color-gantt-hi-hover-glow: rgba(245, 158, 11, 0.3);
+
+  /* --- Milestones --- */
+  --color-milestone-incomplete-fill: transparent;
+  --color-milestone-incomplete-stroke: var(--color-blue-400);
+
+  --color-milestone-complete-fill: var(--color-emerald-400);
+  --color-milestone-complete-stroke: var(--color-green-500);
+
+  --color-milestone-late-fill: var(--color-danger);
+  --color-milestone-late-stroke: var(--color-danger-hover);
+
+  --color-milestone-hover-glow: rgba(96, 165, 250, 0.3);
+  --color-milestone-complete-hover-glow: rgba(52, 211, 153, 0.3);
+  --color-milestone-late-hover-glow: rgba(239, 68, 68, 0.3);
+
+  /* Toast: Success */
+  --color-toast-success-bg: rgba(16, 185, 129, 0.1);
+  --color-toast-success-border: rgba(16, 185, 129, 0.3);
+
+  /* Toast: Info */
+  --color-toast-info-bg: rgba(59, 130, 246, 0.15);
+  --color-toast-info-border: rgba(59, 130, 246, 0.3);
+
+  /* Toast: Error */
+  --color-toast-error-bg: rgba(239, 68, 68, 0.1);
+  --color-toast-error-border: rgba(239, 68, 68, 0.3);
+
+  /* --- Diary entry type tokens (dark mode) --- */
+  --color-diary-daily-log-bg: rgba(59, 130, 246, 0.2);
+  --color-diary-daily-log-text: var(--color-blue-300);
+
+  --color-diary-site-visit-bg: rgba(20, 184, 166, 0.15);
+  --color-diary-site-visit-text: #5eead4;
+
+  --color-diary-delivery-bg: rgba(245, 158, 11, 0.15);
+  --color-diary-delivery-text: var(--color-amber-300);
+
+  --color-diary-issue-bg: rgba(239, 68, 68, 0.15);
+  --color-diary-issue-text: var(--color-red-300);
+
+  --color-diary-general-note-bg: var(--color-slate-500);
+  --color-diary-general-note-text: var(--color-slate-100);
+
+  --color-diary-automatic-bg: var(--color-slate-600);
+  --color-diary-automatic-text: var(--color-slate-200);
+  --color-diary-automatic-border: var(--color-slate-500);
+
+  /* --- Diary outcome badges (dark mode) --- */
+  --color-diary-outcome-pass-bg: rgba(16, 185, 129, 0.15);
+  --color-diary-outcome-pass-text: var(--color-emerald-300);
+
+  --color-diary-outcome-fail-bg: rgba(239, 68, 68, 0.15);
+  --color-diary-outcome-fail-text: var(--color-red-300);
+
+  --color-diary-outcome-conditional-bg: rgba(245, 158, 11, 0.15);
+  --color-diary-outcome-conditional-text: var(--color-amber-300);
+
+  /* --- Diary severity badges (dark mode) --- */
+  --color-diary-severity-low-bg: rgba(16, 185, 129, 0.15);
+  --color-diary-severity-low-text: var(--color-emerald-300);
+
+  --color-diary-severity-medium-bg: rgba(245, 158, 11, 0.15);
+  --color-diary-severity-medium-text: var(--color-amber-300);
+
+  --color-diary-severity-high-bg: rgba(249, 115, 22, 0.2);
+  --color-diary-severity-high-text: #fdba74;
+
+  --color-diary-severity-critical-bg: rgba(239, 68, 68, 0.15);
+  --color-diary-severity-critical-text: var(--color-red-300);
+
+  /* --- Calendar item palette (dark mode — muted semi-transparent fills) --- */
+
+  /* 1. Blue */
+  --calendar-item-1-bg: rgba(59, 130, 246, 0.25);
+  --calendar-item-1-text: #93c5fd;
+
+  /* 2. Green */
+  --calendar-item-2-bg: rgba(16, 185, 129, 0.2);
+  --calendar-item-2-text: #6ee7b7;
+
+  /* 3. Orange */
+  --calendar-item-3-bg: rgba(249, 115, 22, 0.2);
+  --calendar-item-3-text: #fdba74;
+
+  /* 4. Purple */
+  --calendar-item-4-bg: rgba(139, 92, 246, 0.2);
+  --calendar-item-4-text: #c4b5fd;
+
+  /* 5. Teal */
+  --calendar-item-5-bg: rgba(20, 184, 166, 0.2);
+  --calendar-item-5-text: #5eead4;
+
+  /* 6. Rose */
+  --calendar-item-6-bg: rgba(244, 63, 94, 0.2);
+  --calendar-item-6-text: #fda4af;
+
+  /* 7. Amber */
+  --calendar-item-7-bg: rgba(245, 158, 11, 0.2);
+  --calendar-item-7-text: #fcd34d;
+
+  /* 8. Indigo */
+  --calendar-item-8-bg: rgba(99, 102, 241, 0.2);
+  --calendar-item-8-text: #a5b4fc;
+}

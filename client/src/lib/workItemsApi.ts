@@ -1,0 +1,119 @@
+import { get, post, patch, del } from './apiClient.js';
+import type {
+  WorkItemListResponse,
+  WorkItemListQuery,
+  WorkItemDetail,
+  CreateWorkItemRequest,
+  UpdateWorkItemRequest,
+  SubsidyProgram,
+  WorkItemSubsidyPaybackResponse,
+} from '@cornerstone/shared';
+
+/**
+ * Fetches a paginated list of work items with optional filters, search, and sorting.
+ */
+export function listWorkItems(params?: WorkItemListQuery): Promise<WorkItemListResponse> {
+  const queryParams = new URLSearchParams();
+
+  if (params?.page !== undefined) {
+    queryParams.set('page', params.page.toString());
+  }
+  if (params?.pageSize !== undefined) {
+    queryParams.set('pageSize', params.pageSize.toString());
+  }
+  if (params?.status) {
+    queryParams.set('status', params.status);
+  }
+  if (params?.assignedUserId) {
+    queryParams.set('assignedUserId', params.assignedUserId);
+  }
+  if (params?.areaId) {
+    queryParams.set('areaId', params.areaId);
+  }
+  if (params?.assignedVendorId) {
+    queryParams.set('assignedVendorId', params.assignedVendorId);
+  }
+  if (params?.q) {
+    queryParams.set('q', params.q);
+  }
+  if (params?.budgetLinesMin !== undefined) {
+    queryParams.set('budgetLinesMin', params.budgetLinesMin.toString());
+  }
+  if (params?.budgetLinesMax !== undefined) {
+    queryParams.set('budgetLinesMax', params.budgetLinesMax.toString());
+  }
+  if (params?.sortBy) {
+    queryParams.set('sortBy', params.sortBy);
+  }
+  if (params?.sortOrder) {
+    queryParams.set('sortOrder', params.sortOrder);
+  }
+
+  const queryString = queryParams.toString();
+  const path = queryString ? `/work-items?${queryString}` : '/work-items';
+
+  return get<WorkItemListResponse>(path);
+}
+
+/**
+ * Fetches a single work item by ID with full details.
+ */
+export function getWorkItem(id: string): Promise<WorkItemDetail> {
+  return get<WorkItemDetail>(`/work-items/${id}`);
+}
+
+/**
+ * Creates a new work item.
+ */
+export function createWorkItem(data: CreateWorkItemRequest): Promise<WorkItemDetail> {
+  return post<WorkItemDetail>('/work-items', data);
+}
+
+/**
+ * Updates an existing work item.
+ */
+export function updateWorkItem(id: string, data: UpdateWorkItemRequest): Promise<WorkItemDetail> {
+  return patch<WorkItemDetail>(`/work-items/${id}`, data);
+}
+
+/**
+ * Deletes a work item.
+ */
+export function deleteWorkItem(id: string): Promise<void> {
+  return del<void>(`/work-items/${id}`);
+}
+
+// ─── Subsidy linking ──────────────────────────────────────────────────────────
+
+/**
+ * Fetches all subsidy programs linked to a work item.
+ */
+export function fetchWorkItemSubsidies(workItemId: string): Promise<SubsidyProgram[]> {
+  return get<{ subsidies: SubsidyProgram[] }>(`/work-items/${workItemId}/subsidies`).then(
+    (r) => r.subsidies,
+  );
+}
+
+/**
+ * Links a subsidy program to a work item.
+ */
+export function linkWorkItemSubsidy(workItemId: string, subsidyProgramId: string): Promise<void> {
+  return post<void>(`/work-items/${workItemId}/subsidies`, { subsidyProgramId });
+}
+
+/**
+ * Unlinks a subsidy program from a work item.
+ */
+export function unlinkWorkItemSubsidy(workItemId: string, subsidyProgramId: string): Promise<void> {
+  return del<void>(`/work-items/${workItemId}/subsidies/${subsidyProgramId}`);
+}
+
+/**
+ * Fetches the expected subsidy payback for a work item.
+ * Returns total payback and a per-subsidy breakdown.
+ */
+export function fetchWorkItemSubsidyPayback(
+  workItemId: string,
+): Promise<WorkItemSubsidyPaybackResponse> {
+  return get<WorkItemSubsidyPaybackResponse>(`/work-items/${workItemId}/subsidy-payback`);
+}

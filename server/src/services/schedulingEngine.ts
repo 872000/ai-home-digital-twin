@@ -1,0 +1,1083 @@
+/**
+ * Scheduling Engine — Critical Path Method (CPM) implementation.
+ *
+ * This module is a pure function: it takes work item and dependency data as input
+ * and returns the proposed schedule. No database access occurs here.
+ *
+ * See wiki/ADR-014-Scheduling-Engine-Architecture.md for algorithm details.
+ *
+ * EPIC-06: Story 6.2 — Scheduling Engine (CPM, Auto-Schedule, Conflict Detection)
+ * EPIC-06 UAT Fix 1: Added autoReschedule() for automatic rescheduling on constraint changes.
+ */
+
+import { eq } from 'drizzle-orm';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import type * as schemaTypes from '../db/schema.js';
+import {
+  workItems,
+  workItemDependencies,
+  workItemMilestoneDeps,
+  milestoneWorkItems,
+  householdItems,
+  householdItemDeps,
+  milestones,
+} from '../db/schema.js';
+import type { ScheduleResponse, ScheduleWarning } from '@cornerstone/shared';
+import { onMilestoneDelayed as _onMilestoneDelayed } from './diaryAutoEventService.js';
+
+// ─── Input types for the pure scheduling engine ───────────────────────────────
+
+/**
+ * Minimal work item data required by the scheduling engine.
+ */
+export interface SchedulingWorkItem {
+  id: string;
+  status: string;
+  startDate: string | null;
+  endDate: string | null;
+  /** Actual start date recorded when work began. When set, overrides CPM-computed ES. */
+  actualStartDate: string | null;
+  /** Actual end date recorded when work completed. When set, overrides CPM-computed EF. */
+  actualEndDate: string | null;
+  durationDays: number | null;
+  startAfter: string | null;
+  startBefore: string | null;
+}
+
+/**
+ * A dependency edge in the scheduling graph.
+ */
+export interface SchedulingDependency {
+  predecessorId: string;
+  successorId: string;
+  dependencyType: 'finish_to_start' | 'start_to_start' | 'finish_to_finish' | 'start_to_finish';
+  leadLagDays: number;
+}
+
+/**
+ * Parameters for the scheduling engine's schedule() function.
+ */
+export interface ScheduleParams {
+  mode: 'full' | 'cascade';
+  anchorWorkItemId?: string;
+  workItems: SchedulingWorkItem[];
+  dependencies: SchedulingDependency[];
+  /** Today's date in YYYY-MM-DD format (injectable for testability). */
+  today: string;
+}
+
+/**
+ * Result of the scheduling engine — extends ScheduleResponse with an optional cycleNodes
+ * field that signals a circular dependency was detected.
+ */
+export interface ScheduleResult extends ScheduleResponse {
+  /** Present and non-empty when a circular dependency is detected. */
+  cycleNodes?: string[];
+}
+
+// ─── Internal CPM data structures ─────────────────────────────────────────────
+
+interface NodeData {
+  item: SchedulingWorkItem;
+  duration: number; // 0 if no durationDays
+  es: string; // Earliest start (ISO date)
+  ef: string; // Earliest finish (ISO date)
+  ls: string; // Latest start (ISO date)
+  lf: string; // Latest finish (ISO date)
+  /** true when Rule 2 or Rule 3 clamped dates to today; false otherwise. */
+  isLate: boolean;
+}
+
+// ─── Date arithmetic helpers ───────────────────────────────────────────────────
+
+/**
+ * Parse an ISO 8601 date string (YYYY-MM-DD) and return a UTC Date object.
+ * Using UTC midnight to avoid DST issues in date arithmetic.
+ */
+function parseDate(dateStr: string): Date {
+  return new Date(dateStr + 'T00:00:00Z');
+}
+
+/**
+ * Format a UTC Date object as an ISO 8601 date string (YYYY-MM-DD).
+ */
+function formatDate(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+/**
+ * Add a number of days to an ISO date string and return the result as ISO date string.
+ * Positive adds days, negative subtracts.
+ */
+function addDays(dateStr: string, days: number): string {
+  const d = parseDate(dateStr);
+  d.setUTCDate(d.getUTCDate() + days);
+  return formatDate(d);
+}
+
+/**
+ * Return the later of two ISO date strings.
+ */
+function maxDate(a: string, b: string): string {
+  return a >= b ? a : b;
+}
+
+/**
+ * Return the earlier of two ISO date strings.
+ */
+function minDate(a: string, b: string): string {
+  return a <= b ? a : b;
+}
+
+/**
+ * Calculate the difference in calendar days between two ISO date strings (b - a).
+ */
+function diffDays(a: string, b: string): number {
+  const msPerDay = 24 * 60 * 60 * 1000;
+  return Math.round((parseDate(b).getTime() - parseDate(a).getTime()) / msPerDay);
+}
+
+// ─── Topological sort (Kahn's algorithm) ──────────────────────────────────────
+
+/**
+ * Perform Kahn's algorithm topological sort on a set of node IDs with edges.
+ *
+ * @param nodeIds - Set of all node IDs to include in the sort
+ * @param edges - Directed edges as [predecessorId, successorId] pairs
+ * @returns Object with sorted array and cycle array. If cycle is non-empty, a cycle was detected.
+ */
+function topologicalSort(
+  nodeIds: Set<string>,
+  edges: Array<[string, string]>,
+): { sorted: string[]; cycle: string[] } {
+  // Build adjacency list and in-degree map restricted to nodeIds
+  const successors = new Map<string, string[]>();
+  const inDegree = new Map<string, number>();
+
+  for (const id of nodeIds) {
+    successors.set(id, []);
+    inDegree.set(id, 0);
+  }
+
+  for (const [pred, succ] of edges) {
+    // Only include edges where both endpoints are in the scheduled set
+    if (!nodeIds.has(pred) || !nodeIds.has(succ)) continue;
+    successors.get(pred)!.push(succ);
+    inDegree.set(succ, (inDegree.get(succ) ?? 0) + 1);
+  }
+
+  // Queue: all nodes with in-degree 0 (no predecessors in this set)
+  const queue: string[] = [];
+  for (const [id, deg] of inDegree) {
+    if (deg === 0) queue.push(id);
+  }
+
+  const sorted: string[] = [];
+
+  while (queue.length > 0) {
+    // Sort queue for deterministic output (stable ordering by ID)
+    queue.sort();
+    const node = queue.shift()!;
+    sorted.push(node);
+
+    for (const succ of successors.get(node) ?? []) {
+      const newDeg = (inDegree.get(succ) ?? 0) - 1;
+      inDegree.set(succ, newDeg);
+      if (newDeg === 0) {
+        queue.push(succ);
+      }
+    }
+  }
+
+  if (sorted.length !== nodeIds.size) {
+    // Cycle detected — collect nodes still with positive in-degree
+    const cycle: string[] = [];
+    for (const [id, deg] of inDegree) {
+      if (deg > 0) cycle.push(id);
+    }
+    return { sorted, cycle };
+  }
+
+  return { sorted, cycle: [] };
+}
+
+// ─── Forward pass: compute ES and EF ─────────────────────────────────────────
+
+/**
+ * Compute the ES (earliest start) that a given dependency imposes on the successor.
+ * Takes the successor's duration because FF and SF constraints are EF-based.
+ *
+ * ADR-014 dependency type rules:
+ * - FS: Successor ES >= Predecessor EF + lead/lag
+ * - SS: Successor ES >= Predecessor ES + lead/lag
+ * - FF: Successor EF >= Predecessor EF + lead/lag  => Successor ES >= (PredEF + LL) - succDuration
+ * - SF: Successor EF >= Predecessor ES + lead/lag  => Successor ES >= (PredES + LL) - succDuration
+ */
+function forwardDepEs(
+  dep: SchedulingDependency,
+  predNode: NodeData,
+  successorDuration: number,
+): string {
+  const { dependencyType, leadLagDays } = dep;
+
+  switch (dependencyType) {
+    case 'finish_to_start':
+      return addDays(predNode.ef, leadLagDays);
+
+    case 'start_to_start':
+      return addDays(predNode.es, leadLagDays);
+
+    case 'finish_to_finish': {
+      // Successor EF >= predNode.ef + leadLagDays
+      // => Successor ES >= required_ef - successorDuration
+      const requiredEf = addDays(predNode.ef, leadLagDays);
+      return addDays(requiredEf, -successorDuration);
+    }
+
+    case 'start_to_finish': {
+      // Successor EF >= predNode.es + leadLagDays
+      // => Successor ES >= required_ef - successorDuration
+      const requiredEf = addDays(predNode.es, leadLagDays);
+      return addDays(requiredEf, -successorDuration);
+    }
+  }
+}
+
+// ─── Backward pass: compute LS and LF ────────────────────────────────────────
+
+/**
+ * Compute the LF (latest finish) constraint imposed on a predecessor by a given dependency.
+ * Takes the predecessor's duration because SS and SF constraints are LS-based.
+ *
+ * ADR-014 backward pass rules:
+ * - FS: Predecessor LF <= Successor LS - lead/lag
+ * - SS: Predecessor LS <= Successor LS - lead/lag  => Predecessor LF <= (SucLS - LL) + predDuration
+ * - FF: Predecessor LF <= Successor LF - lead/lag
+ * - SF: Predecessor LS <= Successor LF - lead/lag  => Predecessor LF <= (SucLF - LL) + predDuration
+ */
+function backwardDepLf(
+  dep: SchedulingDependency,
+  succNode: NodeData,
+  predDuration: number,
+): string {
+  const { dependencyType, leadLagDays } = dep;
+
+  switch (dependencyType) {
+    case 'finish_to_start':
+      // Predecessor LF <= Successor LS - lead/lag
+      return addDays(succNode.ls, -leadLagDays);
+
+    case 'start_to_start': {
+      // Predecessor LS <= Successor LS - lead/lag
+      // => Predecessor LF = constrainedLS + predDuration
+      const constrainedLs = addDays(succNode.ls, -leadLagDays);
+      return addDays(constrainedLs, predDuration);
+    }
+
+    case 'finish_to_finish':
+      // Predecessor LF <= Successor LF - lead/lag
+      return addDays(succNode.lf, -leadLagDays);
+
+    case 'start_to_finish': {
+      // Predecessor LS <= Successor LF - lead/lag
+      // => Predecessor LF = constrainedLS + predDuration
+      const constrainedLs = addDays(succNode.lf, -leadLagDays);
+      return addDays(constrainedLs, predDuration);
+    }
+  }
+}
+
+// ─── Cascade helper ───────────────────────────────────────────────────────────
+
+/**
+ * Build the set of all downstream successors of an anchor node (inclusive of anchor).
+ * Uses BFS traversal of the dependency graph following successor edges.
+ */
+function buildDownstreamSet(anchorId: string, dependencies: SchedulingDependency[]): Set<string> {
+  const successorsOf = new Map<string, string[]>();
+  for (const dep of dependencies) {
+    if (!successorsOf.has(dep.predecessorId)) {
+      successorsOf.set(dep.predecessorId, []);
+    }
+    successorsOf.get(dep.predecessorId)!.push(dep.successorId);
+  }
+
+  const visited = new Set<string>();
+  const queue: string[] = [anchorId];
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (visited.has(current)) continue;
+    visited.add(current);
+
+    for (const succ of successorsOf.get(current) ?? []) {
+      if (!visited.has(succ)) {
+        queue.push(succ);
+      }
+    }
+  }
+
+  return visited;
+}
+
+// ─── Callback Options for Auto-Reschedule ─────────────────────────────────────
+
+/**
+ * Optional callbacks for autoReschedule to notify consumers of events.
+ */
+export interface AutoRescheduleOptions {
+  /** Callback when a milestone is detected as delayed beyond its target date. */
+  onMilestoneDelayed?: (
+    milestoneId: number,
+    milestoneName: string,
+    targetDate: string,
+    projectedDate: string,
+  ) => void;
+  /** Callback when auto-reschedule completes with updated count. */
+  onRescheduleCompleted?: (updatedCount: number) => void;
+}
+
+// ─── Main scheduling engine ────────────────────────────────────────────────────
+
+/**
+ * Run the CPM scheduling algorithm.
+ *
+ * This is a pure function — it takes data as input and returns the schedule result.
+ * No database access occurs.
+ *
+ * @param params - Scheduling parameters including work items, dependencies, mode, and today's date
+ * @returns ScheduleResult — scheduled items with CPM dates, critical path, warnings,
+ *   and optionally cycleNodes if a circular dependency was detected
+ */
+export function schedule(params: ScheduleParams): ScheduleResult {
+  const { mode, anchorWorkItemId, workItems, dependencies, today } = params;
+
+  const warnings: ScheduleWarning[] = [];
+
+  // ─── 1. Determine which items to schedule ────────────────────────────────────
+
+  let scheduledIds: Set<string>;
+
+  if (mode === 'full') {
+    scheduledIds = new Set(workItems.map((wi) => wi.id));
+  } else {
+    // Cascade mode: anchor + all downstream successors
+    if (!anchorWorkItemId) {
+      throw new Error('anchorWorkItemId is required for cascade mode');
+    }
+    scheduledIds = buildDownstreamSet(anchorWorkItemId, dependencies);
+  }
+
+  // Index work items by ID
+  const workItemMap = new Map<string, SchedulingWorkItem>();
+  for (const wi of workItems) {
+    workItemMap.set(wi.id, wi);
+  }
+
+  // Filter to items that exist in the data (handles orphaned IDs in cascade)
+  const validScheduledIds = new Set<string>();
+  for (const id of scheduledIds) {
+    if (workItemMap.has(id)) {
+      validScheduledIds.add(id);
+    }
+  }
+  scheduledIds = validScheduledIds;
+
+  // Empty result if nothing to schedule
+  if (scheduledIds.size === 0) {
+    return { scheduledItems: [], criticalPath: [], warnings };
+  }
+
+  // Build edge list for the scheduled node set
+  const edges: Array<[string, string]> = dependencies
+    .filter((d) => scheduledIds.has(d.predecessorId) && scheduledIds.has(d.successorId))
+    .map((d) => [d.predecessorId, d.successorId] as [string, string]);
+
+  // ─── 2. Topological sort (Kahn's algorithm) ──────────────────────────────────
+
+  const { sorted: topoOrder, cycle } = topologicalSort(scheduledIds, edges);
+
+  if (cycle.length > 0) {
+    // Circular dependency detected — signal to the caller
+    return { scheduledItems: [], criticalPath: [], warnings, cycleNodes: cycle };
+  }
+
+  // ─── 3. Build dependency index maps ──────────────────────────────────────────
+
+  // predecessorDepsOf[id] = deps where id is the successor (id depends on these)
+  const predecessorDepsOf = new Map<string, SchedulingDependency[]>();
+  // successorDepsOf[id] = deps where id is the predecessor (these depend on id)
+  const successorDepsOf = new Map<string, SchedulingDependency[]>();
+
+  for (const id of scheduledIds) {
+    predecessorDepsOf.set(id, []);
+    successorDepsOf.set(id, []);
+  }
+
+  for (const dep of dependencies) {
+    if (scheduledIds.has(dep.predecessorId) && scheduledIds.has(dep.successorId)) {
+      predecessorDepsOf.get(dep.successorId)!.push(dep);
+      successorDepsOf.get(dep.predecessorId)!.push(dep);
+    }
+  }
+
+  // ─── 4. Forward pass: compute ES and EF ──────────────────────────────────────
+
+  const nodes = new Map<string, NodeData>();
+
+  for (const id of topoOrder) {
+    const item = workItemMap.get(id)!;
+    const duration = item.durationDays ?? 0;
+
+    // Emit no_duration warning for items without a duration estimate
+    if (item.durationDays === null || item.durationDays === undefined) {
+      warnings.push({
+        workItemId: id,
+        type: 'no_duration',
+        message: 'Work item has no duration set; scheduled as zero-duration',
+      });
+    }
+
+    // ── Rule 1: Actual dates take absolute precedence ─────────────────────────
+    //
+    // When actualStartDate is set, it overrides CPM-computed ES unconditionally.
+    // When actualEndDate is set (with or without actualStartDate), it overrides EF.
+    // Items with actual dates are never considered "late" — actual dates are authoritative.
+
+    if (item.actualStartDate || item.actualEndDate) {
+      // Determine ES: actualStartDate overrides if set; otherwise fall through to CPM below.
+      // We handle the "actualEndDate only" case here to ensure EF override regardless.
+      if (item.actualStartDate) {
+        const es = item.actualStartDate;
+        let ef = item.actualEndDate ?? addDays(es, duration);
+        let isLate = false;
+
+        // ── Rule 3 inside Rule 1: in_progress end-date floor ─────────────────
+        // When actualStartDate is set but actualEndDate is NOT, Rule 1 computes
+        // EF = actualStartDate + duration. If that date is in the past (e.g. the
+        // item started weeks ago and the duration estimate was short), we must
+        // still clamp EF to today — the work is still ongoing.
+        // When actualEndDate IS set it is authoritative and no clamping applies.
+        if (item.status === 'in_progress' && !item.actualEndDate) {
+          const efBeforeClamp = ef;
+          ef = maxDate(ef, today);
+          if (ef !== efBeforeClamp) {
+            isLate = true;
+          }
+        }
+
+        nodes.set(id, {
+          item,
+          duration,
+          es,
+          ef,
+          ls: es, // Placeholder until backward pass
+          lf: ef, // Placeholder until backward pass
+          isLate,
+        });
+
+        // Emit already_completed warning if dates would change
+        if (item.status === 'completed') {
+          const startWouldChange = item.startDate && es !== item.startDate;
+          const endWouldChange = item.endDate && ef !== item.endDate;
+          if (startWouldChange || endWouldChange) {
+            warnings.push({
+              workItemId: id,
+              type: 'already_completed',
+              message: 'Work item is already completed; dates cannot be changed by the scheduler',
+            });
+          }
+        }
+        continue;
+      }
+      // actualEndDate is set but actualStartDate is not — fall through to CPM for ES,
+      // then override EF with actualEndDate after computing ES.
+    }
+
+    // Compute ES: start from the latest date implied by all predecessors
+    const preds = predecessorDepsOf.get(id)!;
+    let es: string;
+
+    // Whether this item is a root node (no predecessors) with a non-completed status.
+    // Used below to determine whether to preserve explicit user-set dates.
+    let isNonCompletedRoot = false;
+
+    if (preds.length === 0) {
+      // No predecessors within the scheduled set.
+      // For non-completed items: use the item's existing startDate as the base when
+      // explicitly set, so that auto-reschedule does not override user-set dates.
+      // For completed items: always compute from today so that already_completed
+      // warnings correctly detect when historical dates would differ from CPM dates.
+      // Fall back to today when no explicit startDate is set.
+      isNonCompletedRoot = item.status !== 'completed';
+      es = isNonCompletedRoot && item.startDate != null ? item.startDate : today;
+    } else {
+      // ES = max of all predecessor-derived ES constraints
+      let maxEs = '0001-01-01'; // Sentinel: earliest possible date
+      for (const dep of preds) {
+        const predNode = nodes.get(dep.predecessorId)!;
+        const depEs = forwardDepEs(dep, predNode, duration);
+        maxEs = maxDate(maxEs, depEs);
+      }
+      es = maxEs;
+    }
+
+    // Apply start_after hard constraint (must start on or after this date)
+    if (item.startAfter) {
+      es = maxDate(es, item.startAfter);
+    }
+
+    // ── Rule 2: Today floor for not_started items ─────────────────────────────
+    // A not_started work item cannot start in the past — floor ES to today.
+    // Track whether clamping occurred to set isLate.
+    let isLate = false;
+    if (item.status === 'not_started') {
+      const esBeforeClamp = es;
+      es = maxDate(es, today);
+      if (es !== esBeforeClamp) {
+        isLate = true;
+      }
+    }
+
+    // Compute EF from ES + duration.
+    // Exception: for non-completed root nodes with an explicit endDate AND no explicit
+    // durationDays, use that endDate as EF to preserve user-set dates when duration is
+    // unset or implicit. This prevents auto-reschedule from overwriting an explicit
+    // endDate with es+0 when durationDays is null.
+    // When durationDays IS set, always compute EF = addDays(es, duration) so that
+    // changing durationDays is reflected in the scheduled end date.
+    let ef: string;
+    if (
+      isNonCompletedRoot &&
+      item.endDate != null &&
+      item.endDate >= es &&
+      (item.durationDays === null || item.durationDays === undefined)
+    ) {
+      ef = item.endDate;
+    } else {
+      ef = addDays(es, duration);
+    }
+
+    // ── Rule 1 (actualEndDate only): Override EF with actual end date ─────────
+    // When actualEndDate is set without actualStartDate, ES comes from CPM (above)
+    // but EF is overridden by the actual end date. Not considered late.
+    if (item.actualEndDate) {
+      ef = item.actualEndDate;
+      isLate = false; // Actual dates are authoritative
+    }
+
+    // ── Rule 3: Today floor for in_progress items ─────────────────────────────
+    // An in_progress work item's end date must not be in the past.
+    // Only applies when actualEndDate is not set (Rule 1 takes precedence).
+    if (item.status === 'in_progress' && !item.actualEndDate) {
+      const efBeforeClamp = ef;
+      ef = maxDate(ef, today);
+      if (ef !== efBeforeClamp) {
+        isLate = true;
+      }
+    }
+
+    nodes.set(id, {
+      item,
+      duration,
+      es,
+      ef,
+      ls: es, // Placeholder until backward pass
+      lf: ef, // Placeholder until backward pass
+      isLate,
+    });
+
+    // Emit start_before_violated soft warning
+    if (item.startBefore && es > item.startBefore) {
+      warnings.push({
+        workItemId: id,
+        type: 'start_before_violated',
+        message: `Scheduled start date (${es}) exceeds start-before constraint (${item.startBefore})`,
+      });
+    }
+
+    // Emit already_completed warning if dates would change
+    if (item.status === 'completed') {
+      const startWouldChange = item.startDate && es !== item.startDate;
+      const endWouldChange = item.endDate && ef !== item.endDate;
+      if (startWouldChange || endWouldChange) {
+        warnings.push({
+          workItemId: id,
+          type: 'already_completed',
+          message: 'Work item is already completed; dates cannot be changed by the scheduler',
+        });
+      }
+    }
+  }
+
+  // ─── 5. Backward pass: compute LS and LF ─────────────────────────────────────
+
+  // Compute project finish date: maximum EF across all terminal nodes
+  let projectEnd = '0000-01-01';
+  for (const id of topoOrder) {
+    const succs = successorDepsOf.get(id)!;
+    if (succs.length === 0) {
+      const node = nodes.get(id)!;
+      projectEnd = maxDate(projectEnd, node.ef);
+    }
+  }
+
+  // Traverse in reverse topological order
+  for (const id of [...topoOrder].reverse()) {
+    const node = nodes.get(id)!;
+    const succs = successorDepsOf.get(id)!;
+
+    if (succs.length === 0) {
+      // Terminal node: use shared project finish date so only the longest path has zero float
+      node.lf = projectEnd;
+      node.ls = addDays(projectEnd, -node.duration);
+    } else {
+      // LF = min of all successor-derived LF constraints
+      let minLf = '9999-12-31'; // Sentinel: latest possible date
+      for (const dep of succs) {
+        const succNode = nodes.get(dep.successorId)!;
+        const depLf = backwardDepLf(dep, succNode, node.duration);
+        minLf = minDate(minLf, depLf);
+      }
+      node.lf = minLf;
+      node.ls = addDays(minLf, -node.duration);
+    }
+  }
+
+  // ─── 6. Calculate float and identify critical path ────────────────────────────
+
+  const criticalPath: string[] = [];
+  const scheduledItems: ScheduleResponse['scheduledItems'] = [];
+
+  for (const id of topoOrder) {
+    const node = nodes.get(id)!;
+    // Total float = LS - ES (in days). Zero or negative = critical.
+    const totalFloat = diffDays(node.es, node.ls);
+    const isCritical = totalFloat <= 0;
+
+    if (isCritical) {
+      criticalPath.push(id);
+    }
+
+    scheduledItems.push({
+      workItemId: id,
+      previousStartDate: node.item.startDate,
+      previousEndDate: node.item.endDate,
+      scheduledStartDate: node.es,
+      scheduledEndDate: node.ef,
+      latestStartDate: node.ls,
+      latestFinishDate: node.lf,
+      // Clamp to 0: negative float means infeasible (constraints cannot be simultaneously met)
+      totalFloat: Math.max(0, totalFloat),
+      isCritical,
+      isLate: node.isLate,
+    });
+  }
+
+  return { scheduledItems, criticalPath, warnings };
+}
+
+// ─── Auto-reschedule (database-aware) ─────────────────────────────────────────
+
+type DbType = BetterSQLite3Database<typeof schemaTypes>;
+
+/**
+ * Fetch all work items from the database, run the CPM scheduler, and apply any
+ * changed dates back to the database.
+ *
+ * Milestone dependency expansion:
+ *   For each required milestone dependency (WI depends on milestone M), we find all
+ *   work items that are linked/contributing to M via milestone_work_items. We then
+ *   create synthetic finish-to-start dependencies from each contributing WI to the
+ *   dependent WI and feed them into the CPM engine alongside the real dependencies.
+ *
+ * @param db - Drizzle database handle
+ * @param options - Optional callbacks for milestone delays and completion
+ * @returns The count of work items whose dates were updated
+ */
+export function autoReschedule(db: DbType, options?: AutoRescheduleOptions): number {
+  // ── 1. Fetch all work items ──────────────────────────────────────────────────
+
+  const allWorkItems = db.select().from(workItems).all();
+
+  // ── 2. Fetch real dependencies ───────────────────────────────────────────────
+
+  const allDependencies =
+    allWorkItems.length > 0 ? db.select().from(workItemDependencies).all() : [];
+
+  // ── 3. Load milestones and their links ──────────────────────────────────────
+  //
+  // Load milestone data and contributor/dependent links so we can model milestones
+  // as zero-duration CPM nodes.
+
+  const allMilestones = db.select().from(milestones).all();
+
+  // Map milestone IDs to milestones for quick lookup
+  const milestoneMap = new Map<number, typeof milestones.$inferSelect>();
+  for (const milestone of allMilestones) {
+    milestoneMap.set(milestone.id, milestone);
+  }
+
+  // ── 4. Milestone modeled as CPM nodes ───────────────────────────────────────
+  //
+  // For each milestone that has contributors (in milestone_work_items) or
+  // dependents (in work_item_milestone_deps), create a zero-duration CPM node
+  // with ID `milestone:<id>`.
+
+  const allMilestoneDeps = db.select().from(workItemMilestoneDeps).all();
+  const allMilestoneLinks = db.select().from(milestoneWorkItems).all();
+
+  // Build milestoneId → contributing workItemIds map
+  const milestoneContributorsMap = new Map<number, string[]>();
+  for (const link of allMilestoneLinks) {
+    const existing = milestoneContributorsMap.get(link.milestoneId) ?? [];
+    existing.push(link.workItemId);
+    milestoneContributorsMap.set(link.milestoneId, existing);
+  }
+
+  // Build milestoneId → dependent workItemIds map
+  const milestoneDependentsMap = new Map<number, string[]>();
+  for (const dep of allMilestoneDeps) {
+    const existing = milestoneDependentsMap.get(dep.milestoneId) ?? [];
+    existing.push(dep.workItemId);
+    milestoneDependentsMap.set(dep.milestoneId, existing);
+  }
+
+  // Identify milestones that should become CPM nodes (have contributors or dependents)
+  const milestoneIdsWithLinks = new Set<number>();
+  for (const milestoneId of milestoneContributorsMap.keys()) {
+    milestoneIdsWithLinks.add(milestoneId);
+  }
+  for (const milestoneId of milestoneDependentsMap.keys()) {
+    milestoneIdsWithLinks.add(milestoneId);
+  }
+
+  const syntheticDeps: SchedulingDependency[] = [];
+  const milestoneVirtualWIs: SchedulingWorkItem[] = [];
+
+  for (const milestoneId of milestoneIdsWithLinks) {
+    const milestone = milestoneMap.get(milestoneId);
+    if (!milestone) continue;
+
+    // Create a zero-duration CPM node for this milestone
+    const milestoneNodeId = `milestone:${milestoneId}`;
+    const completedDate = milestone.completedAt ? milestone.completedAt.slice(0, 10) : null;
+
+    milestoneVirtualWIs.push({
+      id: milestoneNodeId,
+      status: milestone.completedAt ? 'completed' : 'not_started',
+      startDate: completedDate ?? milestone.targetDate,
+      endDate: completedDate ?? milestone.targetDate,
+      actualStartDate: completedDate ?? null,
+      actualEndDate: completedDate ?? null,
+      durationDays: 0,
+      startAfter: null,
+      startBefore: null,
+    });
+
+    // Create FS deps from each contributor to the milestone
+    const contributors = milestoneContributorsMap.get(milestoneId) ?? [];
+    for (const contributorId of contributors) {
+      syntheticDeps.push({
+        predecessorId: contributorId,
+        successorId: milestoneNodeId,
+        dependencyType: 'finish_to_start',
+        leadLagDays: 0,
+      });
+    }
+
+    // Create FS deps from the milestone to each dependent
+    const dependents = milestoneDependentsMap.get(milestoneId) ?? [];
+    for (const dependentId of dependents) {
+      syntheticDeps.push({
+        predecessorId: milestoneNodeId,
+        successorId: dependentId,
+        dependencyType: 'finish_to_start',
+        leadLagDays: 0,
+      });
+    }
+  }
+
+  // ── 5. Build combined dependency list for the engine ────────────────────────
+
+  const engineWorkItems: SchedulingWorkItem[] = [
+    ...allWorkItems.map((wi) => ({
+      id: wi.id,
+      status: wi.status,
+      startDate: wi.startDate,
+      endDate: wi.endDate,
+      actualStartDate: wi.actualStartDate,
+      actualEndDate: wi.actualEndDate,
+      durationDays: wi.durationDays,
+      startAfter: wi.startAfter,
+      startBefore: wi.startBefore,
+    })),
+    ...milestoneVirtualWIs,
+  ];
+
+  const realDeps: SchedulingDependency[] = allDependencies.map((dep) => ({
+    predecessorId: dep.predecessorId,
+    successorId: dep.successorId,
+    dependencyType: dep.dependencyType,
+    leadLagDays: dep.leadLagDays,
+  }));
+
+  const engineDependencies: SchedulingDependency[] = [...realDeps, ...syntheticDeps];
+
+  const today = new Date().toISOString().slice(0, 10);
+
+  // ── 6. Run the CPM scheduler ─────────────────────────────────────────────────
+
+  const result = schedule({
+    mode: 'full',
+    workItems: engineWorkItems,
+    dependencies: engineDependencies,
+    today,
+  });
+
+  // If a cycle is detected, skip rescheduling silently — the dependency creation
+  // endpoint surfaces cycle errors before reaching here, but guard defensively.
+  if (result.cycleNodes && result.cycleNodes.length > 0) {
+    return 0;
+  }
+
+  // ── 7. Apply changed dates back to the database ──────────────────────────────
+  //
+  // Skip milestone nodes (IDs starting with "milestone:") — they are virtual CPM
+  // nodes only and should never be written to the database.
+
+  // Build a map of current startDate/endDate by workItemId for comparison
+  const currentDatesMap = new Map<string, { startDate: string | null; endDate: string | null }>();
+  for (const wi of allWorkItems) {
+    currentDatesMap.set(wi.id, { startDate: wi.startDate, endDate: wi.endDate });
+  }
+
+  let updatedCount = 0;
+  const now = new Date().toISOString();
+
+  db.transaction(() => {
+    for (const scheduled of result.scheduledItems) {
+      // Process milestone nodes to detect delays
+      if (scheduled.workItemId.startsWith('milestone:')) {
+        const milestoneIdStr = scheduled.workItemId.substring('milestone:'.length);
+        const milestoneId = parseInt(milestoneIdStr, 10);
+        const milestone = milestoneMap.get(milestoneId);
+
+        if (milestone && options?.onMilestoneDelayed) {
+          const scheduledEnd = scheduled.scheduledEndDate;
+          const targetDate = milestone.targetDate;
+          if (scheduledEnd > targetDate) {
+            options.onMilestoneDelayed(milestoneId, milestone.title, targetDate, scheduledEnd);
+          }
+        }
+        continue;
+      }
+
+      const current = currentDatesMap.get(scheduled.workItemId);
+      if (!current) continue;
+
+      const newStart = scheduled.scheduledStartDate;
+      const newEnd = scheduled.scheduledEndDate;
+
+      const startChanged = newStart !== current.startDate;
+      const endChanged = newEnd !== current.endDate;
+
+      if (startChanged || endChanged) {
+        db.update(workItems)
+          .set({
+            startDate: newStart,
+            endDate: newEnd,
+            updatedAt: now,
+          })
+          .where(eq(workItems.id, scheduled.workItemId))
+          .run();
+        updatedCount++;
+      }
+    }
+
+    // ── 8. Compute household item delivery dates ──────────────────────────────────
+    //
+    // Build CPM nodes for household items using work item end dates.
+    // HIs are zero-duration terminal nodes.
+    // Note: milestoneMap was already loaded in section 3; reuse it here.
+
+    const allHouseholdItems = db.select().from(householdItems).all();
+    const allHIDeps = db.select().from(householdItemDeps).all();
+
+    // Build the scheduled result map for quick lookup of work item end dates
+    const scheduledMap = new Map<string, (typeof result.scheduledItems)[0]>();
+    for (const scheduled of result.scheduledItems) {
+      scheduledMap.set(scheduled.workItemId, scheduled);
+    }
+
+    // ── 9. Compute delivery dates for household items ─────────────────────────────
+
+    const hiDeliveryDates = new Map<string, { targetDate: string | null; isLate: boolean }>();
+
+    for (const hi of allHouseholdItems) {
+      // Find all dependencies for this HI
+      const hiDeps = allHIDeps.filter((dep) => dep.householdItemId === hi.id);
+
+      if (hiDeps.length === 0 && !hi.earliestDeliveryDate) {
+        // No dependencies and no earliest delivery constraint — HI is unconstrained
+        hiDeliveryDates.set(hi.id, { targetDate: null, isLate: false });
+        continue;
+      }
+
+      // Compute ES (earliest start): max of all predecessor finish times + lead/lag
+      let maxES = today; // Default to today if no predecessors
+
+      for (const dep of hiDeps) {
+        let predEF = today;
+
+        if (dep.predecessorType === 'work_item') {
+          // Look up the work item's end date from the scheduled result
+          const scheduled = scheduledMap.get(dep.predecessorId);
+          if (scheduled) {
+            predEF = scheduled.scheduledEndDate;
+          } else {
+            // Work item not in scheduled results (shouldn't happen, but fallback)
+            const wiRow = db
+              .select()
+              .from(workItems)
+              .where(eq(workItems.id, dep.predecessorId))
+              .get();
+            if (wiRow && wiRow.endDate) {
+              predEF = wiRow.endDate;
+            }
+          }
+        } else if (dep.predecessorType === 'milestone') {
+          // Determine effective milestone finish date using priority:
+          // 1. completedAt (actual) → truncate to YYYY-MM-DD
+          // 2. Projected: max scheduledEndDate of contributing work items
+          // 3. Fallback: targetDate
+          const milestoneId = parseInt(dep.predecessorId, 10);
+          const milestone = milestoneMap.get(milestoneId);
+          if (milestone) {
+            if (milestone.completedAt) {
+              // Priority 1: milestone has been completed — use actual date
+              predEF = milestone.completedAt.slice(0, 10);
+            } else {
+              // Priority 2: compute projected date from contributing work items
+              const contributorIds = milestoneContributorsMap.get(milestoneId) ?? [];
+              let projectedDate: string | null = null;
+              for (const contributorId of contributorIds) {
+                const scheduled = scheduledMap.get(contributorId);
+                if (scheduled?.scheduledEndDate) {
+                  projectedDate =
+                    projectedDate === null
+                      ? scheduled.scheduledEndDate
+                      : maxDate(projectedDate, scheduled.scheduledEndDate);
+                }
+              }
+              // Priority 3: fall back to targetDate if no projected date available
+              predEF = projectedDate ?? milestone.targetDate;
+            }
+          }
+        }
+
+        // All HI dependencies are finish-to-start with zero lag (HIs are zero-duration terminal nodes)
+        const depES = predEF;
+
+        maxES = maxDate(maxES, depES);
+      }
+
+      // Apply earliestDeliveryDate constraint (user-editable): ES >= earliestDeliveryDate if set
+      let es = maxES;
+      if (hi.earliestDeliveryDate) {
+        es = maxDate(es, hi.earliestDeliveryDate);
+      }
+
+      // Since HIs are zero-duration, EF = ES
+      let targetDate = es; // Start with the computed earliest date
+
+      // ── 10. Apply floor rules ─────────────────────────────────────────────────────
+
+      let isLate = false;
+
+      if (hi.actualDeliveryDate) {
+        // Actual date overrides CPM — use it directly
+        targetDate = hi.actualDeliveryDate;
+      } else if (hi.status === 'planned' || hi.status === 'purchased') {
+        // Floor to today; mark as late if floored
+        const targetBeforeFloor = targetDate;
+        targetDate = maxDate(targetDate, today);
+        if (targetDate !== targetBeforeFloor) {
+          isLate = true;
+        }
+      } else if (hi.status === 'scheduled') {
+        // Floor to today; mark as late if floored
+        const targetBeforeFloor = targetDate;
+        targetDate = maxDate(targetDate, today);
+        if (targetDate !== targetBeforeFloor) {
+          isLate = true;
+        }
+      }
+
+      hiDeliveryDates.set(hi.id, { targetDate, isLate });
+    }
+
+    // ── 11. Write HI target delivery dates back to database ────────────────────────────────
+    // Note: scheduler does NOT write to earliestDeliveryDate or latestDeliveryDate.
+    // Those are now user-editable constraints. Only targetDeliveryDate and isLate are computed by scheduler.
+
+    for (const [hiId, dates] of hiDeliveryDates) {
+      const current = allHouseholdItems.find((hi) => hi.id === hiId);
+      if (!current) continue;
+
+      const targetDateChanged = dates.targetDate !== current.targetDeliveryDate;
+      const isLateChanged = dates.isLate !== current.isLate;
+
+      if (targetDateChanged || isLateChanged) {
+        db.update(householdItems)
+          .set({
+            targetDeliveryDate: dates.targetDate,
+            isLate: dates.isLate,
+            updatedAt: now,
+          })
+          .where(eq(householdItems.id, hiId))
+          .run();
+        updatedCount++;
+      }
+    }
+  });
+
+  // Invoke completion callback if provided
+  if (options?.onRescheduleCompleted) {
+    options.onRescheduleCompleted(updatedCount);
+  }
+
+  return updatedCount;
+}
+
+// ─── Daily auto-reschedule tracker ────────────────────────────────────────────
+
+/**
+ * Last date (YYYY-MM-DD) on which autoReschedule was called.
+ * Resets to null on server restart. Module-level state.
+ */
+let lastRescheduleDate: string | null = null;
+
+/**
+ * Reset the daily reschedule tracker (for testing purposes).
+ */
+export function resetRescheduleTracker(): void {
+  lastRescheduleDate = null;
+}
+
+/**
+ * Ensure autoReschedule has been called today.
+ *
+ * If autoReschedule has already run today (tracked by lastRescheduleDate), this is a no-op.
+ * Otherwise, runs autoReschedule synchronously and records today's date.
+ *
+ * @param db - Drizzle database handle
+ */
+export function ensureDailyReschedule(db: DbType): void {
+  const today = new Date().toISOString().slice(0, 10);
+  if (lastRescheduleDate === today) {
+    return;
+  }
+  autoReschedule(db);
+  lastRescheduleDate = today;
+}

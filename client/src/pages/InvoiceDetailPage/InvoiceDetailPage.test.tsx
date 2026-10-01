@@ -1,0 +1,521 @@
+/**
+ * @jest-environment jsdom
+ */
+import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
+import { MemoryRouter, Routes, Route } from 'react-router-dom';
+import type { Invoice, Vendor } from '@cornerstone/shared';
+import type * as InvoicesApiTypes from '../../lib/invoicesApi.js';
+import type * as VendorsApiTypes from '../../lib/vendorsApi.js';
+import type * as InvoiceDetailPageTypes from './InvoiceDetailPage.js';
+
+// ─── Module-scope mock functions ──────────────────────────────────────────────
+
+const mockFetchInvoiceById = jest.fn<typeof InvoicesApiTypes.fetchInvoiceById>();
+const mockUpdateInvoice = jest.fn<typeof InvoicesApiTypes.updateInvoice>();
+const mockDeleteInvoice = jest.fn<typeof InvoicesApiTypes.deleteInvoice>();
+const mockFetchVendors = jest.fn<typeof VendorsApiTypes.fetchVendors>();
+
+/** Captures the SearchPicker onChange handler so tests can simulate vendor selection */
+let capturedSearchPickerOnChange: ((id: string) => void) | null = null;
+
+// ─── Mock: invoicesApi ─────────────────────────────────────────────────────────
+
+jest.unstable_mockModule('../../lib/invoicesApi.js', () => ({
+  fetchInvoiceById: mockFetchInvoiceById,
+  updateInvoice: mockUpdateInvoice,
+  deleteInvoice: mockDeleteInvoice,
+  fetchInvoices: jest.fn(),
+  createInvoice: jest.fn(),
+  fetchAllInvoices: jest.fn(),
+}));
+
+// ─── Mock: InvoiceBudgetLinesSection stub ─────────────────────────────────────
+// Stub out the section to avoid cascading dependencies in InvoiceDetailPage tests
+
+jest.unstable_mockModule('./InvoiceBudgetLinesSection.js', () => ({
+  InvoiceBudgetLinesSection: (props: { invoiceId: string; invoiceTotal: number }) => (
+    <div
+      data-testid="invoice-budget-lines-section"
+      data-invoice-id={props.invoiceId}
+      data-invoice-total={props.invoiceTotal}
+    />
+  ),
+}));
+
+// ─── Mock: LinkedDocumentsSection stub ────────────────────────────────────────
+
+jest.unstable_mockModule('../../components/documents/LinkedDocumentsSection.js', () => ({
+  LinkedDocumentsSection: (props: { entityType: string; entityId: string }) => (
+    <div
+      data-testid="linked-documents-section"
+      data-entity-type={props.entityType}
+      data-entity-id={props.entityId}
+    />
+  ),
+}));
+
+// ─── Mock: apiClient (required by transitively imported modules) ───────────────
+
+class MockApiClientError extends Error {
+  statusCode: number;
+  error: { code: string; message?: string };
+  constructor(statusCode: number, error: { code: string; message?: string }) {
+    super(error.message ?? 'API Error');
+    this.statusCode = statusCode;
+    this.error = error;
+  }
+}
+
+jest.unstable_mockModule('../../lib/apiClient.js', () => ({
+  get: jest.fn(),
+  post: jest.fn(),
+  patch: jest.fn(),
+  del: jest.fn(),
+  put: jest.fn(),
+  setBaseUrl: jest.fn(),
+  getBaseUrl: jest.fn().mockReturnValue('/api'),
+  ApiClientError: MockApiClientError,
+  NetworkError: class MockNetworkError extends Error {},
+}));
+
+// ─── Mock: formatters (pure utility — avoids Intl issues in jsdom) ────────────
+
+jest.unstable_mockModule('../../lib/formatters.js', () => ({
+  formatDate: (d: string) => d ?? '—',
+  formatCurrency: (n: number) => `$${n.toFixed(2)}`,
+  formatTime: (d: string | null | undefined) => d ?? '—',
+  formatDateTime: (d: string | null | undefined) => d ?? '—',
+  formatRelativeTime: (d: string) => d,
+  formatPercent: (n: number) => `${n.toFixed(2)}%`,
+  computeActualDuration: () => null,
+  useFormatters: () => ({
+    formatCurrency: (n: number) => `$${n.toFixed(2)}`,
+    formatDate: (d: string | null | undefined) => d ?? '—',
+    formatTime: (d: string | null | undefined) => d ?? '—',
+    formatDateTime: (d: string | null | undefined) => d ?? '—',
+    formatPercent: (n: number) => `${n.toFixed(2)}%`,
+  }),
+}));
+
+// ─── Mock: vendorsApi (used transitively by SearchPicker in edit modal) ────────
+
+jest.unstable_mockModule('../../lib/vendorsApi.js', () => ({
+  fetchVendors: mockFetchVendors,
+  fetchVendorById: jest.fn(),
+  createVendor: jest.fn(),
+  updateVendor: jest.fn(),
+  deleteVendor: jest.fn(),
+}));
+
+// ─── Mock: SearchPicker (#1736) ───────────────────────────────────────────────
+// The real SearchPicker requires floating-ui portal and getBoundingClientRect
+// which are problematic in jsdom. Stub it with a simple element that captures
+// the onChange handler so tests can simulate vendor selection.
+
+jest.unstable_mockModule('../../components/SearchPicker/SearchPicker.js', () => ({
+  SearchPicker: ({
+    onChange,
+    initialTitle,
+    id,
+  }: {
+    value: string;
+    onChange: (id: string) => void;
+    initialTitle?: string;
+    id?: string;
+    [key: string]: unknown;
+  }) => {
+    capturedSearchPickerOnChange = onChange;
+    return (
+      <div data-testid={`search-picker-${id ?? 'default'}`} data-initial-title={initialTitle}>
+        <span data-testid="search-picker-title">{initialTitle ?? ''}</span>
+        <input
+          data-testid={`search-picker-input-${id ?? 'default'}`}
+          onChange={(e) => onChange(e.target.value)}
+        />
+      </div>
+    );
+  },
+}));
+
+// ─── Type import for deferred module load ─────────────────────────────────────
+
+let InvoiceDetailPage: (typeof InvoiceDetailPageTypes)['InvoiceDetailPage'];
+
+// ─── Test fixtures ─────────────────────────────────────────────────────────────
+
+const MOCK_INVOICE_ID = 'inv-001';
+
+const mockInvoice: Invoice = {
+  id: MOCK_INVOICE_ID,
+  vendorId: 'vendor-1',
+  vendorName: 'Acme Construction',
+  budgetLines: [],
+  remainingAmount: 1500.0,
+  invoiceNumber: 'INV-2026-001',
+  amount: 1500.0,
+  date: '2026-01-15',
+  dueDate: '2026-02-15',
+  status: 'pending',
+  notes: null,
+  deposits: [],
+  finalPaymentAmount: 1500.0,
+  createdBy: {
+    id: 'user-1',
+    displayName: 'Jane Builder',
+    email: 'jane@example.com',
+  },
+  createdAt: '2026-01-15T10:00:00Z',
+  updatedAt: '2026-01-15T10:00:00Z',
+};
+
+// ─── Setup ────────────────────────────────────────────────────────────────────
+
+beforeEach(async () => {
+  mockFetchInvoiceById.mockReset();
+  mockUpdateInvoice.mockReset();
+  mockDeleteInvoice.mockReset();
+  mockFetchVendors.mockReset();
+
+  // Default: successful load
+  mockFetchInvoiceById.mockResolvedValue(mockInvoice);
+  // Default: empty vendor list (vendor search not exercised by most tests)
+  mockFetchVendors.mockResolvedValue({
+    vendors: [] as Vendor[],
+    pagination: { page: 1, pageSize: 50, totalItems: 0, totalPages: 0 },
+  });
+
+  // Deferred import after mock registration
+  const module = (await import('./InvoiceDetailPage.js')) as typeof InvoiceDetailPageTypes;
+  InvoiceDetailPage = module.InvoiceDetailPage;
+});
+
+afterEach(() => {
+  jest.restoreAllMocks();
+});
+
+// ─── Helper ───────────────────────────────────────────────────────────────────
+
+function renderPage(id = MOCK_INVOICE_ID) {
+  return render(
+    <MemoryRouter initialEntries={[`/budget/invoices/${id}`]}>
+      <Routes>
+        <Route path="/budget/invoices/:id" element={<InvoiceDetailPage />} />
+        <Route path="/budget/invoices" element={<div>Invoice List Page</div>} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+describe('InvoiceDetailPage', () => {
+  describe('loading state', () => {
+    it('renders "Loading invoice..." before fetchInvoiceById resolves', () => {
+      mockFetchInvoiceById.mockImplementation(() => new Promise(() => {}));
+      renderPage();
+      expect(screen.getByText('Loading invoice...')).toBeInTheDocument();
+    });
+  });
+
+  describe('error state', () => {
+    it('renders "Invoice not found" when fetchInvoiceById rejects with 404', async () => {
+      mockFetchInvoiceById.mockRejectedValue(
+        new MockApiClientError(404, { code: 'NOT_FOUND', message: 'Invoice not found.' }),
+      );
+      renderPage();
+
+      await waitFor(() => expect(screen.getByText(/Invoice not found/i)).toBeInTheDocument());
+    });
+
+    it('renders generic error message on non-404 API error', async () => {
+      mockFetchInvoiceById.mockRejectedValue(
+        new MockApiClientError(500, { code: 'INTERNAL_ERROR', message: 'Internal server error' }),
+      );
+      renderPage();
+
+      await waitFor(() => expect(screen.getByText(/Internal server error/i)).toBeInTheDocument());
+    });
+
+    it('renders generic error message on network failure', async () => {
+      mockFetchInvoiceById.mockRejectedValue(new Error('Network error'));
+      renderPage();
+
+      await waitFor(() => expect(screen.getByText(/Invoice not found/i)).toBeInTheDocument());
+    });
+  });
+
+  describe('successful render', () => {
+    it('renders page heading with the invoice number', async () => {
+      renderPage();
+
+      await waitFor(() =>
+        expect(
+          screen.getByRole('heading', { name: /#INV-2026-001/i, level: 1 }),
+        ).toBeInTheDocument(),
+      );
+    });
+
+    it('renders the vendor name', async () => {
+      renderPage();
+
+      await waitFor(() => expect(screen.getByText('Acme Construction')).toBeInTheDocument());
+    });
+
+    it('renders the formatted amount', async () => {
+      renderPage();
+
+      // Amount 1500 formatted as currency (mock returns $1500.00)
+      await waitFor(() => expect(screen.getByText('$1500.00')).toBeInTheDocument());
+    });
+
+    it('renders the status badge', async () => {
+      renderPage();
+
+      // The page renders the status badge in two places: the page header and the info list
+      await waitFor(() => expect(screen.getAllByText('Pending').length).toBeGreaterThanOrEqual(1));
+    });
+
+    it('renders the invoice number in the details list', async () => {
+      renderPage();
+
+      await waitFor(() => expect(screen.getByText('Invoice #')).toBeInTheDocument());
+    });
+
+    it('renders "Invoice Details" section heading', async () => {
+      renderPage();
+
+      await waitFor(() =>
+        expect(
+          screen.getByRole('heading', { name: 'Invoice Details', level: 2 }),
+        ).toBeInTheDocument(),
+      );
+    });
+  });
+
+  describe('LinkedDocumentsSection integration', () => {
+    it('renders the LinkedDocumentsSection component after loading', async () => {
+      renderPage();
+
+      await waitFor(() =>
+        expect(screen.getByTestId('linked-documents-section')).toBeInTheDocument(),
+      );
+    });
+
+    it('passes entityType="invoice" to LinkedDocumentsSection', async () => {
+      renderPage();
+
+      await waitFor(() => {
+        const section = screen.getByTestId('linked-documents-section');
+        expect(section).toHaveAttribute('data-entity-type', 'invoice');
+      });
+    });
+
+    it('passes the invoice ID as entityId to LinkedDocumentsSection', async () => {
+      renderPage(MOCK_INVOICE_ID);
+
+      await waitFor(() => {
+        const section = screen.getByTestId('linked-documents-section');
+        expect(section).toHaveAttribute('data-entity-id', MOCK_INVOICE_ID);
+      });
+    });
+  });
+
+  describe('InvoiceBudgetLinesSection integration', () => {
+    it('renders InvoiceBudgetLinesSection after invoice loads', async () => {
+      renderPage();
+
+      await waitFor(() =>
+        expect(screen.getByTestId('invoice-budget-lines-section')).toBeInTheDocument(),
+      );
+    });
+
+    it('passes the invoice ID to InvoiceBudgetLinesSection', async () => {
+      renderPage(MOCK_INVOICE_ID);
+
+      await waitFor(() => {
+        const section = screen.getByTestId('invoice-budget-lines-section');
+        expect(section).toHaveAttribute('data-invoice-id', MOCK_INVOICE_ID);
+      });
+    });
+
+    it('passes the invoice amount as invoiceTotal to InvoiceBudgetLinesSection', async () => {
+      renderPage();
+
+      await waitFor(() => {
+        const section = screen.getByTestId('invoice-budget-lines-section');
+        expect(section).toHaveAttribute('data-invoice-total', '1500');
+      });
+    });
+  });
+
+  describe('edit modal no longer contains legacy budget pickers', () => {
+    it('edit modal does not render a work item picker', async () => {
+      renderPage();
+      await waitFor(() =>
+        expect(
+          screen.getByRole('heading', { name: /#INV-2026-001/i, level: 1 }),
+        ).toBeInTheDocument(),
+      );
+
+      // Open edit modal
+      const editButton = screen.getByRole('button', { name: /^Edit$/i });
+      editButton.click();
+
+      await waitFor(() =>
+        expect(screen.getByRole('heading', { name: 'Edit Invoice', level: 2 })).toBeInTheDocument(),
+      );
+
+      // No work item or household item pickers in the edit modal
+      expect(screen.queryByTestId('work-item-picker')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('household-item-picker')).not.toBeInTheDocument();
+    });
+
+    it('edit modal does not render a "— or —" separator', async () => {
+      renderPage();
+      await waitFor(() =>
+        expect(
+          screen.getByRole('heading', { name: /#INV-2026-001/i, level: 1 }),
+        ).toBeInTheDocument(),
+      );
+
+      const editButton = screen.getByRole('button', { name: /^Edit$/i });
+      editButton.click();
+
+      await waitFor(() =>
+        expect(screen.getByRole('heading', { name: 'Edit Invoice', level: 2 })).toBeInTheDocument(),
+      );
+
+      expect(screen.queryByText('— or —')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('vendor SearchPicker in edit modal (#1736)', () => {
+    beforeEach(() => {
+      capturedSearchPickerOnChange = null;
+    });
+
+    it('edit modal renders vendor SearchPicker pre-populated with current vendor name', async () => {
+      renderPage();
+      await waitFor(() =>
+        expect(
+          screen.getByRole('heading', { name: /#INV-2026-001/i, level: 1 }),
+        ).toBeInTheDocument(),
+      );
+
+      screen.getByRole('button', { name: /^Edit$/i }).click();
+
+      await waitFor(() =>
+        expect(screen.getByRole('heading', { name: 'Edit Invoice', level: 2 })).toBeInTheDocument(),
+      );
+
+      const picker = screen.getByTestId('search-picker-edit-vendor');
+      expect(picker).toHaveAttribute('data-initial-title', 'Acme Construction');
+    });
+
+    it('selecting a different vendor and submitting sends PATCH with new vendorId while path uses original', async () => {
+      mockUpdateInvoice.mockResolvedValue({
+        ...mockInvoice,
+        vendorId: 'vendor-2',
+        vendorName: 'Builder Co',
+      });
+
+      renderPage();
+      await waitFor(() =>
+        expect(
+          screen.getByRole('heading', { name: /#INV-2026-001/i, level: 1 }),
+        ).toBeInTheDocument(),
+      );
+
+      screen.getByRole('button', { name: /^Edit$/i }).click();
+
+      await waitFor(() =>
+        expect(screen.getByRole('heading', { name: 'Edit Invoice', level: 2 })).toBeInTheDocument(),
+      );
+
+      // Simulate selecting a different vendor
+      await act(async () => {
+        capturedSearchPickerOnChange?.('vendor-2');
+      });
+
+      // Submit the form
+      const saveButton = screen.getByRole('button', { name: /^Save Changes$/i });
+      await act(async () => {
+        fireEvent.click(saveButton);
+      });
+
+      await waitFor(() => expect(mockUpdateInvoice).toHaveBeenCalledTimes(1));
+
+      const [pathVendorId, invoiceId, body] = mockUpdateInvoice.mock.calls[0] as [
+        string,
+        string,
+        Record<string, unknown>,
+      ];
+      expect(pathVendorId).toBe('vendor-1');
+      expect(invoiceId).toBe(MOCK_INVOICE_ID);
+      expect(body.vendorId).toBe('vendor-2');
+    });
+
+    it('submitting with vendor cleared shows vendorRequired error and does not call updateInvoice', async () => {
+      renderPage();
+      await waitFor(() =>
+        expect(
+          screen.getByRole('heading', { name: /#INV-2026-001/i, level: 1 }),
+        ).toBeInTheDocument(),
+      );
+
+      screen.getByRole('button', { name: /^Edit$/i }).click();
+
+      await waitFor(() =>
+        expect(screen.getByRole('heading', { name: 'Edit Invoice', level: 2 })).toBeInTheDocument(),
+      );
+
+      // Clear the vendor selection
+      await act(async () => {
+        capturedSearchPickerOnChange?.('');
+      });
+
+      // Submit the form
+      const saveButton = screen.getByRole('button', { name: /^Save Changes$/i });
+      await act(async () => {
+        fireEvent.click(saveButton);
+      });
+
+      await waitFor(() => expect(screen.getByText('Please select a vendor')).toBeInTheDocument());
+
+      expect(mockUpdateInvoice).not.toHaveBeenCalled();
+    });
+
+    it('404 response from updateInvoice surfaces vendorNotFound error without navigating away', async () => {
+      mockUpdateInvoice.mockRejectedValue(
+        new MockApiClientError(404, { code: 'NOT_FOUND', message: 'Vendor not found' }),
+      );
+
+      renderPage();
+      await waitFor(() =>
+        expect(
+          screen.getByRole('heading', { name: /#INV-2026-001/i, level: 1 }),
+        ).toBeInTheDocument(),
+      );
+
+      screen.getByRole('button', { name: /^Edit$/i }).click();
+
+      await waitFor(() =>
+        expect(screen.getByRole('heading', { name: 'Edit Invoice', level: 2 })).toBeInTheDocument(),
+      );
+
+      // Submit with default pre-populated vendor (vendor-1 is valid)
+      const saveButton = screen.getByRole('button', { name: /^Save Changes$/i });
+      await act(async () => {
+        fireEvent.click(saveButton);
+      });
+
+      await waitFor(() =>
+        expect(screen.getByText('The selected vendor could not be found')).toBeInTheDocument(),
+      );
+
+      // Modal should still be open
+      expect(screen.getByRole('heading', { name: 'Edit Invoice', level: 2 })).toBeInTheDocument();
+    });
+  });
+});

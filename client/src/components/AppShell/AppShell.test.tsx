@@ -1,0 +1,350 @@
+/**
+ * @jest-environment jsdom
+ */
+import { jest, describe, it, expect, beforeEach } from '@jest/globals';
+import type React from 'react';
+import { screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { lazy } from 'react';
+import { Route, Routes } from 'react-router-dom';
+import { renderWithRouter } from '../../test/testUtils';
+import type * as AppShellTypes from './AppShell.js';
+
+// Mock AuthContext so Sidebar can call useAuth()
+jest.unstable_mockModule('../../contexts/AuthContext.js', () => ({
+  useAuth: () => ({
+    user: {
+      id: '1',
+      email: 'test@example.com',
+      displayName: 'Test',
+      role: 'admin',
+      authProvider: 'local',
+      createdAt: '',
+      updatedAt: '',
+      deactivatedAt: null,
+    },
+    oidcEnabled: false,
+    isLoading: false,
+    error: null,
+    refreshAuth: jest.fn(),
+    logout: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
+  }),
+}));
+
+// Mock ThemeContext so ThemeToggle (inside Sidebar) can call useTheme()
+jest.unstable_mockModule('../../contexts/ThemeContext.js', () => ({
+  useTheme: () => ({
+    theme: 'system',
+    resolvedTheme: 'light',
+    setTheme: jest.fn(),
+  }),
+  ThemeProvider: ({ children }: { children: React.ReactNode }) => children,
+}));
+
+describe('AppShell', () => {
+  let AppShellModule: typeof AppShellTypes;
+
+  beforeEach(async () => {
+    if (!AppShellModule) {
+      AppShellModule = await import('./AppShell.js');
+    }
+  });
+
+  it('renders sidebar, floating menu button, and outlet area', () => {
+    renderWithRouter(
+      <Routes>
+        <Route element={<AppShellModule.AppShell />} path="*">
+          <Route index element={<div>Test Content</div>} />
+        </Route>
+      </Routes>,
+    );
+
+    // Sidebar should be present
+    const sidebar = screen.getByRole('complementary');
+    expect(sidebar).toBeInTheDocument();
+
+    // Floating menu button (FAB) should be present
+    const fab = screen.getByTestId('menu-fab');
+    expect(fab).toBeInTheDocument();
+
+    // Main content area should be present
+    const main = screen.getByRole('main');
+    expect(main).toBeInTheDocument();
+
+    // Outlet content should render
+    expect(screen.getByText('Test Content')).toBeInTheDocument();
+  });
+
+  it('shows "Loading..." fallback while lazy component loads', async () => {
+    // Create a lazy component that takes time to resolve
+    const LazyComponent = lazy(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(() => {
+            resolve({
+              default: () => <div>Loaded Content</div>,
+            } as never);
+          }, 100);
+        }),
+    );
+
+    renderWithRouter(
+      <Routes>
+        <Route element={<AppShellModule.AppShell />} path="*">
+          <Route index element={<LazyComponent />} />
+        </Route>
+      </Routes>,
+    );
+
+    // Loading fallback should be visible initially
+    expect(screen.getByText('Loading...')).toBeInTheDocument();
+
+    // Wait for lazy component to resolve and replace the fallback
+    await waitFor(() => expect(screen.queryByText('Loading...')).not.toBeInTheDocument());
+    expect(screen.getByText('Loaded Content')).toBeInTheDocument();
+  });
+
+  it('sidebar is always visible', () => {
+    renderWithRouter(
+      <Routes>
+        <Route element={<AppShellModule.AppShell />} path="*">
+          <Route index element={<div>Test Content</div>} />
+        </Route>
+      </Routes>,
+    );
+
+    const sidebar = screen.getByRole('complementary');
+    expect(sidebar).toBeVisible();
+  });
+
+  it('renders navigation links in sidebar', () => {
+    renderWithRouter(
+      <Routes>
+        <Route element={<AppShellModule.AppShell />} path="*">
+          <Route index element={<div>Test Content</div>} />
+        </Route>
+      </Routes>,
+    );
+
+    // All navigation links should be present
+    expect(screen.getByRole('link', { name: /^project$/i })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /^budget$/i })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /^schedule$/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^settings$/i })).toBeInTheDocument();
+  });
+
+  it('renders floating menu button for mobile sidebar toggle', () => {
+    renderWithRouter(
+      <Routes>
+        <Route element={<AppShellModule.AppShell />} path="*">
+          <Route index element={<div>Test Content</div>} />
+        </Route>
+      </Routes>,
+    );
+
+    const fab = screen.getByTestId('menu-fab');
+    expect(fab).toBeInTheDocument();
+    expect(fab).toHaveAttribute('type', 'button');
+  });
+
+  it('floating menu button has data-testid and type="button"', () => {
+    renderWithRouter(
+      <Routes>
+        <Route element={<AppShellModule.AppShell />} path="*">
+          <Route index element={<div>Test Content</div>} />
+        </Route>
+      </Routes>,
+    );
+
+    const fab = screen.getByTestId('menu-fab');
+    expect(fab).toBeInTheDocument();
+    expect(fab).toHaveAttribute('type', 'button');
+    expect(fab).toHaveAttribute('aria-label', 'Open menu');
+  });
+
+  it('overlay is not visible initially (sidebar starts closed)', () => {
+    renderWithRouter(
+      <Routes>
+        <Route element={<AppShellModule.AppShell />} path="*">
+          <Route index element={<div>Test Content</div>} />
+        </Route>
+      </Routes>,
+    );
+
+    // Overlay should not exist in DOM when sidebar is closed
+    const overlay = document.querySelector('[data-testid="sidebar-overlay"]');
+    expect(overlay).not.toBeInTheDocument();
+  });
+
+  it('clicking menu button toggles sidebar open (overlay becomes visible)', async () => {
+    const user = userEvent.setup();
+    renderWithRouter(
+      <Routes>
+        <Route element={<AppShellModule.AppShell />} path="*">
+          <Route index element={<div>Test Content</div>} />
+        </Route>
+      </Routes>,
+    );
+
+    const menuButton = screen.getByRole('button', { name: /open menu/i });
+    await user.click(menuButton);
+
+    // Overlay should now exist in DOM
+    const overlay = document.querySelector('[data-testid="sidebar-overlay"]');
+    expect(overlay).toBeInTheDocument();
+  });
+
+  it('clicking overlay closes the sidebar', async () => {
+    const user = userEvent.setup();
+    renderWithRouter(
+      <Routes>
+        <Route element={<AppShellModule.AppShell />} path="*">
+          <Route index element={<div>Test Content</div>} />
+        </Route>
+      </Routes>,
+    );
+
+    // Open sidebar
+    const menuButton = screen.getByRole('button', { name: /open menu/i });
+    await user.click(menuButton);
+
+    // Verify overlay exists
+    let overlay = document.querySelector('[data-testid="sidebar-overlay"]');
+    expect(overlay).toBeInTheDocument();
+
+    // Click overlay to close
+    await user.click(overlay as HTMLElement);
+
+    // Overlay should be removed
+    overlay = document.querySelector('[data-testid="sidebar-overlay"]');
+    expect(overlay).not.toBeInTheDocument();
+  });
+
+  it('pressing Escape key closes the sidebar when open', async () => {
+    const user = userEvent.setup();
+    renderWithRouter(
+      <Routes>
+        <Route element={<AppShellModule.AppShell />} path="*">
+          <Route index element={<div>Test Content</div>} />
+        </Route>
+      </Routes>,
+    );
+
+    // Open sidebar
+    const menuButton = screen.getByRole('button', { name: /open menu/i });
+    await user.click(menuButton);
+
+    // Verify overlay exists
+    let overlay = document.querySelector('[data-testid="sidebar-overlay"]');
+    expect(overlay).toBeInTheDocument();
+
+    // Press Escape
+    await user.keyboard('{Escape}');
+
+    // Overlay should be removed
+    overlay = document.querySelector('[data-testid="sidebar-overlay"]');
+    expect(overlay).not.toBeInTheDocument();
+  });
+
+  it('sidebar receives isOpen prop correctly when toggled', async () => {
+    const user = userEvent.setup();
+    renderWithRouter(
+      <Routes>
+        <Route element={<AppShellModule.AppShell />} path="*">
+          <Route index element={<div>Test Content</div>} />
+        </Route>
+      </Routes>,
+    );
+
+    const sidebar = screen.getByRole('complementary');
+
+    // Initially sidebar should not have 'open' class
+    expect(sidebar.className).not.toMatch(/open/);
+
+    // Toggle sidebar open
+    const menuButton = screen.getByRole('button', { name: /open menu/i });
+    await user.click(menuButton);
+
+    // Sidebar should now have 'open' class
+    expect(sidebar.className).toMatch(/open/);
+  });
+
+  it('multiple toggles work (open/close/open)', async () => {
+    const user = userEvent.setup();
+    renderWithRouter(
+      <Routes>
+        <Route element={<AppShellModule.AppShell />} path="*">
+          <Route index element={<div>Test Content</div>} />
+        </Route>
+      </Routes>,
+    );
+
+    let menuButton = screen.getByRole('button', { name: /open menu/i });
+
+    // Open
+    await user.click(menuButton);
+    let overlay = document.querySelector('[data-testid="sidebar-overlay"]');
+    expect(overlay).toBeInTheDocument();
+
+    // FAB button should now say "Close menu"
+    menuButton = screen.getByTestId('menu-fab');
+    expect(menuButton).toHaveAttribute('aria-label', 'Close menu');
+
+    // Close
+    await user.click(menuButton);
+    overlay = document.querySelector('[data-testid="sidebar-overlay"]');
+    expect(overlay).not.toBeInTheDocument();
+
+    // Button should now say "Open menu" again
+    menuButton = screen.getByRole('button', { name: /open menu/i });
+
+    // Open again
+    await user.click(menuButton);
+    overlay = document.querySelector('[data-testid="sidebar-overlay"]');
+    expect(overlay).toBeInTheDocument();
+  });
+
+  it('menu button icon changes from ☰ to ✕ when sidebar opens', async () => {
+    const user = userEvent.setup();
+    renderWithRouter(
+      <Routes>
+        <Route element={<AppShellModule.AppShell />} path="*">
+          <Route index element={<div>Test Content</div>} />
+        </Route>
+      </Routes>,
+    );
+
+    // Initially FAB shows hamburger icon
+    const fab = screen.getByTestId('menu-fab');
+    expect(fab).toHaveTextContent('☰');
+
+    // Click to open
+    await user.click(fab);
+
+    // FAB button should now show close icon
+    const fabAfterOpen = screen.getByTestId('menu-fab');
+    expect(fabAfterOpen).toHaveTextContent('✕');
+  });
+
+  it('menu button aria-label changes from "Open menu" to "Close menu" when sidebar opens', async () => {
+    const user = userEvent.setup();
+    renderWithRouter(
+      <Routes>
+        <Route element={<AppShellModule.AppShell />} path="*">
+          <Route index element={<div>Test Content</div>} />
+        </Route>
+      </Routes>,
+    );
+
+    // Initially FAB has "Open menu" label
+    const fab = screen.getByTestId('menu-fab');
+    expect(fab).toHaveAttribute('aria-label', 'Open menu');
+
+    // Click to open
+    await user.click(fab);
+
+    // FAB button should now have "Close menu" label
+    const fabAfterOpen = screen.getByTestId('menu-fab');
+    expect(fabAfterOpen).toHaveAttribute('aria-label', 'Close menu');
+  });
+});

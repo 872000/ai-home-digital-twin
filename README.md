@@ -1,0 +1,152 @@
+# AI Home Digital Twin (evolved from cornerstone)
+
+> This repository builds on [steilerDev/cornerstone](https://github.com/steilerDev/cornerstone)
+> — the self-hosted home-building project manager — and expands it into an
+> **AI Home Digital Twin**: a living, local-first record of your entire home.
+
+## What's new in the Digital Twin edition
+
+Cornerstone already tracks work items, budgets, timelines, and household items
+during construction. The Digital Twin layer (`twin/`, pure Python + SQLite)
+extends that into the *whole life of the home*:
+
+- **Asset & document registry** (`twin/assets.py`) — appliances, fixtures, and
+  systems with brand/model/serial, area assignment, and trade. Receipts,
+  warranties (with expiry tracking), manuals, **floor plans**, and **photos**
+  are registered by local file reference — nothing ever leaves the machine.
+- **Maintenance log** (`twin/maintenance.py`) — every service event with date,
+  task, cost, vendor, and next-due date. Powers "what's due soon" reminders and
+  per-asset lifetime-cost rollups.
+- **Natural-language retrieval** (`twin/query.py`) — ask in plain words:
+  `warranties expiring soon`, `plumbing receipts 2024`, `photos of the kitchen`,
+  `what maintenance is due soon`. A keyword + facet parser turns phrasing into
+  structured queries over the SQLite store.
+- **CLI** (`twin/cli.py`) — `python -m twin.cli ask "expired warranties"`.
+
+```bash
+cd twin
+python -m twin.cli asset add --name "Furnace" --trade hvac --area "House / Basement"
+python -m twin.cli warranty add --title "Furnace 10-yr warranty" --expires-at 2032-01-15 --asset-id 1
+python -m twin.cli maintenance log --task "Annual service" --performed-at 2026-09-15 --asset-id 1 --cost 180
+python -m twin.cli ask "warranties expiring soon"
+```
+
+See `tests/test_twin.py` for the executable spec. Roadmap: embed the twin store
+behind the Cornerstone server API and surface "expiring soon" cards on the
+project dashboard.
+
+---
+
+# cornerstone
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://cornerstone.steiler.dev/img/logo-full-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="https://cornerstone.steiler.dev/img/logo-full.svg" />
+    <img src="https://cornerstone.steiler.dev/img/logo-full.svg" alt="Cornerstone" width="400" />
+  </picture>
+</p>
+
+[![GitHub Release](https://img.shields.io/github/v/release/steilerDev/cornerstone?label=release)](https://github.com/steilerDev/cornerstone/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/steilerDev/cornerstone/ci.yml?branch=main&label=CI)](https://github.com/steilerDev/cornerstone/actions/workflows/ci.yml)
+[![Docker Image](https://img.shields.io/docker/v/steilerdev/cornerstone?label=Docker&sort=semver)](https://hub.docker.com/r/steilerdev/cornerstone)
+
+A self-hosted home building project management tool for homeowners. Track work items, manage budgets across multiple financing sources, visualize your timeline on a Gantt chart, and organize everything by area and trade -- all from a single Docker container backed by SQLite. No external database or cloud service required.
+
+> [!NOTE]
+> This project is completely written using an Agentic Developmen Workflow with Claude Code and [Docker Sandbox VMs](https://docs.docker.com/ai/sandboxes/get-started/).
+>
+> It is a playground to better understand how to fully utilize the coding capabilities of modern LLMs, while applying Software Engineering best practices to create quality and maintainable code. My plan is to write as little code as possible by hand, but rely on a set of agents to build this application.
+>
+> The project scope is time-limited (I'm currently in need for this tool and probably won't be after) and feature limited - which is why I'm not necessarily concerned about long-term maintainability and/or overall code quality.
+>
+> After having spend a couple of weeks on this project, I'm both blown away by the LLM capabilities, while still feeling that things don't move as fast and reliable as I would like them to be.
+>
+> Key learnings so far:
+>
+> - In order to coding agents to produce good work, verification is very important.
+> - Good work will cost a lot of tokens!
+> - Clearly defining the process through skills and agents simplifies the UX for the developer and ensures coding happens along a happy path.
+> - Parallel work is important - using git worktrees for this should be natively supported by coding agents.
+> - Running coding agents on your host is dangerous! They can (and will) go wild and perform tasks that you would have never thought of and they are clever in bypassing restrictions. An [isolated environment](https://docs.docker.com/ai/sandboxes/) is crucial to provide agents with clear restrictions and reduce the blast radius in case something goes wrong - Coding Agent Governance will be a critical capability moving forward!
+> - In order to follow a policy, it needs correct enforcement - nicely asking an agent to follow it will not always work: Make sure your CI, Repository and Deployment process have enforced quality gates with no way for the agent to bypass them .
+
+**[Full documentation →](https://steilerDev.github.io/cornerstone/)**
+
+## Features
+
+- **Work Items** -- Manage construction tasks with statuses, dates, area assignments, notes, subtasks, dependencies, and keyboard shortcuts -- every work item shows its full area ancestor path (e.g. `House / Ground Floor / Kitchen`) as a breadcrumb across lists, detail pages, pickers, and every place it is referenced
+- **Areas & Trades** -- Organize your project with hierarchical areas (rooms, floors, zones) and trade specialties (Electrical, Plumbing, etc.) for vendors; a dedicated "No Area" filter surfaces items that have not been classified yet
+- **Budget Management** -- Budget categories, financing sources with inline expansion and mass-move of attached lines, multi-budget-line invoice linking with itemized amounts, inline editing of invoice-linked budget lines (including moving a line to a different work item or household item), staged-payment deposits for invoices paid in instalments (deposit-aware paid/claimed rollups), subsidies with caps that can target specific categories, uncategorized items, or your whole project, quotation tracking, and an area-grouped overview dashboard with source attribution badges on every line, a per-source filter (URL-persisted, server-side) that updates totals and subsidy math, a Cost Basis filter (All / Paid / Outstanding) that reframes the breakdown around what you have actually spent versus what is left to pay, clickable summary tiles, and print-friendly export
+- **Bank Reports** -- Generate a formatted PDF for a financing source -- a claim submission, a proof-of-funds statement, or a budget overview -- with an editable cover letter, configurable table columns, and optional AI-drafted content
+- **Auto-itemize Invoices** -- Read line items off invoice PDFs (via Paperless OCR) using any OpenAI-compatible LLM provider (Gemini, Anthropic, OpenAI, Ollama) on a dedicated review page with side-by-side PDF preview, per-row category/funding/assignment pickers, and the ability to merge several related rows into one consolidated line -- or create a whole invoice straight from a Paperless document, with metadata, vendor, and VAT-grossed-up line items extracted in one step -- opt-in, no vendor lock-in, costs pennies per invoice
+- **Timeline & Gantt Chart** -- Interactive Gantt chart with dependency arrows, critical path, zoom controls, milestones, and CPM-based auto-scheduling
+- **Calendar View** -- Monthly and weekly calendar grids with work items and milestones
+- **Household Items** -- Track furniture, appliances, and fixtures with categories, area assignment, delivery scheduling, budget integration, and work item linking
+- **Project Dashboard** -- At-a-glance project health with budget, timeline, invoice, and subsidy cards, mini Gantt preview, and customizable layout
+- **Construction Diary** -- Daily logs (with optional vendor and work start/end time plus computed duration), site visits, delivery records, automatic system events, mobile-first photo capture tagged with area and compass orientation, in-browser touch-enabled annotation (rectangles, arrows, text, measurements, freehand), auto-saved drafts, and digital signature capture
+- **Document Integration** -- Browse and link documents from Paperless-ngx to work items, household items, and invoices, with a system-wide "hide already-linked" filter to surface unfiled documents and a discoverable unlink action on each linked-document card
+- **Advanced List Views** -- Filter, sort, paginate, and customize columns across all list pages with the shared DataTable system
+- **Backup & Restore** -- Manual and scheduled backups with configurable retention, restore from the settings UI
+- **Internationalization** -- English and German language support with automatic locale detection, including translated category names
+- **Authentication** -- Local accounts with setup wizard, OIDC single sign-on
+- **User Management** -- Admin and Member roles, admin panel
+- **Dark Mode** -- Light, Dark, or System theme
+
+## Quick Start
+
+```bash
+docker run -d \
+  --name cornerstone \
+  -p 3000:3000 \
+  -v cornerstone-data:/app/data \
+  -v cornerstone-backups:/backups \
+  steilerdev/cornerstone:latest
+```
+
+Open `http://localhost:3000` -- the setup wizard will guide you through creating your admin account. See the [full deployment guide](https://steilerDev.github.io/cornerstone/getting-started/docker-setup) for Docker Compose, reverse proxy, OIDC, and [scheduled-backup configuration](https://steilerDev.github.io/cornerstone/guides/backup/).
+
+## Roadmap
+
+- [x] **EPIC-02**: Application Shell and Infrastructure
+- [x] **EPIC-11**: CI/CD Infrastructure
+- [x] **EPIC-01**: Authentication and User Management
+- [x] **EPIC-03**: Work Items
+- [x] **EPIC-12**: Design System Bootstrap
+- [x] **EPIC-05**: Budget Management
+- [x] **EPIC-06**: Timeline and Gantt Chart
+- [x] **EPIC-08**: Paperless-ngx Integration
+- [x] **EPIC-04**: Household Items
+- [x] **EPIC-07**: Reporting and Export
+- [x] **EPIC-10**: UX Polish and Accessibility
+- [x] **EPIC-11**: Unified Tag and Category System
+- [x] **EPIC-12**: Codebase Refinement and Consistency
+- [x] **EPIC-14**: Cross-Entity Code Deduplication
+- [x] **EPIC-15**: Budget-Line Invoice Linking Rework
+- [x] **EPIC-09**: Dashboard and Overview
+- [x] **EPIC-13**: Construction Diary
+- [x] **EPIC-17**: Internationalization (English + German)
+- [x] **EPIC-18**: Areas & Trades
+- [x] DataTable & List View Overhaul
+- [x] Backup & Restore
+- [x] Auto-itemize Invoices (LLM)
+- [x] Photo Annotation Editor (Shottr-style markup on diary photos)
+- [ ] **EPIC-16**: Floor Plans & Utility Tracking
+
+Track live progress on the [GitHub Projects board](https://github.com/users/steilerDev/projects/4).
+
+## Documentation
+
+| Resource                                                      | Description                                |
+| ------------------------------------------------------------- | ------------------------------------------ |
+| [Docs site](https://steilerDev.github.io/cornerstone/)        | User guides, deployment, getting started   |
+| [GitHub Wiki](https://github.com/steilerDev/cornerstone/wiki) | Architecture, API contract, schema, ADRs   |
+| [CLAUDE.md](CLAUDE.md)                                        | Agent instructions and project conventions |
+
+## Contributing
+
+Cornerstone is a personal project built primarily through an agentic development workflow. If you have questions or suggestions, feel free to [open an issue](https://github.com/steilerDev/cornerstone/issues).
+
+## License
+
+This project is not currently published under an open-source license.

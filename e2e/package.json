@@ -1,0 +1,19 @@
+{
+  "name": "@cornerstone/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "npx playwright test",
+    "test:smoke": "npx playwright test --grep @smoke --project desktop",
+    "test:shard": "npx playwright test --shard=$SHARD_INDEX/$SHARD_TOTAL",
+    "test:report": "npx playwright show-report",
+    "merge-reports": "npx playwright merge-reports --reporter html,list ./all-blob-reports",
+    "screenshots": "npx playwright test tests/screenshots/ --project=desktop"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "@types/node": "26.4.1",
+    "testcontainers": "12.1.0"
+  }
+}

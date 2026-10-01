@@ -1,0 +1,111 @@
+/**
+ * Subsidy program types and interfaces.
+ * Subsidy programs represent government or institutional programs that reduce
+ * construction costs through percentage or fixed-amount reductions.
+ */
+
+import type { BudgetCategory } from './budgetCategory.js';
+import type { UserSummary } from './workItem.js';
+import type { SubsidyPaybackEntry } from './budget.js';
+
+/**
+ * The type of cost reduction applied by a subsidy program.
+ */
+export type SubsidyReductionType = 'percentage' | 'fixed';
+
+/**
+ * The current application status of a subsidy program.
+ */
+export type SubsidyApplicationStatus =
+  'eligible' | 'applied' | 'approved' | 'received' | 'rejected';
+
+/**
+ * Subsidy program entity as returned by the API.
+ * applicableCategories lists all budget categories this program applies to.
+ */
+export interface SubsidyProgram {
+  id: string;
+  name: string;
+  description: string | null;
+  eligibility: string | null;
+  reductionType: SubsidyReductionType;
+  reductionValue: number;
+  applicationStatus: SubsidyApplicationStatus;
+  applicationDeadline: string | null;
+  notes: string | null;
+  maximumAmount: number | null;
+  applicableCategories: BudgetCategory[];
+  includesNoCategoryItems: boolean;
+  createdBy: UserSummary | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Request body for creating a new subsidy program.
+ */
+export interface CreateSubsidyProgramRequest {
+  name: string;
+  reductionType: SubsidyReductionType;
+  reductionValue: number;
+  description?: string | null;
+  eligibility?: string | null;
+  applicationStatus?: SubsidyApplicationStatus;
+  applicationDeadline?: string | null;
+  notes?: string | null;
+  maximumAmount?: number | null;
+  categoryIds?: string[];
+  includesNoCategoryItems?: boolean;
+}
+
+/**
+ * Request body for updating a subsidy program.
+ * All fields are optional; at least one must be provided.
+ */
+export interface UpdateSubsidyProgramRequest {
+  name?: string;
+  reductionType?: SubsidyReductionType;
+  reductionValue?: number;
+  description?: string | null;
+  eligibility?: string | null;
+  applicationStatus?: SubsidyApplicationStatus;
+  applicationDeadline?: string | null;
+  notes?: string | null;
+  maximumAmount?: number | null;
+  categoryIds?: string[];
+  includesNoCategoryItems?: boolean;
+}
+
+/**
+ * Response for GET /api/subsidy-programs - list all programs.
+ */
+export interface SubsidyProgramListResponse {
+  subsidyPrograms: SubsidyProgram[];
+}
+
+/**
+ * Response for single-program endpoints (POST, GET by ID, PATCH).
+ */
+export interface SubsidyProgramResponse {
+  subsidyProgram: SubsidyProgram;
+}
+
+/**
+ * Per-subsidy payback entry returned in the work item subsidy payback response.
+ * min and max reflect the confidence margin range for non-invoiced budget lines.
+ * For fixed subsidies and fully-invoiced lines, minPayback === maxPayback.
+ */
+export type WorkItemSubsidyPaybackEntry = SubsidyPaybackEntry;
+
+/**
+ * Response for GET /api/work-items/:workItemId/subsidy-payback
+ */
+export interface WorkItemSubsidyPaybackResponse {
+  workItemId: string;
+  /** Minimum total payback across all non-rejected linked subsidies. */
+  minTotalPayback: number;
+  /** Maximum total payback across all non-rejected linked subsidies. */
+  maxTotalPayback: number;
+  /** Per-subsidy breakdown. Empty array when no subsidies are linked. */
+  subsidies: WorkItemSubsidyPaybackEntry[];
+}

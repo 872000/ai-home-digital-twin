@@ -1,0 +1,133 @@
+import { defineConfig, devices } from '@playwright/test';
+
+/**
+ * Read environment variables from file.
+ * https://github.com/motdotla/dotenv
+ */
+// import dotenv from 'dotenv';
+// dotenv.config({ path: path.resolve(__dirname, '.env') });
+
+/**
+ * See https://playwright.dev/docs/test-configuration.
+ */
+export default defineConfig({
+  testDir: './tests',
+  outputDir: './playwright-output',
+
+  /* Run tests in files in parallel */
+  fullyParallel: true,
+
+  /* Fail the build on CI if you accidentally left test.only in the source code. */
+  forbidOnly: !!process.env.CI,
+
+  /* Retry on CI only */
+  retries: process.env.CI ? 1 : 0,
+
+  /* CI workers: 2 on ubuntu-latest (2 vCPUs). With 16 shards splitting the
+     suite, each shard runs ~1-2 test files. Halved from 4 to reduce CPU
+     contention that caused desktop tests to hit the 10s timeout. */
+  workers: process.env.CI ? 2 : undefined,
+
+  /* Reporter to use. See https://playwright.dev/docs/test-reporters
+     When sharding, use blob reporter so reports can be merged across shards. */
+  reporter: process.env.SHARD_INDEX
+    ? [['blob', { outputDir: 'blob-report' }], ['list']]
+    : [['html', { outputFolder: 'playwright-report' }], ['dot']],
+
+  /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
+  use: {
+    /* Base URL to use in actions like `await page.goto('/')`. */
+    baseURL: process.env.APP_BASE_URL || 'http://localhost:3000',
+
+    /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
+    trace: 'retain-on-failure',
+
+    /* Take screenshot only on failure */
+    screenshot: 'only-on-failure',
+
+    /* Record video on failure for CI debugging */
+    video: 'retain-on-failure',
+
+    /* Fail click()/fill() fast instead of falling through to test timeout */
+    actionTimeout: 5000,
+
+    /* Fail page.goto() at 10s instead of test timeout */
+    navigationTimeout: 10000,
+  },
+
+  /* Global setup and teardown */
+  globalSetup: './containers/setup.ts',
+  globalTeardown: './containers/teardown.ts',
+
+  /* Configure projects for major browsers */
+  projects: [
+    // Authentication setup project - runs first
+    {
+      name: 'auth-setup',
+      testDir: '.',
+      testMatch: /auth\.setup\.ts/,
+      timeout: 120000, // 2 minutes for setup
+    },
+
+    // Desktop (1920x1080, chromium) — all tests
+    {
+      name: 'desktop',
+      dependencies: ['auth-setup'],
+      expect: { timeout: 7_000 }, // React SPA transitions need more than the 5s default
+      use: {
+        ...devices['Desktop Chrome'],
+        viewport: { width: 1920, height: 1080 },
+        storageState: 'test-results/.auth/admin.json',
+      },
+    },
+
+    // Tablet (iPad Gen 7, webkit) — @responsive tests, provides webkit engine + tablet layout coverage
+    {
+      name: 'tablet',
+      dependencies: ['auth-setup'],
+      grep: /@responsive/,
+      timeout: 30_000, // 2x desktop — WebKit is slightly slower than Chromium
+      expect: { timeout: 10_000 }, // 2x desktop expect timeout
+      use: {
+        ...devices['iPad (gen 7)'],
+        storageState: 'test-results/.auth/admin.json',
+        actionTimeout: 10_000, // 2x desktop action timeout
+        navigationTimeout: 10_000, // matches desktop navigation timeout
+      },
+    },
+
+    // Mobile (iPhone 13, webkit) — only @responsive-tagged tests
+    {
+      name: 'mobile',
+      dependencies: ['auth-setup'],
+      grep: /@responsive/,
+      timeout: 30_000, // 2x desktop — WebKit is slightly slower than Chromium
+      expect: { timeout: 10_000 }, // 2x desktop expect timeout
+      use: {
+        ...devices['iPhone 13'],
+        storageState: 'test-results/.auth/admin.json',
+        actionTimeout: 10_000, // 2x desktop action timeout
+        navigationTimeout: 10_000, // matches desktop navigation timeout
+      },
+    },
+  ],
+
+  /* Test timeout — most passing tests complete in 2-5s; some multi-step tests need up to 15s */
+  timeout: 15_000, // 15 seconds per test (desktop default)
+
+  /* On main-targeted PRs, stop the shard after the first non-recoverable failure
+     so fail-fast can cancel the remaining shards immediately.
+     Verified (bug #1829, Playwright 1.61.1 runner/dispatcher.ts _reportTestEnd):
+     maxFailures only counts a test once it has exhausted ALL of its `retries` and
+     is still 'unexpected' — a test that fails on attempt 1 but passes on retry
+     ("flaky") never increments the failure count. This already gives one
+     retry-passing test a pass before cancelling the run; a genuinely flaky test
+     does not need special-casing here. Only a test that fails on every attempt
+     (a real bug, or a test with a real race) trips this. See
+     https://playwright.dev/docs/test-timeouts and the dispatcher source for the
+     exact accounting. */
+  maxFailures: process.env.E2E_FAIL_FAST ? 1 : undefined,
+
+  /* Global timeout: cap the entire suite at 30 minutes on CI to prevent stuck runs */
+  globalTimeout: process.env.CI ? 30 * 60 * 1000 : undefined,
+});

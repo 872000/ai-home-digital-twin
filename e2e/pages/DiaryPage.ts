@@ -1,0 +1,300 @@
+/**
+ * Page Object Model for the Construction Diary list page (/diary)
+ *
+ * The page renders:
+ * - A page header with h1 "Construction Diary" and a subtitle with the total entry count
+ * - A DiaryFilterBar with search input (data-testid="diary-search-input"), date range pickers,
+ *   entry type chip filters, a "Drafts" toggle chip (data-testid="status-filter-drafts"),
+ *   and a "Clear all" button
+ * - A "New Entry" link button navigating to /diary/new
+ * - A timeline of DiaryDateGroup sections (data-testid="date-group-{date}"), each containing
+ *   DiaryEntryCard links (data-testid="diary-card-{id}")
+ * - An empty state (class emptyState from shared.module.css) with a "Create your first entry" link
+ * - A live region (role="status") that announces loaded entry count and batch-append/end-of-list
+ *   status (Issue #2060)
+ * - Infinite scroll (Issue #2060): the numbered pager is gone entirely (no `?page=` URL param, no
+ *   prev/next buttons). `InfiniteScrollFooter` is a generic component parameterized by a
+ *   `testIdPrefix` prop (`DiaryPage` passes `testIdPrefix="diary"`), so all its testids are
+ *   `diary-*`: root container `data-testid="diary-footer"`, rendered only when
+ *   `entries.length > 0`, containing (in DOM order): a 0-dimension `aria-hidden` sentinel
+ *   (data-testid="diary-sentinel") observed via IntersectionObserver to auto-trigger the next
+ *   batch; a `FormError` banner (role="alert") on `status === 'error'`; and either the
+ *   always-present "Load more"/"Retry" button (data-testid="diary-load-more-button", same DOM
+ *   node across idle/loading/error states, only unmounted once `status === 'done'` — its own
+ *   inline `Spinner` is the ONLY loading indicator now, the separate standalone loading status
+ *   row was removed) or the end-of-list message (data-testid="diary-end-of-list") once done.
+ *
+ * Key DOM observations from source:
+ * - h1 has class styles.title (CSS module), not a data-testid; use role heading
+ * - Empty state uses shared.emptyState CSS module class, not a data-testid
+ * - Date group sections: data-testid="date-group-YYYY-MM-DD"
+ * - Entry cards: data-testid="diary-card-{id}" (rendered as <Link>)
+ * - Filter bar wrapper: data-testid="diary-filter-bar"
+ * - Search input: data-testid="diary-search-input" (also id="diary-search")
+ * - Type chips: data-testid="type-filter-{type}"
+ * - Clear filters: data-testid="clear-filters-button"
+ * - Draft badge on entry card: data-testid="draft-badge-{id}"
+ * - Draft entries link to /diary/:id/edit (not /diary/:id)
+ * - Drafts chip: data-testid="status-filter-drafts" with aria-pressed="true" (default, shows all)
+ *   or aria-pressed="false" (hides drafts, adds ?status=saved to URL)
+ */
+
+import type { Page, Locator } from '@playwright/test';
+
+export const DIARY_ROUTE = '/diary';
+
+export class DiaryPage {
+  readonly page: Page;
+
+  // Page header
+  readonly heading: Locator;
+  readonly subtitle: Locator;
+
+  // Filter bar
+  readonly filterBar: Locator;
+  readonly searchInput: Locator;
+  readonly dateFromInput: Locator;
+  readonly dateToInput: Locator;
+  readonly clearFiltersButton: Locator;
+
+  // "New Entry" button
+  readonly newEntryButton: Locator;
+
+  // Timeline and entry cards
+  readonly timeline: Locator;
+
+  // Empty state — uses shared.emptyState CSS module; .first() to avoid strict-mode collision
+  // with child elements that may also carry an "emptyState" class token
+  readonly emptyState: Locator;
+
+  // Error banner
+  readonly errorBanner: Locator;
+
+  // Infinite scroll footer (Issue #2060) — replaces the numbered pager
+  readonly loadMoreButton: Locator;
+  readonly endOfListMessage: Locator;
+  readonly infiniteScrollSentinel: Locator;
+  readonly footerError: Locator;
+
+  // "Drafts" toggle chip — data-testid="status-filter-drafts" (added in #1446)
+  // aria-pressed="true"  → all entries shown (default)
+  // aria-pressed="false" → only saved entries shown (?status=saved in URL)
+  readonly draftsChip: Locator;
+
+  // Mobile filter toggle button (visible only on mobile, aria-label="Toggle filters")
+  readonly mobileFilterToggle: Locator;
+
+  constructor(page: Page) {
+    this.page = page;
+
+    this.heading = page.getByRole('heading', { level: 1, name: 'Construction Diary' });
+    // The subtitle is a <p> sibling of the heading inside the header element
+    this.subtitle = page.locator('[class*="subtitle"]');
+
+    this.filterBar = page.getByTestId('diary-filter-bar');
+    this.searchInput = page.getByTestId('diary-search-input');
+    this.dateFromInput = page.getByTestId('diary-date-from');
+    this.dateToInput = page.getByTestId('diary-date-to');
+    this.clearFiltersButton = page.getByTestId('clear-filters-button');
+
+    // Drafts chip — added in #1446; replaces the previous hide-drafts-checkbox.
+    // aria-pressed="true" (default) shows all entries; click toggles to aria-pressed="false"
+    // which adds ?status=saved and hides draft entries.
+    this.draftsChip = page.getByTestId('status-filter-drafts');
+
+    this.mobileFilterToggle = page.getByRole('button', { name: 'Toggle filters' });
+
+    this.newEntryButton = page.getByRole('link', { name: 'New Entry', exact: true });
+
+    this.timeline = page.locator('[class*="timeline"]');
+
+    // Empty state — conditional render: `{!isLoading && entries.length === 0 && <div ...>}`
+    // Uses shared.emptyState CSS class. Use .first() in case multiple containers appear.
+    this.emptyState = page.locator('[class*="emptyState"]').first();
+
+    this.errorBanner = page.locator('[class*="bannerError"]');
+
+    // Infinite scroll footer (Issue #2060) — replaces the numbered pager entirely.
+    // InfiniteScrollFooter is generic, parameterized by a `testIdPrefix` prop; DiaryPage passes
+    // testIdPrefix="diary", so its root container is data-testid="diary-footer" (NOT
+    // "diary-infinite-scroll-footer" — that was the pre-genericization hardcoded testid).
+    // Rendered only when entries.length > 0; footerError is scoped to the footer's own
+    // role="alert" banner so it never matches the page-level errorBanner above.
+    this.loadMoreButton = page.getByTestId('diary-load-more-button');
+    this.endOfListMessage = page.getByTestId('diary-end-of-list');
+    this.infiniteScrollSentinel = page.getByTestId('diary-sentinel');
+    this.footerError = page.getByTestId('diary-footer').getByRole('alert');
+  }
+
+  /**
+   * Navigate to the diary list page and wait for the heading to be visible.
+   * No explicit timeout — uses project-level actionTimeout.
+   */
+  async goto(): Promise<void> {
+    await this.page.goto(DIARY_ROUTE);
+    await this.heading.waitFor({ state: 'visible' });
+  }
+
+  /**
+   * Navigate directly to /diary?status=draft (drafts-only filter) and wait for the
+   * heading to be visible. Use this instead of clicking the old status filter chip
+   * (removed in #1435) to assert on draft-only visibility.
+   * No explicit timeout — uses project-level actionTimeout.
+   */
+  async filterDraftsOnly(): Promise<void> {
+    await this.page.goto(`${DIARY_ROUTE}?status=draft`);
+    await this.heading.waitFor({ state: 'visible' });
+  }
+
+  /**
+   * Wait for the page to finish its initial data fetch.
+   * Races: timeline visible, empty state visible, or error banner visible.
+   * No explicit timeout — uses project-level actionTimeout.
+   */
+  async waitForLoaded(): Promise<void> {
+    await Promise.race([
+      this.timeline.waitFor({ state: 'visible' }),
+      this.emptyState.waitFor({ state: 'visible' }),
+      this.errorBanner.waitFor({ state: 'visible' }),
+    ]);
+  }
+
+  /**
+   * Scroll to the bottom of the page to trigger the infinite-scroll sentinel
+   * (Issue #2060) and wait for either a new /api/diary-entries response or the
+   * end-of-list message to appear — whichever happens first. Mirrors the
+   * waitForLoaded() race pattern above. Does not assert anything itself; callers
+   * that need to inspect the specific response (e.g. asserting a page number or
+   * status code) should register their own `page.waitForResponse` before calling
+   * this, since this helper's own listener is not exposed.
+   * No explicit timeout — uses project-level actionTimeout.
+   */
+  async scrollToLoadMore(): Promise<void> {
+    const responsePromise = this.page
+      .waitForResponse((resp) => resp.url().includes('/api/diary-entries'))
+      .catch(() => null);
+    await this.page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await Promise.race([responsePromise, this.endOfListMessage.waitFor({ state: 'visible' })]);
+  }
+
+  /**
+   * Get all entry card locators currently rendered in the timeline.
+   */
+  entryCards(): Locator {
+    return this.page.locator('[data-testid^="diary-card-"]');
+  }
+
+  /**
+   * Get all date group section locators currently rendered.
+   */
+  dateGroups(): Locator {
+    return this.page.locator('[data-testid^="date-group-"]');
+  }
+
+  /**
+   * Get the entry card for a specific entry ID.
+   */
+  entryCard(id: string): Locator {
+    return this.page.getByTestId(`diary-card-${id}`);
+  }
+
+  /**
+   * Get the type filter chip button for the given type.
+   */
+  typeFilterChip(type: string): Locator {
+    return this.page.getByTestId(`type-filter-${type}`);
+  }
+
+  /**
+   * Get the photo count badge on an entry card.
+   * data-testid="photo-count-{id}" — visible only when photoCount > 0.
+   */
+  photoCountBadge(entryId: string): Locator {
+    return this.page.getByTestId(`photo-count-${entryId}`);
+  }
+
+  /**
+   * Get the Draft badge on a specific entry card.
+   * data-testid="draft-badge-{id}" — rendered by DiaryEntryCard when entry.status === 'draft'.
+   */
+  getDraftBadge(entryId: string): Locator {
+    return this.page.getByTestId(`draft-badge-${entryId}`);
+  }
+
+  /**
+   * On mobile (max-width: 767px) the filter panel (containing the search input,
+   * date pickers, and type chips) is hidden behind a toggle button.  Call this
+   * before interacting with any filter control to ensure the panel is expanded.
+   * On desktop/tablet the toggle button is display:none, so isVisible() returns
+   * false and this is a no-op.
+   */
+  async openFiltersIfCollapsed(): Promise<void> {
+    const toggleVisible = await this.mobileFilterToggle.isVisible();
+    if (toggleVisible) {
+      // Only click if the filter panel is currently closed (search input hidden)
+      const searchVisible = await this.searchInput.isVisible();
+      if (!searchVisible) {
+        await this.mobileFilterToggle.click();
+        // Wait for the filter panel to open (search input becomes visible)
+        await this.searchInput.waitFor({ state: 'visible' });
+      }
+    }
+  }
+
+  /**
+   * Returns true if the Drafts chip is currently pressed (aria-pressed="true").
+   * Requires openFiltersIfCollapsed() to have been called first on mobile.
+   */
+  async draftsChipPressed(): Promise<boolean> {
+    const value = await this.draftsChip.getAttribute('aria-pressed');
+    return value === 'true';
+  }
+
+  /**
+   * Type a search query and wait for the debounced API response and DOM update.
+   * The response listener is registered BEFORE the fill action to avoid a race
+   * condition (debounce + API round-trip can fire and complete before the next
+   * line executes, especially on WebKit).
+   * On mobile the filter panel must be opened first via the toggle button.
+   */
+  async search(query: string): Promise<void> {
+    await this.openFiltersIfCollapsed();
+    const responsePromise = this.page.waitForResponse(
+      (resp) => resp.url().includes('/api/diary-entries') && resp.status() === 200,
+    );
+    await this.searchInput.scrollIntoViewIfNeeded();
+    await this.searchInput.waitFor({ state: 'visible' });
+    await this.searchInput.fill(query);
+    await responsePromise;
+    await this.waitForLoaded();
+  }
+
+  /**
+   * Clear the search input and wait for the API response and DOM update.
+   * On mobile the filter panel must be opened first via the toggle button.
+   */
+  async clearSearch(): Promise<void> {
+    await this.openFiltersIfCollapsed();
+    const responsePromise = this.page.waitForResponse(
+      (resp) => resp.url().includes('/api/diary-entries') && resp.status() === 200,
+    );
+    await this.searchInput.clear();
+    await responsePromise;
+    await this.waitForLoaded();
+  }
+
+  /**
+   * Get the total entry count from the subtitle text (e.g. "42 entries").
+   * Returns null if the subtitle is not visible.
+   */
+  async getEntryCount(): Promise<number | null> {
+    try {
+      await this.subtitle.waitFor({ state: 'visible' });
+      const text = await this.subtitle.textContent();
+      const match = text?.match(/(\d+)/);
+      return match ? parseInt(match[1], 10) : null;
+    } catch {
+      return null;
+    }
+  }
+}

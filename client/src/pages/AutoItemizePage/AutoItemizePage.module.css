@@ -1,0 +1,324 @@
+.pageContainer {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.pageHeader {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-dropdown);
+  background: var(--color-bg-primary);
+  border-bottom: 1px solid var(--color-border);
+  padding: var(--spacing-3) var(--spacing-6);
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-4);
+  --auto-itemize-header-height: 72px;
+}
+
+.pageTitle {
+  flex: 1;
+  font-size: var(--font-size-xl);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+  margin: 0;
+}
+
+.breadcrumb {
+  font-size: var(--font-size-sm);
+  color: var(--color-primary);
+  text-decoration: none;
+}
+
+.breadcrumb:hover {
+  text-decoration: underline;
+}
+
+.pageBody {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--spacing-6);
+  padding: var(--spacing-6);
+  /* align-items defaults to stretch — grid items fill the row height.
+     formColumn uses overflow-y: auto to scroll internally; previewColumn
+     fills the height so the PDF iframe (flex: 1) gets a real height. */
+  flex: 1;
+  min-height: 0;
+}
+
+@media (max-width: 860px) {
+  .pageBody {
+    grid-template-columns: 1fr;
+  }
+
+  .previewColumn {
+    order: 2;
+  }
+
+  .formColumn {
+    order: 1;
+  }
+}
+
+.formColumn {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-4);
+  overflow-y: auto;
+  min-height: 0;
+}
+
+@media (max-width: 860px) {
+  .formColumn {
+    overflow-y: visible;
+  }
+}
+
+/* Grid item; default align-items: stretch fills the row height naturally.
+   No position: sticky is needed: the form column has its own internal overflow,
+   so siblings in the grid don't move when it scrolls. */
+.previewColumn {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.metadataCard {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--spacing-4);
+}
+
+.sectionTitle {
+  margin: 0 0 var(--spacing-3) 0;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.fieldRow {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: var(--spacing-2);
+  margin-bottom: var(--spacing-3);
+  overflow-x: hidden;
+}
+
+.fieldRow:last-child {
+  margin-bottom: 0;
+}
+
+.fieldRow > label {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+}
+
+.fieldControl {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-1);
+}
+
+.fieldControl input,
+.fieldControl textarea,
+.fieldControl select {
+  padding: var(--spacing-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+  background-color: transparent;
+  color: var(--color-text-primary);
+}
+
+.fieldControl input:focus-visible,
+.fieldControl textarea:focus-visible,
+.fieldControl select:focus-visible {
+  outline: none;
+  border-color: var(--color-border-focus);
+  box-shadow: var(--shadow-focus);
+}
+
+.fieldControl textarea {
+  font-family: inherit;
+  resize: vertical;
+}
+
+.modeSelector {
+  display: flex;
+  gap: var(--spacing-4);
+}
+
+.modeSelector label {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-1-5);
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+}
+
+.modeSelector input[type='radio'] {
+  cursor: pointer;
+}
+
+.loadingColumn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-4);
+  min-height: 320px;
+}
+
+.analyzingCaption {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+  text-align: center;
+}
+
+.errorColumn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--spacing-4);
+  padding: var(--spacing-8) var(--spacing-6);
+}
+
+.skipLink {
+  position: absolute;
+  left: -9999px;
+}
+
+.skipLink:focus-visible {
+  position: static;
+  display: inline-block;
+  padding: var(--spacing-2) var(--spacing-4);
+  background: var(--color-primary);
+  color: var(--color-primary-text);
+  border-radius: var(--radius-md);
+  text-decoration: none;
+}
+
+.actions {
+  display: flex;
+  gap: var(--spacing-2);
+}
+
+.modalActions {
+  display: flex;
+  gap: var(--spacing-2);
+  margin-top: var(--spacing-4);
+  justify-content: flex-end;
+}
+
+/* PDF Preview Styles */
+
+.pdfPreviewWrapper {
+  position: relative;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.pdfIframe {
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-tertiary);
+  display: block;
+}
+
+.pdfLoadingOverlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-bg-tertiary);
+  border-radius: var(--radius-lg);
+  z-index: var(--z-dropdown);
+}
+
+.pdfFallback {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-secondary);
+  min-height: 200px;
+  padding: var(--spacing-6);
+}
+
+.pdfFallbackLabel {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+.pdfFallbackLink {
+  color: var(--color-primary);
+  text-decoration: none;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  transition: var(--transition-button);
+}
+
+.pdfFallbackLink:hover {
+  color: var(--color-primary-hover);
+  text-decoration: underline;
+}
+
+.pdfFallbackLink:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus);
+  border-radius: var(--radius-sm);
+}
+
+@media (max-width: 860px) {
+  .pdfIframe {
+    min-height: 60vh;
+    height: 60vh;
+    position: static;
+  }
+}
+
+/* Page-level loading state */
+
+.loadingState {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-4);
+  min-height: 320px;
+}
+
+/* Touch targets on mobile */
+@media (max-width: 1023px) {
+  .fieldRow input,
+  .fieldRow select,
+  .fieldControl input,
+  .fieldControl textarea {
+    min-height: 44px;
+  }
+
+  .fieldRow {
+    flex-wrap: wrap;
+  }
+
+  .fieldControl input,
+  .fieldControl textarea,
+  .fieldControl select {
+    min-height: 44px;
+  }
+}

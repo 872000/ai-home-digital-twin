@@ -1,0 +1,335 @@
+/* Base styles — unified from StatusBadge, HouseholdItemStatusBadge, DiaryOutcomeBadge, DiarySeverityBadge */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--spacing-1) var(--spacing-2-5);
+  border-radius: var(--radius-full);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+  line-height: 1;
+  border: none;
+  cursor: default;
+}
+
+/* WorkItemStatus variants */
+.not_started {
+  background-color: var(--color-status-not-started-bg);
+  color: var(--color-status-not-started-text);
+}
+
+.in_progress {
+  background-color: var(--color-status-in-progress-bg);
+  color: var(--color-status-in-progress-text);
+}
+
+.completed {
+  background-color: var(--color-status-completed-bg);
+  color: var(--color-status-completed-text);
+}
+
+/* HouseholdItemStatus variants */
+.planned {
+  background-color: var(--color-hi-status-planned-bg);
+  color: var(--color-hi-status-planned-text);
+}
+
+.purchased {
+  background-color: var(--color-hi-status-purchased-bg);
+  color: var(--color-hi-status-purchased-text);
+}
+
+.scheduled {
+  background-color: var(--color-hi-status-scheduled-bg);
+  color: var(--color-hi-status-scheduled-text);
+}
+
+.arrived {
+  background-color: var(--color-hi-status-arrived-bg);
+  color: var(--color-hi-status-arrived-text);
+}
+
+/* DiaryInspectionOutcome variants */
+.pass {
+  background-color: var(--color-diary-outcome-pass-bg);
+  color: var(--color-diary-outcome-pass-text);
+}
+
+.fail {
+  background-color: var(--color-diary-outcome-fail-bg);
+  color: var(--color-diary-outcome-fail-text);
+}
+
+.conditional {
+  background-color: var(--color-diary-outcome-conditional-bg);
+  color: var(--color-diary-outcome-conditional-text);
+}
+
+/* DiaryIssueSeverity variants */
+.low {
+  background-color: var(--color-diary-severity-low-bg);
+  color: var(--color-diary-severity-low-text);
+}
+
+.medium {
+  background-color: var(--color-diary-severity-medium-bg);
+  color: var(--color-diary-severity-medium-text);
+}
+
+.high {
+  background-color: var(--color-diary-severity-high-bg);
+  color: var(--color-diary-severity-high-text);
+}
+
+.critical {
+  background-color: var(--color-diary-severity-critical-bg);
+  color: var(--color-diary-severity-critical-text);
+}
+
+/* Milestone status variants */
+.milestoneCompleted {
+  background-color: var(--color-status-completed-bg);
+  color: var(--color-status-completed-text);
+}
+
+.milestonePending {
+  background-color: var(--color-status-not-started-bg);
+  color: var(--color-status-not-started-text);
+}
+
+/* Invoice status variants */
+.pending {
+  background-color: var(--color-status-not-started-bg);
+  color: var(--color-status-not-started-text);
+}
+
+.paid {
+  background-color: var(--color-status-completed-bg);
+  color: var(--color-status-completed-text);
+}
+
+.claimed {
+  background-color: var(--color-status-in-progress-bg);
+  color: var(--color-status-in-progress-text);
+}
+
+.quotation {
+  background-color: var(--color-status-blocked-bg);
+  color: var(--color-status-blocked-text);
+}
+
+/* Role badge: Admin */
+.roleAdmin {
+  background-color: var(--color-role-admin-bg);
+  color: var(--color-role-admin-text);
+}
+
+/* Role badge: Member */
+.roleMember {
+  background-color: var(--color-role-member-bg);
+  color: var(--color-role-member-text);
+}
+
+/* User status badge: Active */
+.userActive {
+  background-color: var(--color-user-active-bg);
+  color: var(--color-user-active-text);
+}
+
+/* User status badge: Deactivated/Inactive */
+.userDeactivated {
+  background-color: var(--color-user-inactive-bg);
+  color: var(--color-user-inactive-text);
+}
+
+/* Budget source badge variants (source0–source9, sourceUnassigned) */
+.source0 {
+  background-color: var(--color-source-0-bg);
+  color: var(--color-source-0-text);
+}
+
+.source1 {
+  background-color: var(--color-source-1-bg);
+  color: var(--color-source-1-text);
+}
+
+.source2 {
+  background-color: var(--color-source-2-bg);
+  color: var(--color-source-2-text);
+}
+
+.source3 {
+  background-color: var(--color-source-3-bg);
+  color: var(--color-source-3-text);
+}
+
+.source4 {
+  background-color: var(--color-source-4-bg);
+  color: var(--color-source-4-text);
+}
+
+.source5 {
+  background-color: var(--color-source-5-bg);
+  color: var(--color-source-5-text);
+}
+
+.source6 {
+  background-color: var(--color-source-6-bg);
+  color: var(--color-source-6-text);
+}
+
+.source7 {
+  background-color: var(--color-source-7-bg);
+  color: var(--color-source-7-text);
+}
+
+.source8 {
+  background-color: var(--color-source-8-bg);
+  color: var(--color-source-8-text);
+}
+
+.source9 {
+  background-color: var(--color-source-9-bg);
+  color: var(--color-source-9-text);
+}
+
+.sourceUnassigned {
+  background-color: var(--color-source-0-bg);
+  color: var(--color-source-0-text);
+  font-style: italic;
+}
+
+/* IBL unassigned parent — neutral gray, italic */
+.iblUnassigned {
+  background-color: var(--color-status-not-started-bg);
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
+/* Draft status badge */
+.draft {
+  background-color: var(--color-warning-bg);
+  color: var(--color-text-primary);
+}
+
+/* Warning badge (e.g., "Creating New") */
+.warning {
+  background-color: var(--color-warning-bg);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-warning);
+}
+
+/* Info badge (e.g., "Auto-created") */
+.info {
+  background-color: var(--color-bg-tertiary);
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border);
+}
+
+/* Error badge (e.g., "Merge failed") */
+.error {
+  background-color: var(--color-danger-bg);
+  color: var(--color-danger-text-on-light);
+  border: 1px solid var(--color-danger-border);
+}
+
+/* Success badge (e.g., "Enabled", "Last run succeeded") */
+.success {
+  background-color: var(--color-success-badge-bg);
+  color: var(--color-success-badge-text);
+  border: 1px solid var(--color-success-border);
+}
+
+/* Budget health indicator variants */
+.budgetHealthOnBudget {
+  background-color: var(--color-success-badge-bg);
+  color: var(--color-success-badge-text);
+}
+
+.budgetHealthAtRisk {
+  background-color: var(--color-status-not-started-bg);
+  color: var(--color-status-not-started-text);
+}
+
+.budgetHealthOverBudget {
+  background-color: var(--color-danger-bg-strong);
+  color: var(--color-danger-text-on-light);
+}
+
+/* Schedule health variants (milestones, critical path) */
+.scheduleOnTrack {
+  background-color: var(--color-success-bg);
+  color: var(--color-success-text-on-light);
+}
+
+.scheduleWarning {
+  background-color: var(--color-warning-bg);
+  color: var(--color-text-secondary);
+}
+
+.scheduleAtRisk {
+  background-color: var(--color-danger-bg);
+  color: var(--color-danger-text-on-light);
+}
+
+/* Subsidy pipeline status variants */
+.subsidyEligible {
+  background-color: var(--color-status-not-started-bg);
+  color: var(--color-status-not-started-text);
+}
+
+.subsidyApplied {
+  background-color: var(--color-status-in-progress-bg);
+  color: var(--color-status-in-progress-text);
+}
+
+.subsidyApproved {
+  background-color: var(--color-success-badge-bg);
+  color: var(--color-success-badge-text);
+}
+
+.subsidyRejected {
+  background-color: var(--color-danger-bg);
+  color: var(--color-danger-text-on-light);
+}
+
+/* Document Attachment Type variants */
+.attachmentQuotation {
+  background-color: var(--color-attachment-quotation-bg);
+  color: var(--color-attachment-quotation-text);
+}
+
+.attachmentDeposit {
+  background-color: var(--color-attachment-deposit-bg);
+  color: var(--color-attachment-deposit-text);
+}
+
+.attachmentInvoice {
+  background-color: var(--color-attachment-invoice-bg);
+  color: var(--color-attachment-invoice-text);
+}
+
+/* Overdue flag (Story #2046) — a flag on top of a status badge, never a replacement.
+   Reuses the page's existing "orange = overdue" vocabulary (.summaryCardOverdue). */
+.overdue {
+  background-color: var(--color-warning-badge-bg);
+  color: var(--color-warning-text-on-light);
+}
+
+/* Container-only parent (Story #2046) — muted/italic "not really this bucket"
+   recipe, mirroring .iblUnassigned above. Uses --color-status-not-started-text
+   (not --color-text-muted) to meet WCAG AA contrast on this background — the
+   same token .pending already uses here (8.33:1 light / 4.04:1 dark). */
+.containerOnly {
+  background-color: var(--color-status-not-started-bg);
+  color: var(--color-status-not-started-text);
+  font-style: italic;
+}
+
+/* Responsive */
+@media (max-width: 767px) {
+  .badge {
+    padding: var(--spacing-0-5) var(--spacing-2);
+    font-size: var(--font-size-2xs);
+  }
+}

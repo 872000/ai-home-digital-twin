@@ -1,0 +1,3592 @@
+import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import { randomUUID } from 'node:crypto';
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import { runMigrations } from '../db/migrate.js';
+import * as schema from '../db/schema.js';
+import * as budgetSourceService from './budgetSourceService.js';
+import {
+  NotFoundError,
+  ValidationError,
+  BudgetSourceInUseError,
+  DiscretionarySourceError,
+} from '../errors/AppError.js';
+import type { CreateBudgetSourceRequest, UpdateBudgetSourceRequest } from '@cornerstone/shared';
+import { CONFIDENCE_MARGINS } from '@cornerstone/shared';
+
+describe('Budget Source Service', () => {
+  let sqlite: Database.Database;
+  let db: BetterSQLite3Database<typeof schema>;
+
+  // A test user ID for createdBy fields
+  const TEST_USER_ID = 'user-test-001';
+
+  function createTestDb() {
+    const sqliteDb = new Database(':memory:');
+    sqliteDb.pragma('journal_mode = WAL');
+    sqliteDb.pragma('foreign_keys = ON');
+    runMigrations(sqliteDb);
+    return { sqlite: sqliteDb, db: drizzle(sqliteDb, { schema }) };
+  }
+
+  /**
+   * Insert a test user directly so foreign key references work.
+   */
+  function insertTestUser(userId: string = TEST_USER_ID) {
+    const now = new Date().toISOString();
+    db.insert(schema.users)
+      .values({
+        id: userId,
+        email: `${userId}@example.com`,
+        displayName: 'Test User',
+        passwordHash: 'hashed',
+        role: 'member',
+        authProvider: 'local',
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+  }
+
+  let timestampOffset = 0;
+
+  /**
+   * Helper: Insert a raw budget source directly into the DB for test setup.
+   */
+  function insertRawSource(
+    overrides: Partial<typeof schema.budgetSources.$inferInsert> & {
+      name: string;
+      sourceType?: 'bank_loan' | 'credit_line' | 'savings' | 'other' | 'discretionary';
+      totalAmount?: number;
+    } = { name: 'Test Source' },
+  ) {
+    const id = `src-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+    const ts = new Date(Date.now() + timestampOffset++).toISOString();
+
+    db.insert(schema.budgetSources)
+      .values({
+        id,
+        name: overrides.name,
+        sourceType: overrides.sourceType ?? 'bank_loan',
+        totalAmount: overrides.totalAmount ?? 100000,
+        isDiscretionary: overrides.isDiscretionary ?? false,
+        interestRate: overrides.interestRate ?? null,
+        terms: overrides.terms ?? null,
+        notes: overrides.notes ?? null,
+        reference: overrides.reference ?? null,
+        contactAddress: overrides.contactAddress ?? null,
+        status: overrides.status ?? 'active',
+        createdBy: overrides.createdBy ?? null,
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+
+    return { id, ...overrides, createdAt: ts, updatedAt: ts };
+  }
+
+  let workItemCounter = 0;
+  let householdItemCounter = 0;
+
+  /**
+   * Helper: Insert a household item budget line with a budget_source_id reference.
+   * Used for testing computeUsedAmount and deleteBudgetSource blocking with HI budgets.
+   * NOTE: householdItems requires categoryId (NOT NULL FK); hic-furniture is seeded by migration 0016.
+   */
+  function insertRawHouseholdItemWithSource(
+    sourceId: string,
+    plannedAmount: number,
+  ): { hiId: string; budgetId: string } {
+    const hiId = `hi-src-test-${++householdItemCounter}`;
+    const budgetId = `hi-bud-src-test-${householdItemCounter}`;
+    const ts = new Date(Date.now() + householdItemCounter).toISOString();
+    db.insert(schema.householdItems)
+      .values({
+        id: hiId,
+        name: `Test Household Item ${householdItemCounter}`,
+        categoryId: 'hic-furniture', // seeded by migration 0016
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+    db.insert(schema.householdItemBudgets)
+      .values({
+        id: budgetId,
+        householdItemId: hiId,
+        budgetSourceId: sourceId,
+        plannedAmount,
+        confidence: 'own_estimate',
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+    return { hiId, budgetId };
+  }
+
+  /**
+   * Helper: Insert a work item budget line with a budget_source_id reference.
+   * Used for testing computeUsedAmount and deleteBudgetSource blocking.
+   * NOTE: Story 5.9 — budget data moved from work_items to work_item_budgets.
+   * Returns the budget line ID so callers can attach invoices to it.
+   */
+  function insertRawWorkItemWithSource(
+    sourceId: string,
+    plannedAmount: number | null,
+  ): { wiId: string; budgetId: string } {
+    const wiId = `wi-src-test-${++workItemCounter}`;
+    const budgetId = `bud-src-test-${workItemCounter}`;
+    const ts = new Date(Date.now() + workItemCounter).toISOString();
+    // Create work item first
+    db.insert(schema.workItems)
+      .values({
+        id: wiId,
+        title: `Test Work Item ${workItemCounter}`,
+        status: 'not_started',
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+    // Create budget line referencing the budget source
+    db.insert(schema.workItemBudgets)
+      .values({
+        id: budgetId,
+        workItemId: wiId,
+        budgetSourceId: sourceId,
+        plannedAmount: plannedAmount ?? 0,
+        confidence: 'own_estimate',
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+    return { wiId, budgetId };
+  }
+
+  /**
+   * Helper: Insert a vendor and a claimed invoice against a budget line.
+   * Used for testing computeClaimedAmount.
+   */
+  function insertClaimedInvoice(budgetLineId: string, amount: number): void {
+    const ts = new Date(Date.now() + workItemCounter).toISOString();
+    const vendorId = `vendor-claimed-${++workItemCounter}`;
+    db.insert(schema.vendors)
+      .values({ id: vendorId, name: `Claimed Vendor ${vendorId}`, createdAt: ts, updatedAt: ts })
+      .run();
+    const invoiceId = `inv-claimed-${workItemCounter}`;
+    db.insert(schema.invoices)
+      .values({
+        id: invoiceId,
+        vendorId,
+        amount,
+        date: '2026-01-01',
+        status: 'claimed',
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+    db.insert(schema.invoiceBudgetLines)
+      .values({
+        id: randomUUID(),
+        invoiceId,
+        workItemBudgetId: budgetLineId,
+        itemizedAmount: amount,
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+  }
+
+  /**
+   * Helper: Insert a vendor and a paid invoice against a budget line.
+   * Paid invoices do NOT count as claimed for claimedAmount.
+   */
+  function insertPaidInvoice(budgetLineId: string, amount: number): void {
+    const ts = new Date(Date.now() + workItemCounter).toISOString();
+    const vendorId = `vendor-paid-${++workItemCounter}`;
+    db.insert(schema.vendors)
+      .values({ id: vendorId, name: `Paid Vendor ${vendorId}`, createdAt: ts, updatedAt: ts })
+      .run();
+    const invoiceId = `inv-paid-${workItemCounter}`;
+    db.insert(schema.invoices)
+      .values({
+        id: invoiceId,
+        vendorId,
+        amount,
+        date: '2026-01-01',
+        status: 'paid',
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+    db.insert(schema.invoiceBudgetLines)
+      .values({
+        id: randomUUID(),
+        invoiceId,
+        workItemBudgetId: budgetLineId,
+        itemizedAmount: amount,
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+  }
+
+  /**
+   * Helper: Insert a claimed invoice against a household item budget line.
+   * Used for testing computeClaimedAmount including household items.
+   */
+  function insertClaimedInvoiceForHouseholdItem(budgetLineId: string, amount: number): void {
+    const ts = new Date(Date.now() + householdItemCounter).toISOString();
+    const vendorId = `vendor-hi-claimed-${++householdItemCounter}`;
+    db.insert(schema.vendors)
+      .values({ id: vendorId, name: `HI Claimed Vendor ${vendorId}`, createdAt: ts, updatedAt: ts })
+      .run();
+    const invoiceId = `inv-hi-claimed-${householdItemCounter}`;
+    db.insert(schema.invoices)
+      .values({
+        id: invoiceId,
+        vendorId,
+        amount,
+        date: '2026-01-01',
+        status: 'claimed',
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+    db.insert(schema.invoiceBudgetLines)
+      .values({
+        id: randomUUID(),
+        invoiceId,
+        householdItemBudgetId: budgetLineId,
+        itemizedAmount: amount,
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+  }
+
+  /**
+   * Helper: Insert a paid invoice against a household item budget line.
+   * Used for testing computeUnclaimedAmount including household items.
+   */
+  function insertPaidInvoiceForHouseholdItem(budgetLineId: string, amount: number): void {
+    const ts = new Date(Date.now() + householdItemCounter).toISOString();
+    const vendorId = `vendor-hi-paid-${++householdItemCounter}`;
+    db.insert(schema.vendors)
+      .values({ id: vendorId, name: `HI Paid Vendor ${vendorId}`, createdAt: ts, updatedAt: ts })
+      .run();
+    const invoiceId = `inv-hi-paid-${householdItemCounter}`;
+    db.insert(schema.invoices)
+      .values({
+        id: invoiceId,
+        vendorId,
+        amount,
+        date: '2026-01-01',
+        status: 'paid',
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+    db.insert(schema.invoiceBudgetLines)
+      .values({
+        id: randomUUID(),
+        invoiceId,
+        householdItemBudgetId: budgetLineId,
+        itemizedAmount: amount,
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+  }
+
+  /**
+   * Helper: Insert a vendor invoice that is NOT fully allocated to any budget line.
+   * Creates an invoice with a given amount and optionally links itemized amounts to existing budget lines.
+   * The remainder (invoice.amount - SUM(itemized)) becomes discretionary.
+   */
+  function insertInvoiceWithRemainder(
+    status: 'paid' | 'claimed',
+    invoiceAmount: number,
+    allocations: Array<{ budgetLineId: string; isHouseholdItem?: boolean; itemizedAmount: number }>,
+  ): string {
+    const ts = new Date(Date.now() + workItemCounter).toISOString();
+    const vendorId = `vendor-disc-${++workItemCounter}`;
+    db.insert(schema.vendors)
+      .values({ id: vendorId, name: `Disc Vendor ${vendorId}`, createdAt: ts, updatedAt: ts })
+      .run();
+    const invoiceId = `inv-disc-${workItemCounter}`;
+    db.insert(schema.invoices)
+      .values({
+        id: invoiceId,
+        vendorId,
+        amount: invoiceAmount,
+        date: '2026-01-01',
+        status,
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+    for (const alloc of allocations) {
+      db.insert(schema.invoiceBudgetLines)
+        .values({
+          id: randomUUID(),
+          invoiceId,
+          ...(alloc.isHouseholdItem
+            ? { householdItemBudgetId: alloc.budgetLineId }
+            : { workItemBudgetId: alloc.budgetLineId }),
+          itemizedAmount: alloc.itemizedAmount,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+    }
+    return invoiceId;
+  }
+
+  /**
+   * Get the discretionary system source inserted by migration 0021.
+   */
+  function getDiscretionarySource() {
+    return budgetSourceService.getBudgetSourceById(db, 'discretionary-system');
+  }
+
+  beforeEach(() => {
+    const testDb = createTestDb();
+    sqlite = testDb.sqlite;
+    db = testDb.db;
+    timestampOffset = 0;
+    workItemCounter = 0;
+    householdItemCounter = 0;
+    insertTestUser();
+  });
+
+  afterEach(() => {
+    sqlite.close();
+  });
+
+  // ─── listBudgetSources() ───────────────────────────────────────────────────
+
+  describe('listBudgetSources()', () => {
+    it('returns only the seeded discretionary source when no user sources exist', () => {
+      // Migration 0021 seeds the "Discretionary Funding" system row, so the list is never empty.
+      const result = budgetSourceService.listBudgetSources(db);
+      expect(result).toHaveLength(1);
+      expect(result[0]!.isDiscretionary).toBe(true);
+    });
+
+    it('returns a single source after insertion (plus seeded discretionary source)', () => {
+      insertRawSource({ name: 'Home Loan', sourceType: 'bank_loan', totalAmount: 200000 });
+
+      const result = budgetSourceService.listBudgetSources(db);
+      // 1 inserted + 1 seeded discretionary = 2
+      expect(result).toHaveLength(2);
+      const regular = result.find((s) => !s.isDiscretionary);
+      expect(regular?.name).toBe('Home Loan');
+    });
+
+    it('returns regular sources sorted by name ascending, discretionary last', () => {
+      insertRawSource({ name: 'Zebra Fund', sourceType: 'savings', totalAmount: 5000 });
+      insertRawSource({ name: 'Alpha Bank Loan', sourceType: 'bank_loan', totalAmount: 200000 });
+      insertRawSource({ name: 'Mid Credit Line', sourceType: 'credit_line', totalAmount: 50000 });
+
+      const result = budgetSourceService.listBudgetSources(db);
+      const nonDisc = result.filter((s) => !s.isDiscretionary);
+      expect(nonDisc[0]!.name).toBe('Alpha Bank Loan');
+      expect(nonDisc[1]!.name).toBe('Mid Credit Line');
+      expect(nonDisc[2]!.name).toBe('Zebra Fund');
+      // Discretionary is always last
+      expect(result[result.length - 1]!.isDiscretionary).toBe(true);
+    });
+
+    it('returns all expected fields for a source', () => {
+      insertRawSource({
+        name: 'Primary Loan',
+        sourceType: 'bank_loan',
+        totalAmount: 300000,
+        interestRate: 3.5,
+        terms: '30-year fixed',
+        notes: 'Main financing',
+        status: 'active',
+        createdBy: TEST_USER_ID,
+      });
+
+      const result = budgetSourceService.listBudgetSources(db);
+      // 1 inserted + 1 seeded discretionary = 2
+      expect(result).toHaveLength(2);
+
+      const source = result.find((s) => s.name === 'Primary Loan')!;
+      expect(source.id).toBeDefined();
+      expect(source.name).toBe('Primary Loan');
+      expect(source.sourceType).toBe('bank_loan');
+      expect(source.totalAmount).toBe(300000);
+      expect(source.usedAmount).toBe(0);
+      expect(source.availableAmount).toBe(300000);
+      // New Story 5.11 fields: no claimed invoices → claimedAmount=0, actualAvailable=totalAmount
+      expect(source.claimedAmount).toBe(0);
+      // unclaimedAmount: no paid invoices → 0
+      expect(source.unclaimedAmount).toBe(0);
+      expect(source.actualAvailableAmount).toBe(300000);
+      expect(source.interestRate).toBe(3.5);
+      expect(source.terms).toBe('30-year fixed');
+      expect(source.notes).toBe('Main financing');
+      expect(source.status).toBe('active');
+      expect(source.createdAt).toBeDefined();
+      expect(source.updatedAt).toBeDefined();
+    });
+
+    it('returns createdBy as UserSummary when createdBy user exists', () => {
+      insertRawSource({
+        name: 'Loan With Creator',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+        createdBy: TEST_USER_ID,
+      });
+
+      const result = budgetSourceService.listBudgetSources(db);
+      expect(result[0]!.createdBy).not.toBeNull();
+      expect(result[0]!.createdBy?.id).toBe(TEST_USER_ID);
+      expect(result[0]!.createdBy?.email).toBe(`${TEST_USER_ID}@example.com`);
+    });
+
+    it('returns createdBy as null when createdBy is null', () => {
+      insertRawSource({ name: 'No Creator', sourceType: 'savings', totalAmount: 10000 });
+
+      const result = budgetSourceService.listBudgetSources(db);
+      expect(result[0]!.createdBy).toBeNull();
+    });
+
+    it('computes usedAmount as 0 when no work items reference the source', () => {
+      insertRawSource({ name: 'Computing Loan', sourceType: 'bank_loan', totalAmount: 50000 });
+
+      const result = budgetSourceService.listBudgetSources(db);
+      expect(result[0]!.usedAmount).toBe(0);
+      expect(result[0]!.availableAmount).toBe(50000);
+      // No claimed or paid invoices → both amounts are 0
+      expect(result[0]!.claimedAmount).toBe(0);
+      expect(result[0]!.unclaimedAmount).toBe(0);
+      expect(result[0]!.actualAvailableAmount).toBe(50000);
+    });
+
+    it('computes usedAmount as sum of work item actualCost values', () => {
+      const raw = insertRawSource({
+        name: 'Used Amount Loan',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+      });
+
+      // Insert work items that reference this source
+      insertRawWorkItemWithSource(raw.id, 10000);
+      insertRawWorkItemWithSource(raw.id, 7500.5);
+
+      const result = budgetSourceService.listBudgetSources(db);
+      const source = result.find((s) => s.id === raw.id)!;
+      expect(source.usedAmount).toBe(17500.5);
+      expect(source.availableAmount).toBe(82499.5);
+      // No claimed invoices attached
+      expect(source.claimedAmount).toBe(0);
+      expect(source.actualAvailableAmount).toBe(100000);
+    });
+
+    it('ignores work items with null actualCost in usedAmount calculation', () => {
+      const raw = insertRawSource({
+        name: 'Null Cost Loan',
+        sourceType: 'savings',
+        totalAmount: 50000,
+      });
+
+      // Work item with no actualCost
+      insertRawWorkItemWithSource(raw.id, null);
+
+      const result = budgetSourceService.listBudgetSources(db);
+      const source = result.find((s) => s.id === raw.id)!;
+      expect(source.usedAmount).toBe(0);
+    });
+
+    it('does not count work items from other sources', () => {
+      const rawA = insertRawSource({
+        name: 'Source A',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+      });
+      const rawB = insertRawSource({
+        name: 'Source B',
+        sourceType: 'savings',
+        totalAmount: 20000,
+      });
+
+      insertRawWorkItemWithSource(rawA.id, 5000);
+      insertRawWorkItemWithSource(rawB.id, 3000);
+
+      const result = budgetSourceService.listBudgetSources(db);
+      const sourceA = result.find((s) => s.id === rawA.id)!;
+      const sourceB = result.find((s) => s.id === rawB.id)!;
+
+      expect(sourceA.usedAmount).toBe(5000);
+      expect(sourceB.usedAmount).toBe(3000);
+    });
+
+    it('returns multiple sources with correct data', () => {
+      insertRawSource({ name: 'Loan A', sourceType: 'bank_loan', totalAmount: 100000 });
+      insertRawSource({ name: 'Savings B', sourceType: 'savings', totalAmount: 20000 });
+
+      const result = budgetSourceService.listBudgetSources(db);
+      // 2 inserted + 1 seeded discretionary = 3
+      expect(result).toHaveLength(3);
+    });
+
+    it('returns sources with null interestRate correctly', () => {
+      insertRawSource({ name: 'No Rate Loan', sourceType: 'savings', totalAmount: 5000 });
+
+      const result = budgetSourceService.listBudgetSources(db);
+      expect(result[0]!.interestRate).toBeNull();
+    });
+  });
+
+  // ─── getBudgetSourceById() ─────────────────────────────────────────────────
+
+  describe('getBudgetSourceById()', () => {
+    it('returns a source by ID', () => {
+      const raw = insertRawSource({ name: 'Test Get', sourceType: 'savings', totalAmount: 5000 });
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.id).toBe(raw.id);
+      expect(result.name).toBe('Test Get');
+    });
+
+    it('returns all fields correctly', () => {
+      const raw = insertRawSource({
+        name: 'Full Source',
+        sourceType: 'credit_line',
+        totalAmount: 75000,
+        interestRate: 5.25,
+        terms: '5-year revolving',
+        notes: 'Secondary credit',
+        reference: 'Account #98765',
+        contactAddress: '456 Bank Blvd, Metropolis',
+        status: 'exhausted',
+        createdBy: TEST_USER_ID,
+      });
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.name).toBe('Full Source');
+      expect(result.sourceType).toBe('credit_line');
+      expect(result.totalAmount).toBe(75000);
+      expect(result.usedAmount).toBe(0);
+      expect(result.availableAmount).toBe(75000);
+      // No claimed or paid invoices
+      expect(result.claimedAmount).toBe(0);
+      expect(result.unclaimedAmount).toBe(0);
+      expect(result.actualAvailableAmount).toBe(75000);
+      expect(result.interestRate).toBe(5.25);
+      expect(result.terms).toBe('5-year revolving');
+      expect(result.notes).toBe('Secondary credit');
+      expect(result.reference).toBe('Account #98765');
+      expect(result.contactAddress).toBe('456 Bank Blvd, Metropolis');
+      expect(result.status).toBe('exhausted');
+    });
+
+    it('returns reference/contactAddress as null when not set (toBudgetSource mapping)', () => {
+      const raw = insertRawSource({
+        name: 'No Contact Fields',
+        sourceType: 'other',
+        totalAmount: 1,
+      });
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.reference).toBeNull();
+      expect(result.contactAddress).toBeNull();
+    });
+
+    it('throws NotFoundError when source does not exist', () => {
+      expect(() => {
+        budgetSourceService.getBudgetSourceById(db, 'non-existent-id');
+      }).toThrow(NotFoundError);
+
+      expect(() => {
+        budgetSourceService.getBudgetSourceById(db, 'non-existent-id');
+      }).toThrow('Budget source not found');
+    });
+
+    it('returns createdBy with user data when user exists', () => {
+      const raw = insertRawSource({
+        name: 'With User',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+        createdBy: TEST_USER_ID,
+      });
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.createdBy).not.toBeNull();
+      expect(result.createdBy?.id).toBe(TEST_USER_ID);
+      expect(result.createdBy?.displayName).toBe('Test User');
+    });
+
+    it('returns createdBy as null when no user set', () => {
+      const raw = insertRawSource({ name: 'No User', sourceType: 'other', totalAmount: 1000 });
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.createdBy).toBeNull();
+    });
+
+    it('computes usedAmount from linked work items via getBudgetSourceById', () => {
+      const raw = insertRawSource({
+        name: 'Get By ID Used',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+      });
+
+      insertRawWorkItemWithSource(raw.id, 20000);
+      insertRawWorkItemWithSource(raw.id, 5000);
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.usedAmount).toBe(25000);
+      expect(result.availableAmount).toBe(75000);
+      // No claimed or paid invoices attached to these budget lines
+      expect(result.claimedAmount).toBe(0);
+      expect(result.unclaimedAmount).toBe(0);
+      expect(result.actualAvailableAmount).toBe(100000);
+    });
+  });
+
+  // ─── createBudgetSource() ──────────────────────────────────────────────────
+
+  describe('createBudgetSource()', () => {
+    it('creates a source with required fields only', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'Simple Loan',
+        sourceType: 'bank_loan',
+        totalAmount: 200000,
+      };
+
+      const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+
+      expect(result.id).toBeDefined();
+      expect(result.name).toBe('Simple Loan');
+      expect(result.sourceType).toBe('bank_loan');
+      expect(result.totalAmount).toBe(200000);
+      expect(result.usedAmount).toBe(0);
+      expect(result.availableAmount).toBe(200000);
+      // Newly created source has no claimed or paid invoices
+      expect(result.claimedAmount).toBe(0);
+      expect(result.unclaimedAmount).toBe(0);
+      expect(result.actualAvailableAmount).toBe(200000);
+      expect(result.interestRate).toBeNull();
+      expect(result.terms).toBeNull();
+      expect(result.notes).toBeNull();
+      expect(result.status).toBe('active');
+      expect(result.createdAt).toBeDefined();
+      expect(result.updatedAt).toBeDefined();
+    });
+
+    it('creates a source with all optional fields', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'Full Loan',
+        sourceType: 'credit_line',
+        totalAmount: 50000,
+        interestRate: 3.75,
+        terms: '10-year fixed',
+        notes: 'From First National Bank',
+        status: 'active',
+      };
+
+      const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+
+      expect(result.name).toBe('Full Loan');
+      expect(result.sourceType).toBe('credit_line');
+      expect(result.totalAmount).toBe(50000);
+      expect(result.interestRate).toBe(3.75);
+      expect(result.terms).toBe('10-year fixed');
+      expect(result.notes).toBe('From First National Bank');
+      expect(result.status).toBe('active');
+    });
+
+    it('creates source with all source types', () => {
+      const types: Array<'bank_loan' | 'credit_line' | 'savings' | 'other'> = [
+        'bank_loan',
+        'credit_line',
+        'savings',
+        'other',
+      ];
+
+      for (const sourceType of types) {
+        const result = budgetSourceService.createBudgetSource(
+          db,
+          { name: `Source ${sourceType}`, sourceType, totalAmount: 1000 },
+          TEST_USER_ID,
+        );
+        expect(result.sourceType).toBe(sourceType);
+      }
+    });
+
+    it('trims leading and trailing whitespace from name', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: '  Trimmed Loan  ',
+        sourceType: 'savings',
+        totalAmount: 5000,
+      };
+
+      const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      expect(result.name).toBe('Trimmed Loan');
+    });
+
+    it('defaults status to "active" when not provided', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'Default Status',
+        sourceType: 'bank_loan',
+        totalAmount: 10000,
+      };
+
+      const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      expect(result.status).toBe('active');
+    });
+
+    it('creates source with status "exhausted"', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'Used Up',
+        sourceType: 'savings',
+        totalAmount: 5000,
+        status: 'exhausted',
+      };
+
+      const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      expect(result.status).toBe('exhausted');
+    });
+
+    it('creates source with status "closed"', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'Closed Account',
+        sourceType: 'savings',
+        totalAmount: 5000,
+        status: 'closed',
+      };
+
+      const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      expect(result.status).toBe('closed');
+    });
+
+    it('persists the created source in the database', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'Persisted Loan',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+      };
+
+      const created = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      const fetched = budgetSourceService.getBudgetSourceById(db, created.id);
+
+      expect(fetched.id).toBe(created.id);
+      expect(fetched.name).toBe('Persisted Loan');
+    });
+
+    it('allows interest rate of 0', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'Zero Rate',
+        sourceType: 'savings',
+        totalAmount: 10000,
+        interestRate: 0,
+      };
+
+      const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      expect(result.interestRate).toBe(0);
+    });
+
+    it('allows interest rate of 100', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'Max Rate',
+        sourceType: 'bank_loan',
+        totalAmount: 10000,
+        interestRate: 100,
+      };
+
+      const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      expect(result.interestRate).toBe(100);
+    });
+
+    it('allows interest rate of null (explicitly)', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'Null Rate',
+        sourceType: 'savings',
+        totalAmount: 10000,
+        interestRate: null,
+      };
+
+      const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      expect(result.interestRate).toBeNull();
+    });
+
+    it('creates source with name at exactly 200 characters', () => {
+      const name = 'A'.repeat(200);
+      const data: CreateBudgetSourceRequest = {
+        name,
+        sourceType: 'other',
+        totalAmount: 1000,
+      };
+
+      const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      expect(result.name).toBe(name);
+    });
+
+    it('allows two sources with the same name (no unique constraint)', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'Duplicate Name',
+        sourceType: 'bank_loan',
+        totalAmount: 50000,
+      };
+
+      const r1 = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      const r2 = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+
+      expect(r1.id).not.toBe(r2.id);
+      expect(r1.name).toBe('Duplicate Name');
+      expect(r2.name).toBe('Duplicate Name');
+    });
+
+    // --- Validation errors ---
+
+    it('throws ValidationError for empty name', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: '',
+        sourceType: 'bank_loan',
+        totalAmount: 10000,
+      };
+
+      expect(() => {
+        budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      }).toThrow(ValidationError);
+      expect(() => {
+        budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      }).toThrow('Budget source name must be between 1 and 200 characters');
+    });
+
+    it('throws ValidationError for whitespace-only name', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: '   ',
+        sourceType: 'bank_loan',
+        totalAmount: 10000,
+      };
+
+      expect(() => {
+        budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      }).toThrow(ValidationError);
+    });
+
+    it('throws ValidationError for name exceeding 200 characters', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'A'.repeat(201),
+        sourceType: 'bank_loan',
+        totalAmount: 10000,
+      };
+
+      expect(() => {
+        budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      }).toThrow(ValidationError);
+      expect(() => {
+        budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      }).toThrow('Budget source name must be between 1 and 200 characters');
+    });
+
+    it('throws ValidationError for invalid source type', () => {
+      const data = {
+        name: 'Bad Type',
+        sourceType: 'invalid_type' as 'bank_loan',
+        totalAmount: 10000,
+      };
+
+      expect(() => {
+        budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      }).toThrow(ValidationError);
+      expect(() => {
+        budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      }).toThrow('Invalid source type');
+    });
+
+    it('throws ValidationError for totalAmount of zero', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'Zero Amount',
+        sourceType: 'bank_loan',
+        totalAmount: 0,
+      };
+
+      expect(() => {
+        budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      }).toThrow(ValidationError);
+      expect(() => {
+        budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      }).toThrow('Total amount must be a positive number');
+    });
+
+    it('throws ValidationError for negative totalAmount', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'Negative Amount',
+        sourceType: 'bank_loan',
+        totalAmount: -100,
+      };
+
+      expect(() => {
+        budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      }).toThrow(ValidationError);
+    });
+
+    it('throws ValidationError for interest rate below 0', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'Bad Rate',
+        sourceType: 'bank_loan',
+        totalAmount: 10000,
+        interestRate: -1,
+      };
+
+      expect(() => {
+        budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      }).toThrow(ValidationError);
+      expect(() => {
+        budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      }).toThrow('Interest rate must be between 0 and 100');
+    });
+
+    it('throws ValidationError for interest rate above 100', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'Too High Rate',
+        sourceType: 'bank_loan',
+        totalAmount: 10000,
+        interestRate: 101,
+      };
+
+      expect(() => {
+        budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      }).toThrow(ValidationError);
+    });
+
+    it('throws ValidationError for invalid status', () => {
+      const data = {
+        name: 'Bad Status',
+        sourceType: 'bank_loan' as const,
+        totalAmount: 10000,
+        status: 'invalid_status' as 'active',
+      };
+
+      expect(() => {
+        budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      }).toThrow(ValidationError);
+      expect(() => {
+        budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+      }).toThrow('Invalid status');
+    });
+
+    // ─── reference and contactAddress (Story #1877) ──────────────────────────
+
+    describe('reference and contactAddress', () => {
+      it('persists reference and contactAddress when provided', () => {
+        const data: CreateBudgetSourceRequest = {
+          name: 'With Contact Fields',
+          sourceType: 'bank_loan',
+          totalAmount: 10000,
+          reference: 'Account #12345',
+          contactAddress: '123 Bank St, Springfield',
+        };
+
+        const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+
+        expect(result.reference).toBe('Account #12345');
+        expect(result.contactAddress).toBe('123 Bank St, Springfield');
+      });
+
+      it('defaults reference and contactAddress to null when omitted', () => {
+        const data: CreateBudgetSourceRequest = {
+          name: 'No Contact Fields',
+          sourceType: 'savings',
+          totalAmount: 10000,
+        };
+
+        const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+
+        expect(result.reference).toBeNull();
+        expect(result.contactAddress).toBeNull();
+      });
+
+      it('accepts explicit null for reference and contactAddress', () => {
+        const data: CreateBudgetSourceRequest = {
+          name: 'Explicit Nulls',
+          sourceType: 'savings',
+          totalAmount: 10000,
+          reference: null,
+          contactAddress: null,
+        };
+
+        const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+
+        expect(result.reference).toBeNull();
+        expect(result.contactAddress).toBeNull();
+      });
+
+      it('accepts reference at exactly 200 characters', () => {
+        const reference = 'R'.repeat(200);
+        const data: CreateBudgetSourceRequest = {
+          name: 'Max Reference',
+          sourceType: 'bank_loan',
+          totalAmount: 10000,
+          reference,
+        };
+
+        const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+        expect(result.reference).toBe(reference);
+      });
+
+      it('throws ValidationError when reference exceeds 200 characters', () => {
+        const data: CreateBudgetSourceRequest = {
+          name: 'Too Long Reference',
+          sourceType: 'bank_loan',
+          totalAmount: 10000,
+          reference: 'R'.repeat(201),
+        };
+
+        expect(() => {
+          budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+        }).toThrow(ValidationError);
+        expect(() => {
+          budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+        }).toThrow('Reference must be 200 characters or fewer');
+      });
+
+      it('accepts contactAddress at exactly 500 characters', () => {
+        const contactAddress = 'A'.repeat(500);
+        const data: CreateBudgetSourceRequest = {
+          name: 'Max Address',
+          sourceType: 'bank_loan',
+          totalAmount: 10000,
+          contactAddress,
+        };
+
+        const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+        expect(result.contactAddress).toBe(contactAddress);
+      });
+
+      it('throws ValidationError when contactAddress exceeds 500 characters', () => {
+        const data: CreateBudgetSourceRequest = {
+          name: 'Too Long Address',
+          sourceType: 'bank_loan',
+          totalAmount: 10000,
+          contactAddress: 'A'.repeat(501),
+        };
+
+        expect(() => {
+          budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+        }).toThrow(ValidationError);
+        expect(() => {
+          budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+        }).toThrow('Contact address must be 500 characters or fewer');
+      });
+    });
+  });
+
+  // ─── updateBudgetSource() ──────────────────────────────────────────────────
+
+  describe('updateBudgetSource()', () => {
+    it('updates name only (partial update)', () => {
+      const raw = insertRawSource({
+        name: 'Old Name',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+      });
+
+      const data: UpdateBudgetSourceRequest = { name: 'New Name' };
+      const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+      expect(result.id).toBe(raw.id);
+      expect(result.name).toBe('New Name');
+      expect(result.sourceType).toBe('bank_loan');
+      expect(result.totalAmount).toBe(100000);
+    });
+
+    it('updates sourceType only', () => {
+      const raw = insertRawSource({
+        name: 'Type Update',
+        sourceType: 'bank_loan',
+        totalAmount: 50000,
+      });
+
+      const data: UpdateBudgetSourceRequest = { sourceType: 'credit_line' };
+      const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+      expect(result.sourceType).toBe('credit_line');
+      expect(result.name).toBe('Type Update');
+    });
+
+    it('updates totalAmount only', () => {
+      const raw = insertRawSource({
+        name: 'Amount Update',
+        sourceType: 'savings',
+        totalAmount: 5000,
+      });
+
+      const data: UpdateBudgetSourceRequest = { totalAmount: 15000 };
+      const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+      expect(result.totalAmount).toBe(15000);
+      expect(result.availableAmount).toBe(15000);
+    });
+
+    it('updates interestRate only', () => {
+      const raw = insertRawSource({
+        name: 'Rate Update',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+        interestRate: 3.0,
+      });
+
+      const data: UpdateBudgetSourceRequest = { interestRate: 4.5 };
+      const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+      expect(result.interestRate).toBe(4.5);
+    });
+
+    it('clears interestRate by setting to null', () => {
+      const raw = insertRawSource({
+        name: 'Clear Rate',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+        interestRate: 3.5,
+      });
+
+      const data: UpdateBudgetSourceRequest = { interestRate: null };
+      const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+      expect(result.interestRate).toBeNull();
+    });
+
+    it('updates terms only', () => {
+      const raw = insertRawSource({ name: 'Terms Update', sourceType: 'other', totalAmount: 1000 });
+
+      const data: UpdateBudgetSourceRequest = { terms: '12-month fixed' };
+      const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+      expect(result.terms).toBe('12-month fixed');
+    });
+
+    it('clears terms by setting to null', () => {
+      const raw = insertRawSource({
+        name: 'Clear Terms',
+        sourceType: 'bank_loan',
+        totalAmount: 50000,
+        terms: 'Old terms',
+      });
+
+      const data: UpdateBudgetSourceRequest = { terms: null };
+      const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+      expect(result.terms).toBeNull();
+    });
+
+    it('updates notes only', () => {
+      const raw = insertRawSource({
+        name: 'Notes Update',
+        sourceType: 'credit_line',
+        totalAmount: 20000,
+      });
+
+      const data: UpdateBudgetSourceRequest = { notes: 'Updated notes' };
+      const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+      expect(result.notes).toBe('Updated notes');
+    });
+
+    it('clears notes by setting to null', () => {
+      const raw = insertRawSource({
+        name: 'Clear Notes',
+        sourceType: 'savings',
+        totalAmount: 10000,
+        notes: 'Old notes',
+      });
+
+      const data: UpdateBudgetSourceRequest = { notes: null };
+      const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+      expect(result.notes).toBeNull();
+    });
+
+    it('updates status only', () => {
+      const raw = insertRawSource({ name: 'Status Update', sourceType: 'other', totalAmount: 500 });
+
+      const data: UpdateBudgetSourceRequest = { status: 'closed' };
+      const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+      expect(result.status).toBe('closed');
+    });
+
+    it('updates all fields at once', () => {
+      const raw = insertRawSource({
+        name: 'All Fields',
+        sourceType: 'bank_loan',
+        totalAmount: 100,
+      });
+
+      const data: UpdateBudgetSourceRequest = {
+        name: 'Completely Updated',
+        sourceType: 'savings',
+        totalAmount: 99999,
+        interestRate: 2.5,
+        terms: 'New terms',
+        notes: 'New notes',
+        status: 'exhausted',
+      };
+
+      const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+      expect(result.name).toBe('Completely Updated');
+      expect(result.sourceType).toBe('savings');
+      expect(result.totalAmount).toBe(99999);
+      expect(result.interestRate).toBe(2.5);
+      expect(result.terms).toBe('New terms');
+      expect(result.notes).toBe('New notes');
+      expect(result.status).toBe('exhausted');
+    });
+
+    it('trims whitespace from name on update', () => {
+      const raw = insertRawSource({ name: 'Original', sourceType: 'other', totalAmount: 1000 });
+
+      const data: UpdateBudgetSourceRequest = { name: '  Trimmed  ' };
+      const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+      expect(result.name).toBe('Trimmed');
+    });
+
+    it('sets updatedAt to a new timestamp on update', async () => {
+      const raw = insertRawSource({
+        name: 'Timestamp Test',
+        sourceType: 'savings',
+        totalAmount: 100,
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 1));
+
+      const data: UpdateBudgetSourceRequest = { name: 'Updated Timestamp' };
+      const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+      expect(result.updatedAt).not.toBe(raw.updatedAt);
+    });
+
+    it('allows updating name to the same value', () => {
+      const raw = insertRawSource({
+        name: 'Same Name',
+        sourceType: 'bank_loan',
+        totalAmount: 5000,
+      });
+
+      const data: UpdateBudgetSourceRequest = { name: 'Same Name' };
+      const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+      expect(result.name).toBe('Same Name');
+    });
+
+    it('throws NotFoundError when source does not exist', () => {
+      const data: UpdateBudgetSourceRequest = { name: 'Updated' };
+
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, 'non-existent-id', data);
+      }).toThrow(NotFoundError);
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, 'non-existent-id', data);
+      }).toThrow('Budget source not found');
+    });
+
+    it('throws ValidationError when no fields are provided', () => {
+      const raw = insertRawSource({ name: 'No Fields', sourceType: 'other', totalAmount: 1000 });
+
+      const data: UpdateBudgetSourceRequest = {};
+
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, raw.id, data);
+      }).toThrow(ValidationError);
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, raw.id, data);
+      }).toThrow('At least one field must be provided');
+    });
+
+    it('throws ValidationError for empty name on update', () => {
+      const raw = insertRawSource({
+        name: 'Valid Name',
+        sourceType: 'bank_loan',
+        totalAmount: 1000,
+      });
+
+      const data: UpdateBudgetSourceRequest = { name: '' };
+
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, raw.id, data);
+      }).toThrow(ValidationError);
+    });
+
+    it('throws ValidationError for whitespace-only name on update', () => {
+      const raw = insertRawSource({
+        name: 'Valid Name',
+        sourceType: 'bank_loan',
+        totalAmount: 1000,
+      });
+
+      const data: UpdateBudgetSourceRequest = { name: '   ' };
+
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, raw.id, data);
+      }).toThrow(ValidationError);
+    });
+
+    it('throws ValidationError for name exceeding 200 characters on update', () => {
+      const raw = insertRawSource({
+        name: 'Valid Name',
+        sourceType: 'bank_loan',
+        totalAmount: 1000,
+      });
+
+      const data: UpdateBudgetSourceRequest = { name: 'A'.repeat(201) };
+
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, raw.id, data);
+      }).toThrow(ValidationError);
+    });
+
+    it('throws ValidationError for invalid source type on update', () => {
+      const raw = insertRawSource({ name: 'Valid', sourceType: 'bank_loan', totalAmount: 1000 });
+
+      const data = { sourceType: 'invalid' as 'bank_loan' };
+
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, raw.id, data);
+      }).toThrow(ValidationError);
+    });
+
+    it('throws ValidationError for totalAmount of zero on update', () => {
+      const raw = insertRawSource({ name: 'Valid', sourceType: 'bank_loan', totalAmount: 1000 });
+
+      const data: UpdateBudgetSourceRequest = { totalAmount: 0 };
+
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, raw.id, data);
+      }).toThrow(ValidationError);
+    });
+
+    it('throws ValidationError for negative totalAmount on update', () => {
+      const raw = insertRawSource({ name: 'Valid', sourceType: 'bank_loan', totalAmount: 1000 });
+
+      const data: UpdateBudgetSourceRequest = { totalAmount: -500 };
+
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, raw.id, data);
+      }).toThrow(ValidationError);
+    });
+
+    it('throws ValidationError for interest rate below 0 on update', () => {
+      const raw = insertRawSource({ name: 'Valid', sourceType: 'bank_loan', totalAmount: 1000 });
+
+      const data: UpdateBudgetSourceRequest = { interestRate: -0.1 };
+
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, raw.id, data);
+      }).toThrow(ValidationError);
+    });
+
+    it('throws ValidationError for interest rate above 100 on update', () => {
+      const raw = insertRawSource({ name: 'Valid', sourceType: 'bank_loan', totalAmount: 1000 });
+
+      const data: UpdateBudgetSourceRequest = { interestRate: 100.1 };
+
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, raw.id, data);
+      }).toThrow(ValidationError);
+    });
+
+    it('throws ValidationError for invalid status on update', () => {
+      const raw = insertRawSource({ name: 'Valid', sourceType: 'bank_loan', totalAmount: 1000 });
+
+      const data = { status: 'invalid_status' as 'active' };
+
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, raw.id, data);
+      }).toThrow(ValidationError);
+    });
+
+    // ─── reference and contactAddress (Story #1877) ──────────────────────────
+
+    describe('reference and contactAddress', () => {
+      it('updates reference only (other fields unchanged)', () => {
+        const raw = insertRawSource({
+          name: 'Reference Update',
+          sourceType: 'bank_loan',
+          totalAmount: 10000,
+          contactAddress: 'Original Address',
+        });
+
+        const data: UpdateBudgetSourceRequest = { reference: 'New Reference' };
+        const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+        expect(result.reference).toBe('New Reference');
+        expect(result.contactAddress).toBe('Original Address');
+      });
+
+      it('updates contactAddress only (other fields unchanged)', () => {
+        const raw = insertRawSource({
+          name: 'Address Update',
+          sourceType: 'bank_loan',
+          totalAmount: 10000,
+          reference: 'Original Reference',
+        });
+
+        const data: UpdateBudgetSourceRequest = { contactAddress: 'New Address' };
+        const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+        expect(result.reference).toBe('Original Reference');
+        expect(result.contactAddress).toBe('New Address');
+      });
+
+      it('clears reference by setting it to null', () => {
+        const raw = insertRawSource({
+          name: 'Clear Reference',
+          sourceType: 'bank_loan',
+          totalAmount: 10000,
+          reference: 'To Be Cleared',
+        });
+
+        const data: UpdateBudgetSourceRequest = { reference: null };
+        const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+        expect(result.reference).toBeNull();
+      });
+
+      it('clears contactAddress by setting it to null', () => {
+        const raw = insertRawSource({
+          name: 'Clear Address',
+          sourceType: 'bank_loan',
+          totalAmount: 10000,
+          contactAddress: 'To Be Cleared',
+        });
+
+        const data: UpdateBudgetSourceRequest = { contactAddress: null };
+        const result = budgetSourceService.updateBudgetSource(db, raw.id, data);
+
+        expect(result.contactAddress).toBeNull();
+      });
+
+      it('reference alone satisfies the "at least one field" requirement', () => {
+        const raw = insertRawSource({
+          name: 'Ref Only',
+          sourceType: 'bank_loan',
+          totalAmount: 1000,
+        });
+
+        expect(() => {
+          budgetSourceService.updateBudgetSource(db, raw.id, { reference: 'Some Ref' });
+        }).not.toThrow();
+      });
+
+      it('throws ValidationError when reference exceeds 200 characters on update', () => {
+        const raw = insertRawSource({ name: 'Valid', sourceType: 'bank_loan', totalAmount: 1000 });
+
+        const data: UpdateBudgetSourceRequest = { reference: 'R'.repeat(201) };
+
+        expect(() => {
+          budgetSourceService.updateBudgetSource(db, raw.id, data);
+        }).toThrow(ValidationError);
+        expect(() => {
+          budgetSourceService.updateBudgetSource(db, raw.id, data);
+        }).toThrow('Reference must be 200 characters or fewer');
+      });
+
+      it('throws ValidationError when contactAddress exceeds 500 characters on update', () => {
+        const raw = insertRawSource({ name: 'Valid', sourceType: 'bank_loan', totalAmount: 1000 });
+
+        const data: UpdateBudgetSourceRequest = { contactAddress: 'A'.repeat(501) };
+
+        expect(() => {
+          budgetSourceService.updateBudgetSource(db, raw.id, data);
+        }).toThrow(ValidationError);
+        expect(() => {
+          budgetSourceService.updateBudgetSource(db, raw.id, data);
+        }).toThrow('Contact address must be 500 characters or fewer');
+      });
+    });
+  });
+
+  // ─── deleteBudgetSource() ──────────────────────────────────────────────────
+
+  describe('deleteBudgetSource()', () => {
+    it('deletes a source successfully', () => {
+      const raw = insertRawSource({ name: 'To Delete', sourceType: 'other', totalAmount: 500 });
+
+      budgetSourceService.deleteBudgetSource(db, raw.id);
+
+      expect(() => {
+        budgetSourceService.getBudgetSourceById(db, raw.id);
+      }).toThrow(NotFoundError);
+    });
+
+    it('removes source from the list after deletion', () => {
+      const raw1 = insertRawSource({ name: 'Delete Me', sourceType: 'savings', totalAmount: 1000 });
+      insertRawSource({ name: 'Keep Me', sourceType: 'savings', totalAmount: 2000 });
+
+      const countBefore = budgetSourceService.listBudgetSources(db).length;
+
+      budgetSourceService.deleteBudgetSource(db, raw1.id);
+
+      const result = budgetSourceService.listBudgetSources(db);
+      expect(result).toHaveLength(countBefore - 1);
+      expect(result.find((s) => s.id === raw1.id)).toBeUndefined();
+    });
+
+    it('throws NotFoundError when source does not exist', () => {
+      expect(() => {
+        budgetSourceService.deleteBudgetSource(db, 'non-existent-id');
+      }).toThrow(NotFoundError);
+      expect(() => {
+        budgetSourceService.deleteBudgetSource(db, 'non-existent-id');
+      }).toThrow('Budget source not found');
+    });
+
+    it('BudgetSourceInUseError has code BUDGET_SOURCE_IN_USE and statusCode 409', () => {
+      const err = new BudgetSourceInUseError('Budget source is in use', { budgetLineCount: 3 });
+      expect(err.code).toBe('BUDGET_SOURCE_IN_USE');
+      expect(err.statusCode).toBe(409);
+      expect(err.details?.budgetLineCount).toBe(3);
+    });
+
+    it('does not throw BudgetSourceInUseError when no work items reference the source', () => {
+      const raw = insertRawSource({
+        name: 'Zero Used',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+      });
+
+      expect(() => {
+        budgetSourceService.deleteBudgetSource(db, raw.id);
+      }).not.toThrow();
+    });
+
+    it('cascade-deletes document_links for the budget_source when deleted', () => {
+      const raw = insertRawSource({
+        name: 'To Delete With Docs',
+        sourceType: 'other',
+        totalAmount: 1000,
+      });
+      const now = new Date().toISOString();
+
+      // Insert two document links for this budget source
+      sqlite
+        .prepare(
+          `INSERT INTO document_links (id, entity_type, entity_id, paperless_document_id, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run('dl-bs-1', 'budget_source', raw.id, 10, now);
+      sqlite
+        .prepare(
+          `INSERT INTO document_links (id, entity_type, entity_id, paperless_document_id, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run('dl-bs-2', 'budget_source', raw.id, 20, now);
+
+      // Insert an unrelated document link for a different entity — must NOT be deleted
+      sqlite
+        .prepare(
+          `INSERT INTO document_links (id, entity_type, entity_id, paperless_document_id, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run('dl-other', 'invoice', 'inv-unrelated', 10, now);
+
+      budgetSourceService.deleteBudgetSource(db, raw.id);
+
+      // Budget source links must be gone
+      const budgetSourceLinks = sqlite
+        .prepare(`SELECT id FROM document_links WHERE entity_type='budget_source' AND entity_id=?`)
+        .all(raw.id) as { id: string }[];
+      expect(budgetSourceLinks).toHaveLength(0);
+
+      // Unrelated invoice link must still exist
+      const otherLinks = sqlite
+        .prepare(`SELECT id FROM document_links WHERE id='dl-other'`)
+        .all() as { id: string }[];
+      expect(otherLinks).toHaveLength(1);
+    });
+
+    it('throws BudgetSourceInUseError when work items reference the source', () => {
+      const raw = insertRawSource({
+        name: 'In Use Source',
+        sourceType: 'bank_loan',
+        totalAmount: 200000,
+      });
+
+      // Link a work item to this source
+      insertRawWorkItemWithSource(raw.id, 25000);
+
+      expect(() => {
+        budgetSourceService.deleteBudgetSource(db, raw.id);
+      }).toThrow(BudgetSourceInUseError);
+    });
+
+    it('BudgetSourceInUseError includes budgetLineCount in details', () => {
+      const raw = insertRawSource({
+        name: 'Multi-WI Source',
+        sourceType: 'credit_line',
+        totalAmount: 50000,
+      });
+
+      insertRawWorkItemWithSource(raw.id, 1000);
+      insertRawWorkItemWithSource(raw.id, 2000);
+
+      let thrownErr: BudgetSourceInUseError | undefined;
+      try {
+        budgetSourceService.deleteBudgetSource(db, raw.id);
+      } catch (err) {
+        thrownErr = err as BudgetSourceInUseError;
+      }
+
+      expect(thrownErr).toBeDefined();
+      expect(thrownErr?.details?.budgetLineCount).toBe(2);
+    });
+
+    it('blocks delete even when work item actualCost is null', () => {
+      const raw = insertRawSource({
+        name: 'Source With Null Cost WI',
+        sourceType: 'savings',
+        totalAmount: 10000,
+      });
+
+      // Work item referencing the source but with no actualCost
+      insertRawWorkItemWithSource(raw.id, null);
+
+      expect(() => {
+        budgetSourceService.deleteBudgetSource(db, raw.id);
+      }).toThrow(BudgetSourceInUseError);
+    });
+  });
+
+  // ─── claimedAmount and actualAvailableAmount (Story 5.11) ─────────────────
+
+  describe('claimedAmount and actualAvailableAmount', () => {
+    it('returns claimedAmount=0 and actualAvailableAmount=totalAmount when no claimed invoices exist', () => {
+      const raw = insertRawSource({
+        name: 'No Claims Source',
+        sourceType: 'bank_loan',
+        totalAmount: 80000,
+      });
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.claimedAmount).toBe(0);
+      expect(result.actualAvailableAmount).toBe(80000);
+    });
+
+    it('sums claimed invoice amounts from budget lines referencing the source', () => {
+      const raw = insertRawSource({
+        name: 'Claims Source',
+        sourceType: 'savings',
+        totalAmount: 100000,
+      });
+
+      const { budgetId: budgetId1 } = insertRawWorkItemWithSource(raw.id, 20000);
+      const { budgetId: budgetId2 } = insertRawWorkItemWithSource(raw.id, 10000);
+
+      insertClaimedInvoice(budgetId1, 8000);
+      insertClaimedInvoice(budgetId2, 5000);
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.claimedAmount).toBe(13000); // 8000 + 5000
+      expect(result.actualAvailableAmount).toBe(87000); // 100000 - 13000
+    });
+
+    it('actualAvailableAmount = totalAmount - claimedAmount', () => {
+      const raw = insertRawSource({
+        name: 'Math Check Source',
+        sourceType: 'credit_line',
+        totalAmount: 50000,
+      });
+
+      const { budgetId } = insertRawWorkItemWithSource(raw.id, 30000);
+      insertClaimedInvoice(budgetId, 12500);
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.totalAmount).toBe(50000);
+      expect(result.claimedAmount).toBe(12500);
+      expect(result.actualAvailableAmount).toBe(37500); // 50000 - 12500
+    });
+
+    it('does NOT count paid invoices in claimedAmount (only status=claimed counts)', () => {
+      const raw = insertRawSource({
+        name: 'Paid Not Claimed Source',
+        sourceType: 'bank_loan',
+        totalAmount: 60000,
+      });
+
+      // Each budget line can link to at most one invoice (UNIQUE constraint)
+      const { budgetId: b1 } = insertRawWorkItemWithSource(raw.id, 25000);
+      const { budgetId: b2 } = insertRawWorkItemWithSource(raw.id, 25000);
+      insertPaidInvoice(b1, 9000); // paid — should NOT be counted
+      insertClaimedInvoice(b2, 3000); // claimed — should be counted
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.claimedAmount).toBe(3000); // only the claimed invoice
+      expect(result.actualAvailableAmount).toBe(57000); // 60000 - 3000
+    });
+
+    it('does NOT count claimed invoices from budget lines referencing a different source', () => {
+      const rawA = insertRawSource({
+        name: 'Source A Claimed',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+      });
+      const rawB = insertRawSource({
+        name: 'Source B Claimed',
+        sourceType: 'savings',
+        totalAmount: 50000,
+      });
+
+      const { budgetId: budgetIdA } = insertRawWorkItemWithSource(rawA.id, 20000);
+      insertClaimedInvoice(budgetIdA, 7000); // belongs to source A, not B
+
+      const resultA = budgetSourceService.getBudgetSourceById(db, rawA.id);
+      const resultB = budgetSourceService.getBudgetSourceById(db, rawB.id);
+
+      expect(resultA.claimedAmount).toBe(7000);
+      expect(resultA.actualAvailableAmount).toBe(93000); // 100000 - 7000
+      expect(resultB.claimedAmount).toBe(0);
+      expect(resultB.actualAvailableAmount).toBe(50000);
+    });
+
+    it('accumulates claimed invoices across multiple budget lines for the same source', () => {
+      // Story 15.1 (junction table model): each budget line can link to AT MOST ONE invoice.
+      // Use three separate budget lines — each with its own claimed invoice.
+      const raw = insertRawSource({
+        name: 'Multi-Claim Source',
+        sourceType: 'credit_line',
+        totalAmount: 200000,
+      });
+
+      const { budgetId: b1 } = insertRawWorkItemWithSource(raw.id, 20000);
+      const { budgetId: b2 } = insertRawWorkItemWithSource(raw.id, 15000);
+      const { budgetId: b3 } = insertRawWorkItemWithSource(raw.id, 10000);
+      insertClaimedInvoice(b1, 4000);
+      insertClaimedInvoice(b2, 6000);
+      insertClaimedInvoice(b3, 2500);
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.claimedAmount).toBe(12500); // 4000 + 6000 + 2500
+      expect(result.actualAvailableAmount).toBe(187500); // 200000 - 12500
+    });
+
+    it('listBudgetSources also returns claimedAmount and actualAvailableAmount', () => {
+      const raw = insertRawSource({
+        name: 'List Claims Test',
+        sourceType: 'savings',
+        totalAmount: 40000,
+      });
+
+      const { budgetId } = insertRawWorkItemWithSource(raw.id, 15000);
+      insertClaimedInvoice(budgetId, 6000);
+
+      const results = budgetSourceService.listBudgetSources(db);
+      const source = results.find((s) => s.id === raw.id)!;
+
+      expect(source.claimedAmount).toBe(6000);
+      expect(source.actualAvailableAmount).toBe(34000); // 40000 - 6000
+    });
+
+    it('createBudgetSource returns claimedAmount=0 and actualAvailableAmount=totalAmount', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'New Source Claimed',
+        sourceType: 'other',
+        totalAmount: 25000,
+      };
+
+      const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+
+      expect(result.claimedAmount).toBe(0);
+      expect(result.actualAvailableAmount).toBe(25000);
+    });
+
+    it('updateBudgetSource reflects updated totalAmount in actualAvailableAmount', () => {
+      const raw = insertRawSource({
+        name: 'Update Amount Claimed',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+      });
+
+      const { budgetId } = insertRawWorkItemWithSource(raw.id, 40000);
+      insertClaimedInvoice(budgetId, 15000);
+
+      // Update totalAmount
+      const updated = budgetSourceService.updateBudgetSource(db, raw.id, { totalAmount: 120000 });
+
+      expect(updated.claimedAmount).toBe(15000);
+      expect(updated.actualAvailableAmount).toBe(105000); // 120000 - 15000
+    });
+
+    it('actualAvailableAmount can go negative when claimedAmount exceeds totalAmount', () => {
+      // Edge case: claimed invoices may sum to more than the budget source total
+      const raw = insertRawSource({
+        name: 'Over-Claimed Source',
+        sourceType: 'savings',
+        totalAmount: 5000,
+      });
+
+      const { budgetId } = insertRawWorkItemWithSource(raw.id, 10000);
+      insertClaimedInvoice(budgetId, 7000); // more than totalAmount
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.claimedAmount).toBe(7000);
+      expect(result.actualAvailableAmount).toBe(-2000); // 5000 - 7000
+    });
+  });
+
+  // ─── unclaimedAmount (paid but not claimed invoices) ──────────────────────
+
+  describe('unclaimedAmount', () => {
+    it('returns unclaimedAmount=0 when no paid invoices exist', () => {
+      const raw = insertRawSource({
+        name: 'No Paid Source',
+        sourceType: 'bank_loan',
+        totalAmount: 80000,
+      });
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.unclaimedAmount).toBe(0);
+    });
+
+    it('sums paid invoice amounts from budget lines referencing the source', () => {
+      const raw = insertRawSource({
+        name: 'Paid Invoices Source',
+        sourceType: 'savings',
+        totalAmount: 100000,
+      });
+
+      const { budgetId: budgetId1 } = insertRawWorkItemWithSource(raw.id, 20000);
+      const { budgetId: budgetId2 } = insertRawWorkItemWithSource(raw.id, 10000);
+
+      insertPaidInvoice(budgetId1, 6000);
+      insertPaidInvoice(budgetId2, 4000);
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.unclaimedAmount).toBe(10000); // 6000 + 4000
+    });
+
+    it('does NOT count claimed invoices in unclaimedAmount (only status=paid counts)', () => {
+      const raw = insertRawSource({
+        name: 'Claimed Not Paid Source',
+        sourceType: 'bank_loan',
+        totalAmount: 60000,
+      });
+
+      // Each budget line can link to at most one invoice (UNIQUE constraint)
+      const { budgetId: b1 } = insertRawWorkItemWithSource(raw.id, 25000);
+      const { budgetId: b2 } = insertRawWorkItemWithSource(raw.id, 25000);
+      insertClaimedInvoice(b1, 9000); // claimed — should NOT count toward unclaimedAmount
+      insertPaidInvoice(b2, 3000); // paid — SHOULD count toward unclaimedAmount
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.unclaimedAmount).toBe(3000); // only the paid invoice
+      expect(result.claimedAmount).toBe(9000); // only the claimed invoice
+    });
+
+    it('does NOT count paid invoices from budget lines referencing a different source', () => {
+      const rawA = insertRawSource({
+        name: 'Source A Paid',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+      });
+      const rawB = insertRawSource({
+        name: 'Source B No Paid',
+        sourceType: 'savings',
+        totalAmount: 50000,
+      });
+
+      const { budgetId: budgetIdA } = insertRawWorkItemWithSource(rawA.id, 20000);
+      insertPaidInvoice(budgetIdA, 5000); // belongs to source A, not B
+
+      const resultA = budgetSourceService.getBudgetSourceById(db, rawA.id);
+      const resultB = budgetSourceService.getBudgetSourceById(db, rawB.id);
+
+      expect(resultA.unclaimedAmount).toBe(5000);
+      expect(resultB.unclaimedAmount).toBe(0);
+    });
+
+    it('accumulates paid invoices across multiple budget lines for the same source', () => {
+      // Story 15.1 (junction table model): each budget line can link to AT MOST ONE invoice.
+      // Use three separate budget lines — each with its own paid invoice.
+      const raw = insertRawSource({
+        name: 'Multi-Paid Source',
+        sourceType: 'credit_line',
+        totalAmount: 200000,
+      });
+
+      const { budgetId: b1 } = insertRawWorkItemWithSource(raw.id, 20000);
+      const { budgetId: b2 } = insertRawWorkItemWithSource(raw.id, 15000);
+      const { budgetId: b3 } = insertRawWorkItemWithSource(raw.id, 10000);
+      insertPaidInvoice(b1, 3000);
+      insertPaidInvoice(b2, 7000);
+      insertPaidInvoice(b3, 1500);
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.unclaimedAmount).toBe(11500); // 3000 + 7000 + 1500
+    });
+
+    it('listBudgetSources also returns unclaimedAmount', () => {
+      const raw = insertRawSource({
+        name: 'List Paid Test',
+        sourceType: 'savings',
+        totalAmount: 40000,
+      });
+
+      const { budgetId } = insertRawWorkItemWithSource(raw.id, 15000);
+      insertPaidInvoice(budgetId, 8000);
+
+      const results = budgetSourceService.listBudgetSources(db);
+      const source = results.find((s) => s.id === raw.id)!;
+
+      expect(source.unclaimedAmount).toBe(8000);
+    });
+
+    it('createBudgetSource returns unclaimedAmount=0 for a new source', () => {
+      const data: CreateBudgetSourceRequest = {
+        name: 'New Source Unclaimed',
+        sourceType: 'other',
+        totalAmount: 25000,
+      };
+
+      const result = budgetSourceService.createBudgetSource(db, data, TEST_USER_ID);
+
+      expect(result.unclaimedAmount).toBe(0);
+    });
+
+    it('correctly tracks both claimedAmount and unclaimedAmount independently', () => {
+      // Story 15.1 (junction table model): each budget line can link to AT MOST ONE invoice.
+      // Use four separate budget lines — one claimed and one paid for each "conceptual" cost centre.
+      const raw = insertRawSource({
+        name: 'Mixed Invoice Source',
+        sourceType: 'bank_loan',
+        totalAmount: 300000,
+      });
+
+      const { budgetId: b1Claimed } = insertRawWorkItemWithSource(raw.id, 50000);
+      const { budgetId: b1Paid } = insertRawWorkItemWithSource(raw.id, 20000);
+      const { budgetId: b2Claimed } = insertRawWorkItemWithSource(raw.id, 30000);
+      const { budgetId: b2Paid } = insertRawWorkItemWithSource(raw.id, 15000);
+
+      insertClaimedInvoice(b1Claimed, 12000); // claimed
+      insertPaidInvoice(b1Paid, 5000); // paid (unclaimed)
+      insertClaimedInvoice(b2Claimed, 8000); // claimed
+      insertPaidInvoice(b2Paid, 3000); // paid (unclaimed)
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.claimedAmount).toBe(20000); // 12000 + 8000
+      expect(result.unclaimedAmount).toBe(8000); // 5000 + 3000
+      // actualAvailableAmount is based on claimedAmount only
+      expect(result.actualAvailableAmount).toBe(280000); // 300000 - 20000
+    });
+  });
+
+  // ─── usedAmount with household item budgets (Bug #626) ────────────────────
+
+  describe('usedAmount including household item budget lines', () => {
+    it('computes usedAmount from household item budget lines only', () => {
+      const raw = insertRawSource({
+        name: 'HI Only Source',
+        sourceType: 'savings',
+        totalAmount: 50000,
+      });
+
+      insertRawHouseholdItemWithSource(raw.id, 10000);
+      insertRawHouseholdItemWithSource(raw.id, 7500);
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.usedAmount).toBe(17500);
+      expect(result.availableAmount).toBe(32500);
+    });
+
+    it('computes usedAmount from both work item and household item budget lines', () => {
+      const raw = insertRawSource({
+        name: 'Mixed Source',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+      });
+
+      insertRawWorkItemWithSource(raw.id, 20000);
+      insertRawHouseholdItemWithSource(raw.id, 15000);
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.usedAmount).toBe(35000);
+    });
+
+    it('isolates usedAmount per source — household item budget lines from other sources do not count', () => {
+      const rawA = insertRawSource({
+        name: 'Source A (HI)',
+        sourceType: 'savings',
+        totalAmount: 40000,
+      });
+      const rawB = insertRawSource({
+        name: 'Source B (HI)',
+        sourceType: 'savings',
+        totalAmount: 60000,
+      });
+
+      insertRawHouseholdItemWithSource(rawA.id, 8000);
+      insertRawHouseholdItemWithSource(rawB.id, 12000);
+
+      const resultA = budgetSourceService.getBudgetSourceById(db, rawA.id);
+      const resultB = budgetSourceService.getBudgetSourceById(db, rawB.id);
+
+      expect(resultA.usedAmount).toBe(8000);
+      expect(resultA.availableAmount).toBe(32000);
+      expect(resultB.usedAmount).toBe(12000);
+      expect(resultB.availableAmount).toBe(48000);
+    });
+  });
+
+  // ─── Discretionary source protection (Issue #727) ────────────────────────
+
+  describe('Discretionary Funding source protection', () => {
+    it('deleteBudgetSource on discretionary source throws DiscretionarySourceError (409)', () => {
+      const err = new DiscretionarySourceError();
+      expect(err.statusCode).toBe(409);
+      expect(err.code).toBe('DISCRETIONARY_SOURCE');
+
+      // The seeded system row is protected
+      expect(() => {
+        budgetSourceService.deleteBudgetSource(db, 'discretionary-system');
+      }).toThrow(DiscretionarySourceError);
+    });
+
+    it('deleteBudgetSource on regular source does not throw DiscretionarySourceError', () => {
+      const raw = insertRawSource({
+        name: 'Normal Source',
+        sourceType: 'savings',
+        totalAmount: 1000,
+      });
+
+      expect(() => {
+        budgetSourceService.deleteBudgetSource(db, raw.id);
+      }).not.toThrow(DiscretionarySourceError);
+    });
+
+    it('updateBudgetSource with sourceType change on discretionary source throws ValidationError', () => {
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, 'discretionary-system', {
+          sourceType: 'bank_loan',
+        });
+      }).toThrow(ValidationError);
+
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, 'discretionary-system', {
+          sourceType: 'bank_loan',
+        });
+      }).toThrow('Cannot change the source type of the Discretionary Funding source');
+    });
+
+    it('updateBudgetSource with totalAmount: 0 on discretionary source succeeds', () => {
+      const result = budgetSourceService.updateBudgetSource(db, 'discretionary-system', {
+        totalAmount: 0,
+      });
+
+      expect(result.totalAmount).toBe(0);
+      expect(result.isDiscretionary).toBe(true);
+    });
+
+    it('updateBudgetSource with totalAmount: -1 on discretionary source throws ValidationError', () => {
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, 'discretionary-system', { totalAmount: -1 });
+      }).toThrow(ValidationError);
+
+      expect(() => {
+        budgetSourceService.updateBudgetSource(db, 'discretionary-system', { totalAmount: -1 });
+      }).toThrow('Total amount must be a non-negative number');
+    });
+  });
+
+  // ─── Sorting: discretionary source appears last (Issue #727) ─────────────
+
+  describe('listBudgetSources() — discretionary source sorting', () => {
+    it('returns discretionary source last even if its name sorts first alphabetically', () => {
+      // "Aardvark Fund" would sort before "Discretionary Funding" alphabetically,
+      // but we want regular sources first and discretionary last.
+      insertRawSource({ name: 'Aardvark Fund', sourceType: 'savings', totalAmount: 5000 });
+      insertRawSource({ name: 'Zebra Loan', sourceType: 'bank_loan', totalAmount: 100000 });
+
+      const results = budgetSourceService.listBudgetSources(db);
+
+      // At least 3 sources: Aardvark Fund, Zebra Loan, discretionary-system
+      expect(results.length).toBeGreaterThanOrEqual(3);
+      const last = results[results.length - 1]!;
+      expect(last.isDiscretionary).toBe(true);
+      expect(last.id).toBe('discretionary-system');
+    });
+
+    it('regular sources before discretionary source are sorted by name ascending', () => {
+      insertRawSource({ name: 'Mango Credit', sourceType: 'credit_line', totalAmount: 30000 });
+      insertRawSource({ name: 'Alpha Loan', sourceType: 'bank_loan', totalAmount: 50000 });
+
+      const results = budgetSourceService.listBudgetSources(db);
+      const regularSources = results.filter((s) => !s.isDiscretionary);
+
+      expect(regularSources[0]!.name).toBe('Alpha Loan');
+      expect(regularSources[1]!.name).toBe('Mango Credit');
+    });
+  });
+
+  // ─── New computed fields: projectedAmount, paidAmount, isDiscretionary ────
+
+  describe('new computed fields (Issue #727)', () => {
+    it('isDiscretionary is true for the seeded discretionary source', () => {
+      const result = getDiscretionarySource();
+      expect(result.isDiscretionary).toBe(true);
+    });
+
+    it('isDiscretionary is false for regular budget sources', () => {
+      const raw = insertRawSource({
+        name: 'Regular Source',
+        sourceType: 'bank_loan',
+        totalAmount: 10000,
+      });
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.isDiscretionary).toBe(false);
+    });
+
+    it('projectedAmount with one budget line and no invoices equals plannedAmount * (1 + margin)', () => {
+      const raw = insertRawSource({
+        name: 'Projected No Invoice',
+        sourceType: 'savings',
+        totalAmount: 50000,
+      });
+      // Insert work item budget line with own_estimate confidence (margin = 0.2)
+      const { budgetId } = insertRawWorkItemWithSource(raw.id, 10000);
+      // No invoice attached — projectedAmount = 10000 * (1 + 0.2) = 12000
+      void budgetId;
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.projectedAmount).toBeCloseTo(10000 * (1 + CONFIDENCE_MARGINS.own_estimate));
+    });
+
+    it('projectedAmount with one invoiced budget line equals the actual itemized invoice amount', () => {
+      const raw = insertRawSource({
+        name: 'Projected With Invoice',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+      });
+      const { budgetId } = insertRawWorkItemWithSource(raw.id, 20000);
+      // Attach a paid invoice for 18500 — projectedAmount = actual cost = 18500
+      insertPaidInvoice(budgetId, 18500);
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.projectedAmount).toBe(18500);
+    });
+
+    it('paidAmount equals claimedAmount + unclaimedAmount', () => {
+      const raw = insertRawSource({
+        name: 'Paid Amount Test',
+        sourceType: 'credit_line',
+        totalAmount: 200000,
+      });
+      const { budgetId: b1 } = insertRawWorkItemWithSource(raw.id, 30000);
+      const { budgetId: b2 } = insertRawWorkItemWithSource(raw.id, 20000);
+      insertClaimedInvoice(b1, 9000); // claimed
+      insertPaidInvoice(b2, 4000); // unclaimed
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.claimedAmount).toBe(9000);
+      expect(result.unclaimedAmount).toBe(4000);
+      expect(result.paidAmount).toBe(9000 + 4000);
+    });
+
+    it('paidAmount is 0 for a newly created source with no invoices', () => {
+      const raw = insertRawSource({ name: 'Zero Paid', sourceType: 'other', totalAmount: 5000 });
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.paidAmount).toBe(0);
+    });
+
+    it('listBudgetSources returns isDiscretionary, projectedAmount, and paidAmount fields', () => {
+      const raw = insertRawSource({
+        name: 'List Fields Test',
+        sourceType: 'savings',
+        totalAmount: 40000,
+      });
+      const { budgetId } = insertRawWorkItemWithSource(raw.id, 15000);
+      insertClaimedInvoice(budgetId, 6000);
+
+      const results = budgetSourceService.listBudgetSources(db);
+      const source = results.find((s) => s.id === raw.id)!;
+
+      expect(source.isDiscretionary).toBe(false);
+      expect(typeof source.projectedAmount).toBe('number');
+      expect(source.paidAmount).toBe(6000);
+    });
+  });
+
+  // ─── Bug fix: claimedAmount/unclaimedAmount includes household item invoices ─
+
+  describe('claimedAmount and unclaimedAmount include household item budget line invoices (Issue #727)', () => {
+    it('claimedAmount includes household item budget line claimed invoices', () => {
+      const raw = insertRawSource({
+        name: 'HI Claimed Source',
+        sourceType: 'savings',
+        totalAmount: 80000,
+      });
+      const { budgetId: hiBudgetId } = insertRawHouseholdItemWithSource(raw.id, 15000);
+      insertClaimedInvoiceForHouseholdItem(hiBudgetId, 7500);
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.claimedAmount).toBe(7500);
+      expect(result.actualAvailableAmount).toBe(72500); // 80000 - 7500
+    });
+
+    it('unclaimedAmount includes household item budget line paid invoices', () => {
+      const raw = insertRawSource({
+        name: 'HI Paid Source',
+        sourceType: 'credit_line',
+        totalAmount: 60000,
+      });
+      const { budgetId: hiBudgetId } = insertRawHouseholdItemWithSource(raw.id, 20000);
+      insertPaidInvoiceForHouseholdItem(hiBudgetId, 11000);
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.unclaimedAmount).toBe(11000);
+    });
+
+    it('claimedAmount sums household item and work item claimed invoices together', () => {
+      const raw = insertRawSource({
+        name: 'Mixed Claimed Source',
+        sourceType: 'bank_loan',
+        totalAmount: 150000,
+      });
+      const { budgetId: wiBudgetId } = insertRawWorkItemWithSource(raw.id, 30000);
+      const { budgetId: hiBudgetId } = insertRawHouseholdItemWithSource(raw.id, 20000);
+      insertClaimedInvoice(wiBudgetId, 8000);
+      insertClaimedInvoiceForHouseholdItem(hiBudgetId, 5000);
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.claimedAmount).toBe(13000); // 8000 + 5000
+      expect(result.actualAvailableAmount).toBe(137000); // 150000 - 13000
+    });
+
+    it('unclaimedAmount sums household item and work item paid invoices together', () => {
+      const raw = insertRawSource({
+        name: 'Mixed Paid Source',
+        sourceType: 'savings',
+        totalAmount: 100000,
+      });
+      const { budgetId: wiBudgetId } = insertRawWorkItemWithSource(raw.id, 25000);
+      const { budgetId: hiBudgetId } = insertRawHouseholdItemWithSource(raw.id, 18000);
+      insertPaidInvoice(wiBudgetId, 4500);
+      insertPaidInvoiceForHouseholdItem(hiBudgetId, 3200);
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.unclaimedAmount).toBe(7700); // 4500 + 3200
+    });
+
+    it('household item claimed invoices for a different source do not count', () => {
+      const rawA = insertRawSource({
+        name: 'HI Claimed A',
+        sourceType: 'savings',
+        totalAmount: 50000,
+      });
+      const rawB = insertRawSource({
+        name: 'HI Claimed B',
+        sourceType: 'other',
+        totalAmount: 30000,
+      });
+
+      const { budgetId: hiBudgetId } = insertRawHouseholdItemWithSource(rawA.id, 10000);
+      insertClaimedInvoiceForHouseholdItem(hiBudgetId, 4000);
+
+      const resultB = budgetSourceService.getBudgetSourceById(db, rawB.id);
+      expect(resultB.claimedAmount).toBe(0);
+    });
+  });
+
+  // ─── Discretionary catch-all: invoice remainder and NULL source lines ──────
+
+  describe('Discretionary source catch-all amounts (Issue #727)', () => {
+    it('discretionary source claimedAmount includes invoice remainder (amount not allocated to budget lines)', () => {
+      // Invoice of €10000 with only €6000 allocated — €4000 remainder is discretionary
+      const { budgetId } = insertRawWorkItemWithSource(
+        insertRawSource({ name: 'Non-disc Source', sourceType: 'bank_loan', totalAmount: 50000 })
+          .id,
+        6000,
+      );
+      insertInvoiceWithRemainder('claimed', 10000, [
+        { budgetLineId: budgetId, itemizedAmount: 6000 },
+      ]);
+
+      const disc = getDiscretionarySource();
+      expect(disc.claimedAmount).toBeGreaterThanOrEqual(4000);
+    });
+
+    it('discretionary source unclaimedAmount includes invoice remainder from paid invoices', () => {
+      const { budgetId } = insertRawWorkItemWithSource(
+        insertRawSource({
+          name: 'Source For Paid Remainder',
+          sourceType: 'savings',
+          totalAmount: 20000,
+        }).id,
+        3000,
+      );
+      insertInvoiceWithRemainder('paid', 5000, [{ budgetLineId: budgetId, itemizedAmount: 3000 }]);
+
+      const disc = getDiscretionarySource();
+      expect(disc.unclaimedAmount).toBeGreaterThanOrEqual(2000);
+    });
+
+    it('discretionary source claimedAmount includes budget lines with NULL budget_source_id', () => {
+      // A work item budget line with no source assigned — its claimed invoice amount is discretionary
+      const wiId = `wi-null-src-${++workItemCounter}`;
+      const budgetId = `bud-null-src-${workItemCounter}`;
+      const ts = new Date().toISOString();
+      db.insert(schema.workItems)
+        .values({
+          id: wiId,
+          title: `Null Source WI ${workItemCounter}`,
+          status: 'not_started',
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      db.insert(schema.workItemBudgets)
+        .values({
+          id: budgetId,
+          workItemId: wiId,
+          budgetSourceId: null, // no source assigned
+          plannedAmount: 8000,
+          confidence: 'own_estimate',
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      insertClaimedInvoice(budgetId, 7000);
+
+      const disc = getDiscretionarySource();
+      expect(disc.claimedAmount).toBeGreaterThanOrEqual(7000);
+    });
+
+    it('discretionary source paidAmount equals its claimedAmount + unclaimedAmount', () => {
+      // Fully unallocated paid invoice → discretionary
+      insertInvoiceWithRemainder('paid', 3000, []);
+      // Fully unallocated claimed invoice → discretionary
+      insertInvoiceWithRemainder('claimed', 2000, []);
+
+      const disc = getDiscretionarySource();
+      expect(disc.paidAmount).toBe(disc.claimedAmount + disc.unclaimedAmount);
+    });
+
+    it('fully unallocated invoice contributes entire amount to discretionary source', () => {
+      insertInvoiceWithRemainder('claimed', 5500, []);
+
+      const disc = getDiscretionarySource();
+      expect(disc.claimedAmount).toBeGreaterThanOrEqual(5500);
+    });
+  });
+
+  // ─── deleteBudgetSource blocked by household item budgets (Bug #626) ───────
+
+  describe('deleteBudgetSource() with household item budget lines', () => {
+    it('throws BudgetSourceInUseError when household item budgets reference the source', () => {
+      const raw = insertRawSource({
+        name: 'HI In Use Source',
+        sourceType: 'savings',
+        totalAmount: 25000,
+      });
+
+      insertRawHouseholdItemWithSource(raw.id, 5000);
+
+      expect(() => {
+        budgetSourceService.deleteBudgetSource(db, raw.id);
+      }).toThrow(BudgetSourceInUseError);
+    });
+
+    it('succeeds when only an unrelated source has household item budget references', () => {
+      const rawA = insertRawSource({
+        name: 'Source A — no HI refs',
+        sourceType: 'other',
+        totalAmount: 10000,
+      });
+      const rawB = insertRawSource({
+        name: 'Source B — has HI ref',
+        sourceType: 'savings',
+        totalAmount: 20000,
+      });
+
+      // Only rawB has a household item budget line referencing it
+      insertRawHouseholdItemWithSource(rawB.id, 3000);
+
+      // Deleting rawA should succeed because nothing references it
+      expect(() => {
+        budgetSourceService.deleteBudgetSource(db, rawA.id);
+      }).not.toThrow();
+
+      expect(() => {
+        budgetSourceService.getBudgetSourceById(db, rawA.id);
+      }).toThrow(NotFoundError);
+    });
+
+    it('throws BudgetSourceInUseError when both work item and household item budgets reference the source', () => {
+      const raw = insertRawSource({
+        name: 'Both Types In Use',
+        sourceType: 'bank_loan',
+        totalAmount: 150000,
+      });
+
+      insertRawWorkItemWithSource(raw.id, 30000);
+      insertRawHouseholdItemWithSource(raw.id, 20000);
+
+      expect(() => {
+        budgetSourceService.deleteBudgetSource(db, raw.id);
+      }).toThrow(BudgetSourceInUseError);
+    });
+  });
+
+  // ─── computeProjectedRange / projectedMinAmount / projectedMaxAmount ─────────
+
+  describe('computeProjectedRange / projectedMinAmount / projectedMaxAmount (Issue #1319)', () => {
+    /**
+     * Insert a work item budget line with a specific confidence level.
+     * Used to test projected range logic with different margins.
+     */
+    function insertWorkItemWithConfidence(
+      sourceId: string,
+      plannedAmount: number,
+      confidence: 'own_estimate' | 'professional_estimate' | 'quote' | 'invoice',
+    ): { wiId: string; budgetId: string } {
+      const wiId = `wi-range-test-${++workItemCounter}`;
+      const budgetId = `bud-range-test-${workItemCounter}`;
+      const ts = new Date(Date.now() + workItemCounter).toISOString();
+      db.insert(schema.workItems)
+        .values({
+          id: wiId,
+          title: `Range Test WI ${workItemCounter}`,
+          status: 'not_started',
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      db.insert(schema.workItemBudgets)
+        .values({
+          id: budgetId,
+          workItemId: wiId,
+          budgetSourceId: sourceId,
+          plannedAmount,
+          confidence,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      return { wiId, budgetId };
+    }
+
+    /**
+     * Insert a household item budget line with a specific confidence level.
+     */
+    function insertHouseholdItemWithConfidence(
+      sourceId: string,
+      plannedAmount: number,
+      confidence: 'own_estimate' | 'professional_estimate' | 'quote' | 'invoice',
+    ): { hiId: string; budgetId: string } {
+      const hiId = `hi-range-test-${++householdItemCounter}`;
+      const budgetId = `hi-bud-range-test-${householdItemCounter}`;
+      const ts = new Date(Date.now() + householdItemCounter).toISOString();
+      db.insert(schema.householdItems)
+        .values({
+          id: hiId,
+          name: `Range Test HI ${householdItemCounter}`,
+          categoryId: 'hic-furniture',
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      db.insert(schema.householdItemBudgets)
+        .values({
+          id: budgetId,
+          householdItemId: hiId,
+          budgetSourceId: sourceId,
+          plannedAmount,
+          confidence,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      return { hiId, budgetId };
+    }
+
+    it('returns projectedMinAmount === 0 and projectedMaxAmount === 0 when source has no budget lines', () => {
+      const raw = insertRawSource({
+        name: 'Empty Range Source',
+        sourceType: 'savings',
+        totalAmount: 50000,
+      });
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.projectedMinAmount).toBe(0);
+      expect(result.projectedMaxAmount).toBe(0);
+    });
+
+    it('both projectedMinAmount and projectedMaxAmount equal actual invoice amount for a fully invoiced line', () => {
+      const raw = insertRawSource({
+        name: 'Single Invoiced Line Source',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+      });
+      const { budgetId } = insertWorkItemWithConfidence(raw.id, 1200, 'own_estimate');
+      insertClaimedInvoice(budgetId, 1000);
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.projectedMinAmount).toBe(1000);
+      expect(result.projectedMaxAmount).toBe(1000);
+    });
+
+    it('single non-invoiced own_estimate line: min = planned * (1 - margin), max = planned * (1 + margin)', () => {
+      const raw = insertRawSource({
+        name: 'Own Estimate Range Source',
+        sourceType: 'savings',
+        totalAmount: 50000,
+      });
+      insertWorkItemWithConfidence(raw.id, 1000, 'own_estimate');
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      const margin = CONFIDENCE_MARGINS.own_estimate;
+      expect(result.projectedMinAmount).toBeCloseTo(1000 * (1 - margin));
+      expect(result.projectedMaxAmount).toBeCloseTo(1000 * (1 + margin));
+    });
+
+    it('single non-invoiced quote line: min/max use CONFIDENCE_MARGINS.quote', () => {
+      const raw = insertRawSource({
+        name: 'Quote Range Source',
+        sourceType: 'credit_line',
+        totalAmount: 80000,
+      });
+      insertWorkItemWithConfidence(raw.id, 2000, 'quote');
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      const margin = CONFIDENCE_MARGINS.quote;
+      expect(result.projectedMinAmount).toBeCloseTo(2000 * (1 - margin));
+      expect(result.projectedMaxAmount).toBeCloseTo(2000 * (1 + margin));
+    });
+
+    it('single non-invoiced professional_estimate line: min/max use CONFIDENCE_MARGINS.professional_estimate', () => {
+      const raw = insertRawSource({
+        name: 'Professional Estimate Range Source',
+        sourceType: 'other',
+        totalAmount: 60000,
+      });
+      insertWorkItemWithConfidence(raw.id, 5000, 'professional_estimate');
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      const margin = CONFIDENCE_MARGINS.professional_estimate;
+      expect(result.projectedMinAmount).toBeCloseTo(5000 * (1 - margin));
+      expect(result.projectedMaxAmount).toBeCloseTo(5000 * (1 + margin));
+    });
+
+    it('mixed invoiced + non-invoiced: sums actual costs with own_estimate range', () => {
+      // WI1 invoiced €500 + WI2 non-invoiced planned €1000 own_estimate (margin 0.2)
+      // min = 500 + 1000 * (1 - 0.2) = 500 + 800 = 1300
+      // max = 500 + 1000 * (1 + 0.2) = 500 + 1200 = 1700
+      const raw = insertRawSource({
+        name: 'Mixed Invoiced Range Source',
+        sourceType: 'bank_loan',
+        totalAmount: 200000,
+      });
+      const { budgetId: b1 } = insertWorkItemWithConfidence(raw.id, 600, 'own_estimate');
+      insertClaimedInvoice(b1, 500); // invoiced: actual cost 500
+      insertWorkItemWithConfidence(raw.id, 1000, 'own_estimate'); // non-invoiced
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      const margin = CONFIDENCE_MARGINS.own_estimate;
+      expect(result.projectedMinAmount).toBeCloseTo(500 + 1000 * (1 - margin));
+      expect(result.projectedMaxAmount).toBeCloseTo(500 + 1000 * (1 + margin));
+    });
+
+    it('household item non-invoiced professional_estimate line: min/max use CONFIDENCE_MARGINS.professional_estimate', () => {
+      const raw = insertRawSource({
+        name: 'HI Professional Estimate Range Source',
+        sourceType: 'savings',
+        totalAmount: 150000,
+      });
+      insertHouseholdItemWithConfidence(raw.id, 2000, 'professional_estimate');
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      const margin = CONFIDENCE_MARGINS.professional_estimate;
+      expect(result.projectedMinAmount).toBeCloseTo(2000 * (1 - margin));
+      expect(result.projectedMaxAmount).toBeCloseTo(2000 * (1 + margin));
+    });
+
+    it('all lines fully invoiced: projectedMinAmount === projectedMaxAmount === sum of actual costs', () => {
+      const raw = insertRawSource({
+        name: 'All Invoiced Range Source',
+        sourceType: 'credit_line',
+        totalAmount: 300000,
+      });
+      const { budgetId: b1 } = insertWorkItemWithConfidence(raw.id, 3000, 'own_estimate');
+      const { budgetId: b2 } = insertWorkItemWithConfidence(raw.id, 5000, 'quote');
+      const { budgetId: b3 } = insertWorkItemWithConfidence(raw.id, 8000, 'professional_estimate');
+      insertClaimedInvoice(b1, 2800);
+      insertClaimedInvoice(b2, 4900);
+      insertPaidInvoice(b3, 7500);
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.projectedMinAmount).toBeCloseTo(2800 + 4900 + 7500);
+      expect(result.projectedMaxAmount).toBeCloseTo(2800 + 4900 + 7500);
+    });
+
+    it('listBudgetSources returns projectedMinAmount and projectedMaxAmount as numbers', () => {
+      const raw = insertRawSource({
+        name: 'List Range Fields Source',
+        sourceType: 'savings',
+        totalAmount: 40000,
+      });
+      insertWorkItemWithConfidence(raw.id, 10000, 'own_estimate');
+
+      const results = budgetSourceService.listBudgetSources(db);
+      const source = results.find((s) => s.id === raw.id)!;
+
+      expect(typeof source.projectedMinAmount).toBe('number');
+      expect(typeof source.projectedMaxAmount).toBe('number');
+    });
+
+    it('getBudgetSourceById returns projectedMinAmount and projectedMaxAmount', () => {
+      const raw = insertRawSource({
+        name: 'GetById Range Fields Source',
+        sourceType: 'other',
+        totalAmount: 25000,
+      });
+      insertWorkItemWithConfidence(raw.id, 5000, 'professional_estimate');
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(typeof result.projectedMinAmount).toBe('number');
+      expect(typeof result.projectedMaxAmount).toBe('number');
+      expect(result.projectedMinAmount).toBeGreaterThanOrEqual(0);
+      expect(result.projectedMaxAmount).toBeGreaterThanOrEqual(result.projectedMinAmount);
+    });
+
+    it('projectedAmount equals projectedMaxAmount for a non-invoiced source', () => {
+      // Back-compat: projectedAmount uses (1 + margin) just like projectedMaxAmount
+      const raw = insertRawSource({
+        name: 'Back-Compat Projected Source',
+        sourceType: 'bank_loan',
+        totalAmount: 100000,
+      });
+      insertWorkItemWithConfidence(raw.id, 8000, 'own_estimate');
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      expect(result.projectedAmount).toBeCloseTo(result.projectedMaxAmount);
+    });
+  });
+
+  // ─── #1405 deposit-aware claimed/unclaimed/discretionary amounts ──────────
+
+  describe('deposit-aware amounts (#1405)', () => {
+    /**
+     * Helper: insert a deposit for a given invoice.
+     */
+    function insertDepositForInvoice(
+      invoiceId: string,
+      opts: {
+        amount: number;
+        status: 'pending' | 'paid' | 'claimed';
+        entryType?: 'deposit' | 'refund';
+        budgetSourceId?: string | null;
+      },
+    ): string {
+      const id = `dep-src-${++workItemCounter}`;
+      const ts = new Date(Date.now() + workItemCounter).toISOString();
+      db.insert(schema.invoiceDeposits)
+        .values({
+          id,
+          invoiceId,
+          amount: opts.amount,
+          dueDate: '2026-03-01',
+          status: opts.status,
+          entryType: opts.entryType ?? 'deposit',
+          budgetSourceId: opts.budgetSourceId ?? null,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      return id;
+    }
+
+    /**
+     * Helper: insert a vendor + invoice with given amount and status, linked to a work item budget line.
+     * Returns the invoiceId.
+     */
+    function insertInvoiceForBudgetLine(
+      budgetLineId: string,
+      invoiceAmount: number,
+      status: 'pending' | 'paid' | 'claimed',
+    ): string {
+      const ts = new Date(Date.now() + workItemCounter).toISOString();
+      const vendorId = `vendor-dep-${++workItemCounter}`;
+      db.insert(schema.vendors)
+        .values({ id: vendorId, name: `Dep Vendor ${vendorId}`, createdAt: ts, updatedAt: ts })
+        .run();
+      const invoiceId = `inv-dep-${workItemCounter}`;
+      db.insert(schema.invoices)
+        .values({
+          id: invoiceId,
+          vendorId,
+          amount: invoiceAmount,
+          date: '2026-01-01',
+          status,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      db.insert(schema.invoiceBudgetLines)
+        .values({
+          id: randomUUID(),
+          invoiceId,
+          workItemBudgetId: budgetLineId,
+          itemizedAmount: invoiceAmount,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      return invoiceId;
+    }
+
+    describe('computeClaimedAmount — with claimed deposit', () => {
+      it('AC-23: claimed deposit fraction is attributed to claimedAmount', () => {
+        // invoice=1000 pending, deposit 400 claimed → claimedAmount should be 400
+        const raw = insertRawSource({ name: 'Deposit Claim Source', totalAmount: 50000 });
+        const { budgetId } = insertRawWorkItemWithSource(raw.id, 1000);
+        const invoiceId = insertInvoiceForBudgetLine(budgetId, 1000, 'pending');
+        insertDepositForInvoice(invoiceId, { amount: 400, status: 'claimed' });
+
+        const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+        // claimedAmount = 400/1000 * 1000 = 400
+        expect(result.claimedAmount).toBeCloseTo(400);
+      });
+
+      it('claimed deposit on claimed invoice: both deposit and remaining residual are claimed', () => {
+        // invoice=1000 claimed, deposit 300 claimed, residual 700 claimed
+        // Both contribute to claimedAmount → total = 1000
+        const raw = insertRawSource({ name: 'Full Claim Source', totalAmount: 50000 });
+        const { budgetId } = insertRawWorkItemWithSource(raw.id, 1000);
+        const invoiceId = insertInvoiceForBudgetLine(budgetId, 1000, 'claimed');
+        insertDepositForInvoice(invoiceId, { amount: 300, status: 'claimed' });
+
+        const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+        expect(result.claimedAmount).toBeCloseTo(1000);
+      });
+
+      it('zero-deposit claimed invoice: claimedAmount unchanged from pre-deposit behavior (AC-10)', () => {
+        // No deposits: whole invoice amount contributes to claimedAmount
+        const raw = insertRawSource({ name: 'No Deposit Claim', totalAmount: 50000 });
+        const { budgetId } = insertRawWorkItemWithSource(raw.id, 800);
+        insertClaimedInvoice(budgetId, 800);
+
+        const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+        expect(result.claimedAmount).toBe(800);
+      });
+    });
+
+    describe('computeUnclaimedAmount — with paid deposit', () => {
+      it('AC-24: paid deposit fraction is attributed to unclaimedAmount', () => {
+        // invoice=1000 pending, deposit 300 paid → unclaimedAmount = 300
+        const raw = insertRawSource({ name: 'Unclaimed Dep Source', totalAmount: 50000 });
+        const { budgetId } = insertRawWorkItemWithSource(raw.id, 1000);
+        const invoiceId = insertInvoiceForBudgetLine(budgetId, 1000, 'pending');
+        insertDepositForInvoice(invoiceId, { amount: 300, status: 'paid' });
+
+        const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+        // unclaimedAmount = computeStatusContribution('paid') = 300
+        expect(result.unclaimedAmount).toBeCloseTo(300);
+      });
+
+      it('paid deposit on paid invoice: deposit fraction + residual paid fraction = full amount', () => {
+        // invoice=1000 paid, deposit 400 paid, residual 600 paid → unclaimedAmount = 1000
+        const raw = insertRawSource({ name: 'Full Unclaim Source', totalAmount: 50000 });
+        const { budgetId } = insertRawWorkItemWithSource(raw.id, 1000);
+        const invoiceId = insertInvoiceForBudgetLine(budgetId, 1000, 'paid');
+        insertDepositForInvoice(invoiceId, { amount: 400, status: 'paid' });
+
+        const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+        expect(result.unclaimedAmount).toBeCloseTo(1000);
+      });
+
+      it('zero-deposit paid invoice: unclaimedAmount unchanged from pre-deposit behavior (AC-10)', () => {
+        const raw = insertRawSource({ name: 'No Deposit Unclaim', totalAmount: 50000 });
+        const { budgetId } = insertRawWorkItemWithSource(raw.id, 500);
+        insertPaidInvoice(budgetId, 500);
+
+        const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+        expect(result.unclaimedAmount).toBe(500);
+      });
+    });
+
+    describe('paidAmount = claimedAmount + unclaimedAmount (deposit-aware)', () => {
+      it('paidAmount sums deposit-aware claimed + unclaimed contributions', () => {
+        // invoice=1000 pending; deposit 200 claimed + deposit 300 paid → residual 500 pending
+        // claimedAmount=200, unclaimedAmount=300, paidAmount=500
+        const raw = insertRawSource({ name: 'Mixed Dep Source', totalAmount: 50000 });
+        const { budgetId } = insertRawWorkItemWithSource(raw.id, 1000);
+        const invoiceId = insertInvoiceForBudgetLine(budgetId, 1000, 'pending');
+        insertDepositForInvoice(invoiceId, { amount: 200, status: 'claimed' });
+        insertDepositForInvoice(invoiceId, { amount: 300, status: 'paid' });
+
+        const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+        expect(result.claimedAmount).toBeCloseTo(200);
+        expect(result.unclaimedAmount).toBeCloseTo(300);
+        expect(result.paidAmount).toBeCloseTo(500);
+      });
+    });
+
+    // ─── Story #1876: refund entries net out claimed/unclaimed amounts ────────
+
+    describe('refund entries net out claimed/unclaimed amounts (Story #1876)', () => {
+      it('a claimed refund reduces claimedAmount (SQL wiring for deposit_entry_type)', () => {
+        // invoice=1000 pending, deposit 600 claimed, refund 200 claimed
+        // claimedAmount = 600 - 200 = 400
+        const raw = insertRawSource({ name: 'Refund Claim Source', totalAmount: 50000 });
+        const { budgetId } = insertRawWorkItemWithSource(raw.id, 1000);
+        const invoiceId = insertInvoiceForBudgetLine(budgetId, 1000, 'pending');
+        insertDepositForInvoice(invoiceId, { amount: 600, status: 'claimed' });
+        insertDepositForInvoice(invoiceId, {
+          amount: 200,
+          status: 'claimed',
+          entryType: 'refund',
+        });
+
+        const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+        expect(result.claimedAmount).toBeCloseTo(400);
+      });
+
+      it('a paid refund reduces unclaimedAmount (SQL wiring for deposit_entry_type)', () => {
+        // invoice=1000 pending, deposit 500 paid, refund 150 paid
+        // unclaimedAmount = 500 - 150 = 350
+        const raw = insertRawSource({ name: 'Refund Unclaim Source', totalAmount: 50000 });
+        const { budgetId } = insertRawWorkItemWithSource(raw.id, 1000);
+        const invoiceId = insertInvoiceForBudgetLine(budgetId, 1000, 'pending');
+        insertDepositForInvoice(invoiceId, { amount: 500, status: 'paid' });
+        insertDepositForInvoice(invoiceId, { amount: 150, status: 'paid', entryType: 'refund' });
+
+        const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+        expect(result.unclaimedAmount).toBeCloseTo(350);
+      });
+
+      it('regression: zero refunds — claimedAmount/unclaimedAmount unaffected (identical to pre-#1876)', () => {
+        const raw = insertRawSource({ name: 'No Refund Regression Source', totalAmount: 50000 });
+        const { budgetId } = insertRawWorkItemWithSource(raw.id, 1000);
+        const invoiceId = insertInvoiceForBudgetLine(budgetId, 1000, 'pending');
+        insertDepositForInvoice(invoiceId, { amount: 400, status: 'claimed' });
+
+        const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+        expect(result.claimedAmount).toBeCloseTo(400);
+      });
+    });
+
+    describe('Discretionary source — deposit-aware catch-all amounts (#1743)', () => {
+      /**
+       * Insert a standalone invoice (with optional budget-line allocations) at any status,
+       * including 'pending' and 'quotation' which insertInvoiceWithRemainder does not support.
+       */
+      function insertStandaloneInvoice(
+        invoiceAmount: number,
+        status: 'pending' | 'paid' | 'claimed' | 'quotation',
+        allocations: Array<{ budgetLineId: string; itemizedAmount: number }>,
+      ): string {
+        const ts = new Date(Date.now() + workItemCounter).toISOString();
+        const vendorId = `vendor-disc-dep-${++workItemCounter}`;
+        db.insert(schema.vendors)
+          .values({
+            id: vendorId,
+            name: `Disc Dep Vendor ${vendorId}`,
+            createdAt: ts,
+            updatedAt: ts,
+          })
+          .run();
+        const invoiceId = `inv-disc-dep-${workItemCounter}`;
+        db.insert(schema.invoices)
+          .values({
+            id: invoiceId,
+            vendorId,
+            amount: invoiceAmount,
+            date: '2026-01-01',
+            status,
+            createdAt: ts,
+            updatedAt: ts,
+          })
+          .run();
+        for (const alloc of allocations) {
+          db.insert(schema.invoiceBudgetLines)
+            .values({
+              id: randomUUID(),
+              invoiceId,
+              workItemBudgetId: alloc.budgetLineId,
+              itemizedAmount: alloc.itemizedAmount,
+              createdAt: ts,
+              updatedAt: ts,
+            })
+            .run();
+        }
+        return invoiceId;
+      }
+
+      it('(a) pending un-itemized invoice with paid deposit contributes to discretionary unclaimedAmount', () => {
+        // pending invoice (1000), fully un-itemized + paid deposit 300
+        // The deposit is paid → unclaimedAmount should include the 300
+        // claimedAmount must remain 0 (no claimed deposit)
+        const invoiceId = insertStandaloneInvoice(1000, 'pending', []);
+        insertDepositForInvoice(invoiceId, { amount: 300, status: 'paid' });
+
+        const disc = getDiscretionarySource();
+        // unclaimedAmount = computeDiscretionaryInvoiceAmount(db, 'paid') — deposit fraction 300/1000 * 1000 = 300
+        expect(disc.unclaimedAmount).toBeCloseTo(300);
+        expect(disc.claimedAmount).toBe(0);
+      });
+
+      it('(b) pending un-itemized invoice with claimed deposit contributes to discretionary claimedAmount', () => {
+        // pending invoice (1000), fully un-itemized + claimed deposit 300
+        // The deposit is claimed → claimedAmount should include the 300
+        // unclaimedAmount must remain 0 (no paid deposit)
+        const invoiceId = insertStandaloneInvoice(1000, 'pending', []);
+        insertDepositForInvoice(invoiceId, { amount: 300, status: 'claimed' });
+
+        const disc = getDiscretionarySource();
+        expect(disc.claimedAmount).toBeCloseTo(300);
+        expect(disc.unclaimedAmount).toBe(0);
+      });
+
+      it('(c) partially-itemized pending invoice: paid deposit splits proportionally between named source and discretionary', () => {
+        // pending invoice (1000): 600 itemized to named source, 400 un-itemized (discretionary remainder)
+        // paid deposit 300 → split 60/40 between named source and discretionary
+        // named source unclaimedAmount ≈ 180 (600/1000 × 300)
+        // discretionary unclaimedAmount ≈ 120 (400/1000 × 300)
+        const namedSource = insertRawSource({
+          name: 'Named Source Partial',
+          sourceType: 'bank_loan',
+          totalAmount: 50000,
+        });
+        const { budgetId } = insertRawWorkItemWithSource(namedSource.id, 1000);
+        const invoiceId = insertStandaloneInvoice(1000, 'pending', [
+          { budgetLineId: budgetId, itemizedAmount: 600 },
+        ]);
+        insertDepositForInvoice(invoiceId, { amount: 300, status: 'paid' });
+
+        const named = budgetSourceService.getBudgetSourceById(db, namedSource.id);
+        // 600/1000 * 300 = 180
+        expect(named.unclaimedAmount).toBeCloseTo(180);
+
+        const disc = getDiscretionarySource();
+        // 400/1000 * 300 = 120
+        expect(disc.unclaimedAmount).toBeCloseTo(120);
+      });
+
+      it('(d) regression: quotation invoice with paid deposit — deposit counts but quotation residual does not', () => {
+        // quotation invoice (1000), un-itemized + paid deposit 300
+        // The broadened WHERE clause now admits the row (deposit status = 'paid')
+        // The deposit fraction (300) → goes to unclaimedAmount (paid deposit)
+        // The residual (700) has invoice_status = 'quotation' which is NOT 'paid' → does NOT count
+        // paidAmount = claimedAmount + unclaimedAmount = 0 + 300 = 300
+        const invoiceId = insertStandaloneInvoice(1000, 'quotation', []);
+        insertDepositForInvoice(invoiceId, { amount: 300, status: 'paid' });
+
+        const disc = getDiscretionarySource();
+        expect(disc.unclaimedAmount).toBeCloseTo(300);
+        expect(disc.claimedAmount).toBe(0);
+        // paidAmount = claimedAmount + unclaimedAmount — no double-counting from quotation residual
+        expect(disc.paidAmount).toBeCloseTo(300);
+      });
+
+      // ─── Story #1876: refund entries in the discretionary catch-all path ────
+
+      it('(e) Story #1876: a paid refund on a discretionary (no-source) invoice reduces discretionary unclaimedAmount', () => {
+        // pending invoice (1000), fully un-itemized (discretionary), paid deposit 300, paid refund 100
+        // unclaimedAmount = 300 - 100 = 200
+        const invoiceId = insertStandaloneInvoice(1000, 'pending', []);
+        insertDepositForInvoice(invoiceId, { amount: 300, status: 'paid' });
+        insertDepositForInvoice(invoiceId, { amount: 100, status: 'paid', entryType: 'refund' });
+
+        const disc = getDiscretionarySource();
+        expect(disc.unclaimedAmount).toBeCloseTo(200);
+      });
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Story #1891: Rail B — deposits tagged directly to a budget source
+  // contribute to claimed/unclaimed/discretionary amounts even with ZERO
+  // budget lines referencing that source.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  describe('Rail B — tagged deposits (Story #1891)', () => {
+    function insertStandaloneInvoiceNoLines(
+      invoiceAmount: number,
+      status: 'pending' | 'paid' | 'claimed' | 'quotation',
+    ): string {
+      const ts = new Date(Date.now() + workItemCounter).toISOString();
+      const vendorId = `vendor-railb-${++workItemCounter}`;
+      db.insert(schema.vendors)
+        .values({ id: vendorId, name: `Rail B Vendor ${vendorId}`, createdAt: ts, updatedAt: ts })
+        .run();
+      const invoiceId = `inv-railb-${workItemCounter}`;
+      db.insert(schema.invoices)
+        .values({
+          id: invoiceId,
+          vendorId,
+          amount: invoiceAmount,
+          date: '2026-01-01',
+          status,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      return invoiceId;
+    }
+
+    function insertTaggedDeposit(
+      invoiceId: string,
+      opts: {
+        amount: number;
+        status: 'pending' | 'paid' | 'claimed';
+        entryType?: 'deposit' | 'refund';
+        budgetSourceId: string | null;
+      },
+    ): string {
+      const id = `dep-railb-${++workItemCounter}`;
+      const ts = new Date(Date.now() + workItemCounter).toISOString();
+      db.insert(schema.invoiceDeposits)
+        .values({
+          id,
+          invoiceId,
+          amount: opts.amount,
+          dueDate: '2026-03-01',
+          status: opts.status,
+          entryType: opts.entryType ?? 'deposit',
+          budgetSourceId: opts.budgetSourceId,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      return id;
+    }
+
+    it('a deposit tagged directly to a source with ZERO budget lines contributes to claimedAmount', () => {
+      // Source has no work_item_budgets / household_item_budgets referencing it at all —
+      // Rail A alone would report claimedAmount = 0. Rail B must still surface the tagged
+      // deposit's claimed contribution.
+      const raw = insertRawSource({ name: 'Zero-Line Tagged Source', totalAmount: 50000 });
+      const invoiceId = insertStandaloneInvoiceNoLines(1000, 'pending');
+      insertTaggedDeposit(invoiceId, { amount: 250, status: 'claimed', budgetSourceId: raw.id });
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.claimedAmount).toBeCloseTo(250);
+    });
+
+    it('a deposit tagged directly to a source with ZERO budget lines contributes to unclaimedAmount when paid', () => {
+      const raw = insertRawSource({ name: 'Zero-Line Unclaimed Source', totalAmount: 50000 });
+      const invoiceId = insertStandaloneInvoiceNoLines(1000, 'pending');
+      insertTaggedDeposit(invoiceId, { amount: 150, status: 'paid', budgetSourceId: raw.id });
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.unclaimedAmount).toBeCloseTo(150);
+      expect(result.claimedAmount).toBe(0);
+    });
+
+    it('a pending-status tagged deposit contributes to neither claimedAmount nor unclaimedAmount', () => {
+      const raw = insertRawSource({ name: 'Zero-Line Pending Source', totalAmount: 50000 });
+      const invoiceId = insertStandaloneInvoiceNoLines(1000, 'pending');
+      insertTaggedDeposit(invoiceId, { amount: 400, status: 'pending', budgetSourceId: raw.id });
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.claimedAmount).toBe(0);
+      expect(result.unclaimedAmount).toBe(0);
+    });
+
+    it('a deposit tagged to a DIFFERENT source does not leak into this source’s claimedAmount', () => {
+      const sourceA = insertRawSource({ name: 'Rail B Source A', totalAmount: 50000 });
+      const sourceB = insertRawSource({ name: 'Rail B Source B', totalAmount: 50000 });
+      const invoiceId = insertStandaloneInvoiceNoLines(1000, 'pending');
+      insertTaggedDeposit(invoiceId, {
+        amount: 500,
+        status: 'claimed',
+        budgetSourceId: sourceB.id,
+      });
+
+      const resultA = budgetSourceService.getBudgetSourceById(db, sourceA.id);
+      expect(resultA.claimedAmount).toBe(0);
+      const resultB = budgetSourceService.getBudgetSourceById(db, sourceB.id);
+      expect(resultB.claimedAmount).toBeCloseTo(500);
+    });
+
+    it('a refund entry tagged directly to a source nets negative against a tagged deposit in claimedAmount', () => {
+      const raw = insertRawSource({ name: 'Rail B Refund Source', totalAmount: 50000 });
+      const invoiceId = insertStandaloneInvoiceNoLines(1000, 'pending');
+      insertTaggedDeposit(invoiceId, {
+        amount: 500,
+        status: 'claimed',
+        entryType: 'deposit',
+        budgetSourceId: raw.id,
+      });
+      insertTaggedDeposit(invoiceId, {
+        amount: 200,
+        status: 'claimed',
+        entryType: 'refund',
+        budgetSourceId: raw.id,
+      });
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      expect(result.claimedAmount).toBeCloseTo(300);
+    });
+
+    it('Rail A (line) + Rail B (tagged deposit) combine additively for the same source', () => {
+      const raw = insertRawSource({ name: 'Combined Rail Source', totalAmount: 50000 });
+      const { budgetId } = insertRawWorkItemWithSource(raw.id, 1000);
+      const ts = new Date().toISOString();
+      const vendorId = `vendor-combined-${++workItemCounter}`;
+      db.insert(schema.vendors)
+        .values({ id: vendorId, name: `Combined Vendor`, createdAt: ts, updatedAt: ts })
+        .run();
+      const invoiceId = `inv-combined-${workItemCounter}`;
+      db.insert(schema.invoices)
+        .values({
+          id: invoiceId,
+          vendorId,
+          amount: 1000,
+          date: '2026-01-01',
+          status: 'paid', // Rail A: 1000 residual, status 'paid' → claimed target excludes it
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      db.insert(schema.invoiceBudgetLines)
+        .values({
+          id: randomUUID(),
+          invoiceId,
+          workItemBudgetId: budgetId,
+          itemizedAmount: 1000,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      // Rail B: a SEPARATE deposit tagged to this source on a DIFFERENT invoice.
+      const otherInvoiceId = insertStandaloneInvoiceNoLines(500, 'pending');
+      insertTaggedDeposit(otherInvoiceId, {
+        amount: 100,
+        status: 'claimed',
+        budgetSourceId: raw.id,
+      });
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+      // claimedAmount: Rail A contributes 0 (invoice paid, not claimed) + Rail B 100 = 100
+      expect(result.claimedAmount).toBeCloseTo(100);
+      // unclaimedAmount: Rail A contributes 1000 (paid, untagged, undeposited residual) + Rail B 0 = 1000
+      expect(result.unclaimedAmount).toBeCloseTo(1000);
+    });
+
+    it("canonical same-invoice case: a tagged deposit combines additively with the SAME invoice's residual to net exactly the invoice amount, and the untagged/legacy path is unaffected", () => {
+      // Canonical repro (Story #1891 double-count bug): a €1000 paid invoice, a €1000 line to
+      // source S, and a €400 claimed deposit tagged to S — all on the SAME invoice (unlike the
+      // "combine additively" test above, which uses two different invoices).
+      const raw = insertRawSource({ name: 'Canonical Same-Invoice Source', totalAmount: 50000 });
+      const { budgetId } = insertRawWorkItemWithSource(raw.id, 1000);
+      const ts = new Date().toISOString();
+      const vendorId = `vendor-canonical-${++workItemCounter}`;
+      db.insert(schema.vendors)
+        .values({ id: vendorId, name: `Canonical Vendor`, createdAt: ts, updatedAt: ts })
+        .run();
+      const invoiceId = `inv-canonical-${workItemCounter}`;
+      db.insert(schema.invoices)
+        .values({
+          id: invoiceId,
+          vendorId,
+          amount: 1000,
+          date: '2026-01-01',
+          status: 'paid',
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      db.insert(schema.invoiceBudgetLines)
+        .values({
+          id: randomUUID(),
+          invoiceId,
+          workItemBudgetId: budgetId,
+          itemizedAmount: 1000,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      insertTaggedDeposit(invoiceId, { amount: 400, status: 'claimed', budgetSourceId: raw.id });
+
+      const result = budgetSourceService.getBudgetSourceById(db, raw.id);
+
+      // Rail B (tagged deposit) counts 100% toward claimedAmount: deposit status 'claimed' → 400.
+      // Rail A (line share) still has the tagged deposit subtracted from its residual
+      // denominator (even though it's omitted from Rail A's depositFractions):
+      // residual = (1000 - 400) / 1000 = 0.6. Invoice status 'paid' → residual contributes to
+      // unclaimedAmount: 1000 * 0.6 = 600.
+      expect(result.claimedAmount).toBeCloseTo(400);
+      expect(result.unclaimedAmount).toBeCloseTo(600);
+      // paidAmount = claimedAmount + unclaimedAmount = 400 + 600 = 1000, exactly the invoice
+      // amount — NOT 1400 (what the pre-fix bug produced by treating the tagged deposit as if
+      // it didn't exist at all in Rail A's residual computation, so nothing was subtracted).
+      expect(result.paidAmount).toBeCloseTo(1000);
+
+      // Legacy path: prove the fix leaves UNTAGGED deposits untouched. Same fixture shape,
+      // but the deposit is left untagged (budgetSourceId: null) — this exercises the exact
+      // computeStatusContributionExcludingTagged code path that behaves byte-identically to
+      // the pre-#1891 computeStatusContribution for untagged rows (see the "regression:
+      // untagged fixtures produce byte-identical output" tests in depositAggregateUtils.test.ts).
+      const legacyRaw = insertRawSource({ name: 'Canonical Legacy Source', totalAmount: 50000 });
+      const { budgetId: legacyBudgetId } = insertRawWorkItemWithSource(legacyRaw.id, 1000);
+      const legacyVendorId = `vendor-legacy-${++workItemCounter}`;
+      db.insert(schema.vendors)
+        .values({ id: legacyVendorId, name: `Legacy Vendor`, createdAt: ts, updatedAt: ts })
+        .run();
+      const legacyInvoiceId = `inv-legacy-${workItemCounter}`;
+      db.insert(schema.invoices)
+        .values({
+          id: legacyInvoiceId,
+          vendorId: legacyVendorId,
+          amount: 1000,
+          date: '2026-01-01',
+          status: 'paid',
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      db.insert(schema.invoiceBudgetLines)
+        .values({
+          id: randomUUID(),
+          invoiceId: legacyInvoiceId,
+          workItemBudgetId: legacyBudgetId,
+          itemizedAmount: 1000,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      insertTaggedDeposit(legacyInvoiceId, {
+        amount: 400,
+        status: 'claimed',
+        budgetSourceId: null,
+      });
+
+      const legacyResult = budgetSourceService.getBudgetSourceById(db, legacyRaw.id);
+      // Untagged deposit: residual and deposit fraction both derive from the same source's own
+      // lines, so claimedAmount(400)/unclaimedAmount(600) split identically here — the point is
+      // that paidAmount still nets to exactly 1000, proving legacy (untagged) behavior is
+      // unaffected by the Rail A/Rail B tagging fix.
+      expect(legacyResult.paidAmount).toBeCloseTo(1000);
+    });
+
+    describe('discretionary variant: tagged deposit on the discretionary source', () => {
+      it('a deposit tagged directly to the discretionary source contributes to discretionary claimedAmount', () => {
+        const invoiceId = insertStandaloneInvoiceNoLines(1000, 'pending');
+        insertTaggedDeposit(invoiceId, {
+          amount: 350,
+          status: 'claimed',
+          budgetSourceId: 'discretionary-system',
+        });
+
+        const disc = getDiscretionarySource();
+        expect(disc.claimedAmount).toBeCloseTo(350);
+      });
+
+      it('a deposit tagged directly to the discretionary source contributes to discretionary unclaimedAmount when paid', () => {
+        const invoiceId = insertStandaloneInvoiceNoLines(1000, 'pending');
+        insertTaggedDeposit(invoiceId, {
+          amount: 200,
+          status: 'paid',
+          budgetSourceId: 'discretionary-system',
+        });
+
+        const disc = getDiscretionarySource();
+        expect(disc.unclaimedAmount).toBeCloseTo(200);
+        expect(disc.claimedAmount).toBe(0);
+      });
+
+      it('a deposit tagged to a NON-discretionary source does not leak into discretionary amounts', () => {
+        const raw = insertRawSource({ name: 'Non-Discretionary Tag Target', totalAmount: 50000 });
+        const invoiceId = insertStandaloneInvoiceNoLines(1000, 'pending');
+        insertTaggedDeposit(invoiceId, { amount: 300, status: 'claimed', budgetSourceId: raw.id });
+
+        const disc = getDiscretionarySource();
+        expect(disc.claimedAmount).toBe(0);
+      });
+    });
+  });
+
+  // ─── #1897 deposit-aware drill-down via getBudgetSourceBudgetLines ──────────
+
+  describe('deposit-aware drill-down — getBudgetSourceBudgetLines (#1897)', () => {
+    /**
+     * Helper: insert a vendor + invoice + invoice_budget_line for a work item budget line.
+     * Uses workItemBudgetId FK. Returns the invoiceId.
+     */
+    function insertInvoiceForWILine(
+      budgetLineId: string,
+      amount: number,
+      status: 'pending' | 'paid' | 'claimed',
+    ): string {
+      const ts = new Date(Date.now() + workItemCounter).toISOString();
+      const vendorId = `vendor-1897-wi-${++workItemCounter}`;
+      db.insert(schema.vendors)
+        .values({ id: vendorId, name: `1897 WI Vendor ${vendorId}`, createdAt: ts, updatedAt: ts })
+        .run();
+      const invoiceId = `inv-1897-wi-${workItemCounter}`;
+      db.insert(schema.invoices)
+        .values({
+          id: invoiceId,
+          vendorId,
+          amount,
+          date: '2026-01-01',
+          status,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      db.insert(schema.invoiceBudgetLines)
+        .values({
+          id: randomUUID(),
+          invoiceId,
+          workItemBudgetId: budgetLineId,
+          itemizedAmount: amount,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      return invoiceId;
+    }
+
+    /**
+     * Helper: insert a deposit for a given invoice.
+     * budgetSourceId defaults to null (untagged), matching the deposit-blind repro scenario.
+     * Returns the deposit ID.
+     */
+    function insertDeposit(
+      invoiceId: string,
+      amount: number,
+      status: 'pending' | 'paid' | 'claimed',
+    ): string {
+      const id = `dep-1897-${++workItemCounter}`;
+      const ts = new Date(Date.now() + workItemCounter).toISOString();
+      db.insert(schema.invoiceDeposits)
+        .values({
+          id,
+          invoiceId,
+          amount,
+          dueDate: '2026-03-01',
+          status,
+          entryType: 'deposit',
+          budgetSourceId: null,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      return id;
+    }
+
+    /**
+     * Helper: insert a vendor + invoice + invoice_budget_line for a household item budget line.
+     * Uses householdItemBudgetId FK instead of workItemBudgetId. Returns the invoiceId.
+     */
+    function insertInvoiceForHILine(
+      budgetLineId: string,
+      amount: number,
+      status: 'pending' | 'paid' | 'claimed',
+    ): string {
+      const ts = new Date(Date.now() + householdItemCounter).toISOString();
+      const vendorId = `vendor-1897-hi-${++householdItemCounter}`;
+      db.insert(schema.vendors)
+        .values({ id: vendorId, name: `1897 HI Vendor ${vendorId}`, createdAt: ts, updatedAt: ts })
+        .run();
+      const invoiceId = `inv-1897-hi-${householdItemCounter}`;
+      db.insert(schema.invoices)
+        .values({
+          id: invoiceId,
+          vendorId,
+          amount,
+          date: '2026-01-01',
+          status,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      db.insert(schema.invoiceBudgetLines)
+        .values({
+          id: randomUUID(),
+          invoiceId,
+          householdItemBudgetId: budgetLineId,
+          itemizedAmount: amount,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      return invoiceId;
+    }
+
+    it('AC1 — reproduction: pending invoice with paid deposit → actualCostPaid = deposit amount (was 0 before fix)', () => {
+      // The broken case: pre-fix, buildWorkItemBudgetLine used deposit-blind SQL that ignored
+      // invoice_deposits entirely, so a pending invoice with a paid €400 deposit returned
+      // actualCostPaid = 0. The fix routes through getInvoiceAggregates (budgetServiceFactory)
+      // which uses computeDepositAwareAggregates.
+      const src = insertRawSource({ name: 'AC1 Pending+Deposit Source', totalAmount: 50000 });
+      const { budgetId } = insertRawWorkItemWithSource(src.id, 1000);
+      const invoiceId = insertInvoiceForWILine(budgetId, 1000, 'pending');
+      insertDeposit(invoiceId, 400, 'paid');
+
+      const result = budgetSourceService.getBudgetSourceBudgetLines(db, src.id);
+
+      expect(result.workItemLines).toHaveLength(1);
+      expect(result.workItemLines[0]!.actualCost).toBe(1000);
+      expect(result.workItemLines[0]!.actualCostPaid).toBeCloseTo(400);
+      expect(result.workItemLines[0]!.hasClaimedInvoice).toBe(false);
+    });
+
+    it('AC2 — pending invoice, no deposits: actualCostPaid = 0, actualCost = invoice amount (no regression)', () => {
+      const src = insertRawSource({ name: 'AC2 Pending No-Deposit Source', totalAmount: 50000 });
+      const { budgetId } = insertRawWorkItemWithSource(src.id, 500);
+      insertInvoiceForWILine(budgetId, 500, 'pending');
+
+      const result = budgetSourceService.getBudgetSourceBudgetLines(db, src.id);
+
+      expect(result.workItemLines[0]!.actualCost).toBe(500);
+      expect(result.workItemLines[0]!.actualCostPaid).toBe(0);
+      expect(result.workItemLines[0]!.hasClaimedInvoice).toBe(false);
+    });
+
+    it('AC3 — paid invoice, no deposits: actualCostPaid = invoice amount (no regression)', () => {
+      const src = insertRawSource({ name: 'AC3 Paid No-Deposit Source', totalAmount: 50000 });
+      const { budgetId } = insertRawWorkItemWithSource(src.id, 800);
+      insertInvoiceForWILine(budgetId, 800, 'paid');
+
+      const result = budgetSourceService.getBudgetSourceBudgetLines(db, src.id);
+
+      expect(result.workItemLines[0]!.actualCost).toBe(800);
+      expect(result.workItemLines[0]!.actualCostPaid).toBeCloseTo(800);
+      expect(result.workItemLines[0]!.hasClaimedInvoice).toBe(false);
+    });
+
+    it('AC4 — claimed invoice, no deposits: hasClaimedInvoice = true, actualCostPaid = invoice amount', () => {
+      // actualCostPaid includes both 'paid' and 'claimed' contributions per depositAggregateUtils.
+      const src = insertRawSource({ name: 'AC4 Claimed Source', totalAmount: 50000 });
+      const { budgetId } = insertRawWorkItemWithSource(src.id, 600);
+      insertInvoiceForWILine(budgetId, 600, 'claimed');
+
+      const result = budgetSourceService.getBudgetSourceBudgetLines(db, src.id);
+
+      expect(result.workItemLines[0]!.hasClaimedInvoice).toBe(true);
+      expect(result.workItemLines[0]!.actualCostPaid).toBeCloseTo(600);
+      expect(result.workItemLines[0]!.actualCost).toBe(600);
+    });
+
+    it('AC5 — pending invoice with claimed deposit: hasClaimedInvoice = true, actualCostPaid = deposit amount', () => {
+      // Deposit is claimed → the deposit fraction contributes to actualCostClaimed,
+      // flipping hasClaimedInvoice = true even though the invoice itself is pending.
+      const src = insertRawSource({ name: 'AC5 Claimed-Deposit Source', totalAmount: 50000 });
+      const { budgetId } = insertRawWorkItemWithSource(src.id, 1000);
+      const invoiceId = insertInvoiceForWILine(budgetId, 1000, 'pending');
+      insertDeposit(invoiceId, 300, 'claimed');
+
+      const result = budgetSourceService.getBudgetSourceBudgetLines(db, src.id);
+
+      expect(result.workItemLines[0]!.hasClaimedInvoice).toBe(true);
+      expect(result.workItemLines[0]!.actualCostPaid).toBeCloseTo(300);
+      expect(result.workItemLines[0]!.actualCost).toBe(1000);
+    });
+
+    it('AC6 — household item variant: pending invoice with paid deposit → actualCostPaid = deposit amount', () => {
+      // Verifies the deposit-aware path through buildHouseholdItemBudgetLine, which uses
+      // getInvoiceAggregates with 'household_item_budget_id' as the FK column.
+      const src = insertRawSource({ name: 'AC6 HI Source', totalAmount: 50000 });
+      const { budgetId } = insertRawHouseholdItemWithSource(src.id, 1200);
+      const invoiceId = insertInvoiceForHILine(budgetId, 1200, 'pending');
+      insertDeposit(invoiceId, 500, 'paid');
+
+      const result = budgetSourceService.getBudgetSourceBudgetLines(db, src.id);
+
+      expect(result.householdItemLines).toHaveLength(1);
+      expect(result.householdItemLines[0]!.actualCost).toBe(1200);
+      expect(result.householdItemLines[0]!.actualCostPaid).toBeCloseTo(500);
+      expect(result.householdItemLines[0]!.hasClaimedInvoice).toBe(false);
+    });
+
+    it('AC8 — claimed invoice fully covered by paid deposits still sets hasClaimedInvoice = true', () => {
+      // Edge case for the hasClaimedInvoice fix (issue #1897):
+      // When a claimed invoice is 100% covered by paid (not claimed) deposits,
+      // residualFraction = 0, so actualCostClaimed = 0.
+      // Old logic (actualCostClaimed > 0) would incorrectly return hasClaimedInvoice = false.
+      // New logic checks rows.some(r => r.invoice_status === 'claimed' || r.deposit_status === 'claimed'),
+      // which sees invoice_status = 'claimed' and correctly returns true.
+      const src = insertRawSource({ name: 'AC8 Claimed+PaidDeposit Source', totalAmount: 50000 });
+      const { budgetId } = insertRawWorkItemWithSource(src.id, 1000);
+      const invoiceId = insertInvoiceForWILine(budgetId, 1000, 'claimed');
+      insertDeposit(invoiceId, 1000, 'paid'); // fully covers the invoice → residualFraction = 0
+
+      const result = budgetSourceService.getBudgetSourceBudgetLines(db, src.id);
+
+      expect(result.workItemLines).toHaveLength(1);
+      // residualFraction = 0, so the residual portion contributes 0 to actualCostClaimed,
+      // but the paid deposit contributes its full amount to actualCostPaid.
+      expect(result.workItemLines[0]!.actualCost).toBe(1000);
+      expect(result.workItemLines[0]!.actualCostPaid).toBeCloseTo(1000);
+      // The invoice IS claimed — hasClaimedInvoice must be true regardless of actualCostClaimed.
+      expect(result.workItemLines[0]!.hasClaimedInvoice).toBe(true);
+    });
+
+    it('AC7 — rider regression: computeDiscretionaryInvoiceAmount passes status through correctly for status="paid"', () => {
+      // The rider fix changed `new Set([status === 'claimed' ? 'claimed' : 'paid'])` to
+      // `new Set([status])`. For the two caller-supplied values ('paid', 'claimed') the behavior
+      // is identical, so this is a regression guard only.
+      // Exercises Rail B of computeDiscretionaryInvoiceAmount via getBudgetSourceById on the
+      // seeded discretionary-system source with a pending invoice + paid tagged deposit.
+      // Additional coverage exists in 'Rail B — tagged deposits (Story #1891)' >
+      // 'discretionary variant: tagged deposit on the discretionary source'.
+      const ts = new Date(Date.now() + workItemCounter).toISOString();
+      const vendorId = `vendor-ac7-${++workItemCounter}`;
+      db.insert(schema.vendors)
+        .values({ id: vendorId, name: `AC7 Rider Vendor`, createdAt: ts, updatedAt: ts })
+        .run();
+      const invoiceId = `inv-ac7-${workItemCounter}`;
+      db.insert(schema.invoices)
+        .values({
+          id: invoiceId,
+          vendorId,
+          amount: 1000,
+          date: '2026-01-01',
+          status: 'pending',
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+      const depositAmount = 250;
+      db.insert(schema.invoiceDeposits)
+        .values({
+          id: `dep-ac7-${workItemCounter}`,
+          invoiceId,
+          amount: depositAmount,
+          dueDate: '2026-03-01',
+          status: 'paid',
+          entryType: 'deposit',
+          budgetSourceId: 'discretionary-system',
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+
+      // getBudgetSourceById calls getSourceAmounts which, for the discretionary source,
+      // calls computeDiscretionaryInvoiceAmount(db, 'paid') → Rail B picks up the tagged deposit.
+      const disc = budgetSourceService.getBudgetSourceById(db, 'discretionary-system');
+      expect(disc.unclaimedAmount).toBeCloseTo(depositAmount);
+      expect(disc.claimedAmount).toBe(0);
+    });
+  });
+});

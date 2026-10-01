@@ -1,0 +1,1359 @@
+/**
+ * Unit tests for paperlessService.ts
+ *
+ * Tests cover:
+ * - fetchPaperless helper (network error, 404, non-ok, success)
+ * - fetchBinary helper (network error, 404, non-ok, success)
+ * - getStatus (reachable, unreachable, error)
+ * - listDocuments (basic, with search, with filters, pagination, sorting)
+ * - getDocument (success, not found)
+ * - listTags (success, empty)
+ * - API version 10 Accept header, hex tag colors, numeric/string search scores,
+ *   HTTP 406 (unsupported API version) handling
+ *
+ * Strategy: global.fetch is replaced with a jest mock in beforeEach.
+ * The service calls fetch at invocation time (not import time), so the mock
+ * is correctly active for all service function calls.
+ */
+
+import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
+import * as paperlessService from './paperlessService.js';
+import type { AppError } from '../errors/AppError.js';
+
+// ─── Mock global fetch ────────────────────────────────────────────────────────
+
+const mockFetch = jest.fn<typeof fetch>();
+let originalFetch: typeof fetch;
+
+beforeEach(() => {
+  originalFetch = global.fetch;
+  global.fetch = mockFetch as unknown as typeof fetch;
+  mockFetch.mockReset();
+  paperlessService._resetFilterTagCache();
+});
+
+afterEach(() => {
+  global.fetch = originalFetch;
+});
+
+// ─── Helpers for building mock responses ─────────────────────────────────────
+
+function mockJsonResponse(body: unknown, status = 200): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText:
+      status === 200
+        ? 'OK'
+        : status === 404
+          ? 'Not Found'
+          : status === 406
+            ? 'Not Acceptable'
+            : 'Error',
+    json: () => Promise.resolve(body),
+    headers: {
+      get: (_key: string) => null,
+    },
+    arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+  } as unknown as Response;
+}
+
+function mockBinaryResponse(data: Buffer, contentType = 'image/webp'): Response {
+  return {
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    json: () => Promise.reject(new Error('Not JSON')),
+    headers: {
+      get: (key: string) => (key === 'content-type' ? contentType : null),
+    },
+    arrayBuffer: () =>
+      Promise.resolve(
+        data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer,
+      ),
+  } as unknown as Response;
+}
+
+// ─── Raw fixture data ─────────────────────────────────────────────────────────
+
+const RAW_TAG_1 = { id: 5, name: 'invoice', color: '#e31a1c', document_count: 15 };
+const RAW_TAG_2 = { id: 12, name: 'contract', color: '#1f78b4', document_count: 8 };
+
+const RAW_TAGS_RESPONSE = { count: 2, results: [RAW_TAG_1, RAW_TAG_2]! };
+
+const RAW_DOCUMENT_1 = {
+  id: 42,
+  title: 'Invoice from Builder Co',
+  content: 'Full text content here.',
+  tags: [5, 12],
+  created: '2026-01-15',
+  added: '2026-01-16T08:30:00Z',
+  modified: '2026-01-16T08:30:00Z',
+  correspondent: 3,
+  document_type: 7,
+  archive_serial_number: 1042,
+  original_file_name: 'invoice-2026-001.pdf',
+  page_count: 2,
+};
+
+const RAW_LIST_RESPONSE = {
+  count: 1,
+  results: [RAW_DOCUMENT_1],
+};
+
+const BASE_URL = 'http://paperless:8000';
+const TOKEN = 'test-api-token';
+
+// ─── getStatus tests ──────────────────────────────────────────────────────────
+
+describe('getStatus()', () => {
+  it('returns reachable=true when probe request succeeds', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 1 }));
+
+    const result = await paperlessService.getStatus(BASE_URL, TOKEN);
+
+    expect(result).toEqual({
+      configured: true,
+      reachable: true,
+      error: null,
+      paperlessUrl: null,
+      filterTag: null,
+    });
+    expect(mockFetch).toHaveBeenCalledWith(
+      `${BASE_URL}/api/documents/?page_size=1`,
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: `Token ${TOKEN}` }),
+      }),
+    );
+  });
+
+  it('returns reachable=false with error message when fetch throws (network error)', async () => {
+    mockFetch.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+
+    const result = await paperlessService.getStatus(BASE_URL, TOKEN);
+
+    expect(result.configured).toBe(true);
+    expect(result.reachable).toBe(false);
+    expect(result.error).toContain('ECONNREFUSED');
+  });
+
+  it('sanitizes IP addresses from error messages to prevent information disclosure', async () => {
+    mockFetch.mockRejectedValueOnce(new Error('connect ECONNREFUSED 10.0.0.5:8000'));
+
+    const result = await paperlessService.getStatus(BASE_URL, TOKEN);
+
+    expect(result.reachable).toBe(false);
+    // IP address should be redacted
+    expect(result.error).not.toContain('10.0.0.5');
+    expect(result.error).toContain('<host>');
+    // General error type should still be present
+    expect(result.error).toContain('ECONNREFUSED');
+  });
+
+  it('sanitizes hostname:port from error messages to prevent information disclosure', async () => {
+    mockFetch.mockRejectedValueOnce(new Error('getaddrinfo ENOTFOUND paperless-host:8000'));
+
+    const result = await paperlessService.getStatus(BASE_URL, TOKEN);
+
+    expect(result.reachable).toBe(false);
+    // Hostname:port should be redacted
+    expect(result.error).not.toContain('paperless-host:8000');
+    expect(result.error).toContain('<host>');
+  });
+
+  it('returns reachable=false with error message when Paperless returns non-ok', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ detail: 'Forbidden' }, 403));
+
+    const result = await paperlessService.getStatus(BASE_URL, TOKEN);
+
+    expect(result.configured).toBe(true);
+    expect(result.reachable).toBe(false);
+    expect(result.error).toBeDefined();
+    expect(result.error).not.toBeNull();
+  });
+
+  it('includes Accept header with API version 10', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 0 }));
+
+    await paperlessService.getStatus(BASE_URL, TOKEN);
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        headers: expect.objectContaining({ Accept: 'application/json; version=10' }),
+      }),
+    );
+  });
+
+  it('returns reachable=false with an API-version hint when Paperless returns 406', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ detail: 'Not acceptable' }, 406));
+
+    const result = await paperlessService.getStatus(BASE_URL, TOKEN);
+
+    expect(result.configured).toBe(true);
+    expect(result.reachable).toBe(false);
+    expect(result.error).toContain('API version 10');
+  });
+
+  describe('filter tag resolution', () => {
+    beforeEach(() => {
+      paperlessService._resetFilterTagCache();
+    });
+
+    it('returns filterTag=null when filterTagName not provided', async () => {
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 1 }));
+
+      const result = await paperlessService.getStatus(BASE_URL, TOKEN);
+
+      expect(result.filterTag).toBeNull();
+      // Only one fetch call (the status probe), no tags lookup
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns filterTag with tag name when tag found', async () => {
+      // First call: status probe
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 1 }));
+      // Second call: tags lookup
+      mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+
+      const result = await paperlessService.getStatus(BASE_URL, TOKEN, 'invoice');
+
+      expect(result.filterTag).toBe('invoice');
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('returns filterTag=null when tag name not found in Paperless', async () => {
+      // First call: status probe
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 1 }));
+      // Second call: tags lookup (empty results)
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 0, results: [] }));
+
+      const result = await paperlessService.getStatus(BASE_URL, TOKEN, 'missing');
+
+      expect(result.filterTag).toBeNull();
+    });
+
+    it('caches filter tag ID for subsequent calls', async () => {
+      mockFetch.mockClear();
+      // First call to getStatus
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 1 }));
+      mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+
+      await paperlessService.getStatus(BASE_URL, TOKEN, 'invoice');
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+
+      mockFetch.mockClear();
+      // Second call to getStatus with same tag name
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 1 }));
+
+      await paperlessService.getStatus(BASE_URL, TOKEN, 'invoice');
+      // Should only call once (status probe) since tag is cached
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+// ─── listDocuments tests ──────────────────────────────────────────────────────
+
+describe('listDocuments()', () => {
+  /**
+   * Helper: set up standard mocks for tags, correspondents, document types, then docs.
+   */
+  function setupListMocks(docResponse = RAW_LIST_RESPONSE) {
+    // First call: documents list
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(docResponse));
+    // Second call: tags
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+    // Third call: correspondent 3
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 3, name: 'Builder Co' }));
+    // Fourth call: document_type 7
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 7, name: 'Invoice' }));
+  }
+
+  it('returns correctly shaped response with resolved names', async () => {
+    setupListMocks();
+
+    const result = await paperlessService.listDocuments(BASE_URL, TOKEN, {});
+
+    expect(result.documents).toHaveLength(1);
+    const doc = result.documents[0]!;
+    expect(doc.id).toBe(42);
+    expect(doc.title).toBe('Invoice from Builder Co');
+    expect(doc.content).toBeNull(); // list view omits content
+    expect(doc.correspondent).toBe('Builder Co');
+    expect(doc.documentType).toBe('Invoice');
+    expect(doc.tags).toHaveLength(2);
+    expect(doc.tags[0]!.name).toBe('invoice');
+    expect(doc.tags[1]!.name).toBe('contract');
+    expect(doc.searchHit).toBeNull(); // no search query
+  });
+
+  it('strips ISO datetime from created field to date-only (YYYY-MM-DD)', async () => {
+    setupListMocks();
+
+    const result = await paperlessService.listDocuments(BASE_URL, TOKEN, {});
+
+    expect(result.documents[0]!.created).toBe('2026-01-15');
+  });
+
+  it('returns correct pagination metadata', async () => {
+    setupListMocks({ count: 142, results: [RAW_DOCUMENT_1] });
+
+    const result = await paperlessService.listDocuments(BASE_URL, TOKEN, { page: 2, pageSize: 25 });
+
+    expect(result.pagination).toEqual({
+      page: 2,
+      pageSize: 25,
+      totalItems: 142,
+      totalPages: 6,
+    });
+  });
+
+  it('uses default page=1 and pageSize=25', async () => {
+    setupListMocks();
+
+    await paperlessService.listDocuments(BASE_URL, TOKEN, {});
+
+    const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+    expect(callUrl).toContain('page=1');
+    expect(callUrl).toContain('page_size=25');
+  });
+
+  it('clamps pageSize to max 100', async () => {
+    setupListMocks();
+
+    await paperlessService.listDocuments(BASE_URL, TOKEN, { pageSize: 999 });
+
+    const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+    expect(callUrl).toContain('page_size=100');
+  });
+
+  it('appends full-text search query param', async () => {
+    setupListMocks();
+
+    await paperlessService.listDocuments(BASE_URL, TOKEN, { query: 'invoice' });
+
+    const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+    expect(callUrl).toContain('query=invoice');
+  });
+
+  it('appends tag filter as tags__id__all', async () => {
+    setupListMocks();
+
+    await paperlessService.listDocuments(BASE_URL, TOKEN, { tags: '5,12' });
+
+    const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+    expect(callUrl).toContain('tags__id__all=5%2C12');
+  });
+
+  it('uses tags__id__all for AND semantics when multiple tags supplied', async () => {
+    setupListMocks();
+
+    await paperlessService.listDocuments(BASE_URL, TOKEN, { tags: '3,7,9' });
+
+    const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+    expect(callUrl).toContain('tags__id__all');
+    expect(callUrl).not.toContain('tags__id__in');
+  });
+
+  it('appends correspondent filter', async () => {
+    setupListMocks();
+
+    await paperlessService.listDocuments(BASE_URL, TOKEN, { correspondent: 3 });
+
+    const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+    expect(callUrl).toContain('correspondent__id=3');
+  });
+
+  it('appends document type filter', async () => {
+    setupListMocks();
+
+    await paperlessService.listDocuments(BASE_URL, TOKEN, { documentType: 7 });
+
+    const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+    expect(callUrl).toContain('document_type__id=7');
+  });
+
+  it('builds descending ordering by default (created)', async () => {
+    setupListMocks();
+
+    await paperlessService.listDocuments(BASE_URL, TOKEN, {});
+
+    const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+    expect(callUrl).toContain('ordering=-created');
+  });
+
+  it('builds ascending ordering when sortOrder=asc', async () => {
+    setupListMocks();
+
+    await paperlessService.listDocuments(BASE_URL, TOKEN, { sortBy: 'title', sortOrder: 'asc' });
+
+    const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+    expect(callUrl).toContain('ordering=title');
+    expect(callUrl).not.toContain('ordering=-title');
+  });
+
+  it('builds descending ordering for archive_serial_number', async () => {
+    setupListMocks();
+
+    await paperlessService.listDocuments(BASE_URL, TOKEN, {
+      sortBy: 'archive_serial_number',
+      sortOrder: 'desc',
+    });
+
+    const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+    expect(callUrl).toContain('ordering=-archive_serial_number');
+  });
+
+  describe('ordering id tiebreaker (#2101)', () => {
+    function orderingParam(): string | null {
+      const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+      return new URL(callUrl).searchParams.get('ordering');
+    }
+
+    it('appends a descending id tiebreaker to the default ordering (URL-encoded comma)', async () => {
+      setupListMocks();
+      await paperlessService.listDocuments(BASE_URL, TOKEN, {});
+
+      const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+      expect(callUrl).toContain('ordering=-created%2C-id');
+      expect(orderingParam()).toBe('-created,-id');
+    });
+
+    it('appends an ascending id tiebreaker when sortOrder=asc', async () => {
+      setupListMocks();
+      await paperlessService.listDocuments(BASE_URL, TOKEN, { sortBy: 'title', sortOrder: 'asc' });
+
+      const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+      expect(callUrl).toContain('ordering=title%2Cid');
+      expect(orderingParam()).toBe('title,id');
+    });
+
+    it('tiebreaker id follows the direction of a descending non-default sort field', async () => {
+      setupListMocks();
+      await paperlessService.listDocuments(BASE_URL, TOKEN, {
+        sortBy: 'archive_serial_number',
+        sortOrder: 'desc',
+      });
+      expect(orderingParam()).toBe('-archive_serial_number,-id');
+    });
+
+    it('omits the tiebreaker for full-text queries (single sort field only)', async () => {
+      setupListMocks();
+      await paperlessService.listDocuments(BASE_URL, TOKEN, { query: 'invoice' });
+
+      const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+      expect(orderingParam()).toBe('-created');
+      expect(callUrl).not.toContain('ordering=-created%2C');
+    });
+
+    it('omits the tiebreaker for full-text queries with ascending sort', async () => {
+      setupListMocks();
+      await paperlessService.listDocuments(BASE_URL, TOKEN, {
+        query: 'invoice',
+        sortBy: 'title',
+        sortOrder: 'asc',
+      });
+      expect(orderingParam()).toBe('title');
+    });
+  });
+
+  it('includes searchHit when document has __search_hit__', async () => {
+    const rawWithSearchHit = {
+      ...RAW_DOCUMENT_1,
+      __search_hit__: { score: '0.95', highlights: 'This <em>invoice</em>...', rank: 1 },
+    };
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 1, results: [rawWithSearchHit] }));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 3, name: 'Builder Co' }));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 7, name: 'Invoice' }));
+
+    const result = await paperlessService.listDocuments(BASE_URL, TOKEN, { query: 'invoice' });
+
+    expect(result.documents[0]!.searchHit).toEqual({
+      score: 0.95,
+      highlights: 'This <em>invoice</em>...',
+      rank: 1,
+    });
+  });
+
+  it.each([
+    ['numeric 0.95', 0.95, 0.95],
+    ['numeric 0', 0, 0],
+  ])('accepts a %s search score', async (_label, raw, expected) => {
+    const rawWithSearchHit = {
+      ...RAW_DOCUMENT_1,
+      __search_hit__: { score: raw, highlights: 'h', rank: 2 },
+    };
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 1, results: [rawWithSearchHit] }));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 3, name: 'Builder Co' }));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 7, name: 'Invoice' }));
+
+    const result = await paperlessService.listDocuments(BASE_URL, TOKEN, { query: 'invoice' });
+
+    expect(result.documents[0]!.searchHit!.score).toBe(expected);
+  });
+
+  it('keeps only the date part when Paperless returns a datetime for created', async () => {
+    mockFetch.mockResolvedValueOnce(
+      mockJsonResponse({
+        count: 1,
+        results: [{ ...RAW_DOCUMENT_1, created: '2026-01-15T00:00:00Z' }],
+      }),
+    );
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 3, name: 'Builder Co' }));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 7, name: 'Invoice' }));
+
+    const result = await paperlessService.listDocuments(BASE_URL, TOKEN, {});
+
+    expect(result.documents[0]!.created).toBe('2026-01-15');
+  });
+
+  it('resolves each unique correspondent and document type only once (no N+1)', async () => {
+    const doc2 = { ...RAW_DOCUMENT_1, id: 43, correspondent: 3, document_type: 7 };
+    mockFetch.mockResolvedValueOnce(
+      mockJsonResponse({ count: 2, results: [RAW_DOCUMENT_1, doc2] }),
+    );
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 3, name: 'Builder Co' }));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 7, name: 'Invoice' }));
+
+    const result = await paperlessService.listDocuments(BASE_URL, TOKEN, {});
+
+    // Should only have 4 fetch calls (docs + tags + 1 correspondent + 1 doc type)
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    expect(result.documents).toHaveLength(2);
+    expect(result.documents[0]!.correspondent).toBe('Builder Co');
+    expect(result.documents[1]!.correspondent).toBe('Builder Co');
+  });
+
+  it('handles documents with no tags, correspondent, or document type', async () => {
+    const minimalDoc = {
+      id: 99,
+      title: 'Minimal doc',
+      content: 'Content',
+      tags: [],
+      created: null,
+      added: null,
+      modified: null,
+      correspondent: null,
+      document_type: null,
+      archive_serial_number: null,
+      original_file_name: null,
+      page_count: null,
+    };
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 1, results: [minimalDoc] }));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 0, results: [] }));
+
+    const result = await paperlessService.listDocuments(BASE_URL, TOKEN, {});
+
+    const doc = result.documents[0]!;
+    expect(doc.tags).toEqual([]);
+    expect(doc.created).toBeNull();
+    expect(doc.correspondent).toBeNull();
+    expect(doc.documentType).toBeNull();
+    expect(doc.archiveSerialNumber).toBeNull();
+    expect(doc.originalFileName).toBeNull();
+    expect(doc.pageCount).toBeNull();
+    // Only 2 fetch calls (docs + tags — no correspondents or doc types to resolve)
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('passes valid hex tag colors through unchanged', async () => {
+    setupListMocks();
+
+    const result = await paperlessService.listDocuments(BASE_URL, TOKEN, {});
+
+    const invoiceTag = result.documents[0]!.tags.find((t) => t.name === 'invoice');
+    expect(invoiceTag?.color).toBe('#e31a1c');
+
+    const contractTag = result.documents[0]!.tags.find((t) => t.name === 'contract');
+    expect(contractTag?.color).toBe('#1f78b4');
+  });
+
+  describe('tag color handling (API v10 hex strings)', () => {
+    async function colorFor(rawTag: Record<string, unknown>): Promise<string | null | undefined> {
+      const doc = { ...RAW_DOCUMENT_1, tags: [20] };
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 1, results: [doc] }));
+      mockFetch.mockResolvedValueOnce(
+        mockJsonResponse({
+          count: 1,
+          results: [{ id: 20, name: 'misc', document_count: 3, ...rawTag }],
+        }),
+      );
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 3, name: 'Builder Co' }));
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 7, name: 'Invoice' }));
+
+      const result = await paperlessService.listDocuments(BASE_URL, TOKEN, {});
+      return result.documents[0]!.tags[0]?.color;
+    }
+
+    it('passes uppercase hex colors through unchanged', async () => {
+      expect(await colorFor({ color: '#A6CEE3' })).toBe('#A6CEE3');
+    });
+
+    it('returns null when color is missing', async () => {
+      expect(await colorFor({})).toBeNull();
+    });
+
+    it('returns null when color is null', async () => {
+      expect(await colorFor({ color: null })).toBeNull();
+    });
+
+    it.each([
+      ['a color name', 'red'],
+      ['a 3-digit hex', '#fff'],
+      ['hex without a leading #', 'a6cee3'],
+      ['non-hex characters', '#zzzzzz'],
+      ['a numeric value', 6 as unknown],
+    ])('returns null (without throwing) for %s', async (_label, value) => {
+      expect(await colorFor({ color: value })).toBeNull();
+    });
+
+    it('returns null for legacy numeric colour with no color field (regression guard)', async () => {
+      expect(await colorFor({ colour: 6 })).toBeNull();
+    });
+  });
+
+  it('throws PAPERLESS_UNREACHABLE on network error', async () => {
+    mockFetch.mockRejectedValueOnce(new Error('Network failure'));
+
+    await expect(paperlessService.listDocuments(BASE_URL, TOKEN, {})).rejects.toMatchObject({
+      code: 'PAPERLESS_UNREACHABLE',
+      statusCode: 502,
+    });
+  });
+
+  it('throws PAPERLESS_ERROR on non-ok response', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ detail: 'Forbidden' }, 403));
+
+    await expect(paperlessService.listDocuments(BASE_URL, TOKEN, {})).rejects.toMatchObject({
+      code: 'PAPERLESS_ERROR',
+      statusCode: 502,
+    });
+  });
+
+  describe('filter tag integration', () => {
+    beforeEach(() => {
+      paperlessService._resetFilterTagCache();
+    });
+
+    it('appends filter tag ID to tags__id__all when filter tag found', async () => {
+      // 1. Filter tag resolution (resolveFilterTagId runs first)
+      mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+      // 2. Documents call
+      mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_LIST_RESPONSE));
+      // 3. Tags call (for mapping via fetchTagsMap)
+      mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+      // 4. Correspondent call
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 3, name: 'Builder Co' }));
+      // 5. Document type call
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 7, name: 'Invoice' }));
+
+      await paperlessService.listDocuments(BASE_URL, TOKEN, {}, 'invoice');
+
+      // The documents call is now the second fetch (index 1)
+      const callUrl = (mockFetch.mock.calls[1] as [string, ...unknown[]])[0];
+      expect(callUrl).toContain('tags__id__all=5');
+    });
+
+    it('merges client-specified tags with filter tag, avoiding duplication', async () => {
+      // 1. Filter tag resolution (runs first)
+      mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+      // 2-5. Standard list mocks (documents, tags map, correspondent, doc type)
+      setupListMocks();
+
+      await paperlessService.listDocuments(BASE_URL, TOKEN, { tags: '12' }, 'invoice');
+
+      // Documents call is at index 1 (after tag resolution)
+      const callUrl = (mockFetch.mock.calls[1] as [string, ...unknown[]])[0];
+      // Both 5 (invoice) and 12 (contract) should be in tags__id__all
+      expect(callUrl).toContain('tags__id__all');
+      const decoded = decodeURIComponent(callUrl);
+      expect(decoded).toMatch(/tags__id__all=(5.*12|12.*5)/);
+    });
+
+    it('deduplicates when filter tag ID matches client tags', async () => {
+      // 1. Filter tag resolution (runs first)
+      mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+      // 2-5. Standard list mocks
+      setupListMocks();
+
+      await paperlessService.listDocuments(BASE_URL, TOKEN, { tags: '5' }, 'invoice');
+
+      // Documents call is at index 1
+      const callUrl = (mockFetch.mock.calls[1] as [string, ...unknown[]])[0];
+      // Should only have 5, not 5,5
+      expect(callUrl).toContain('tags__id__all=5');
+      expect(callUrl).not.toContain('tags__id__all=5%2C5');
+    });
+
+    it('preserves client tags when filter tag not found', async () => {
+      // 1. Filter tag resolution — returns empty (tag not found)
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 0, results: [] }));
+      // 2-5. Standard list mocks
+      setupListMocks();
+
+      await paperlessService.listDocuments(BASE_URL, TOKEN, { tags: '12' }, 'missing');
+
+      // Documents call is at index 1
+      const callUrl = (mockFetch.mock.calls[1] as [string, ...unknown[]])[0];
+      // Should still have client-specified tag
+      expect(callUrl).toContain('tags__id__all=12');
+    });
+
+    it('does not append tags__id__all when no filter tag and no client tags', async () => {
+      // 1. Filter tag resolution — returns empty (tag not found)
+      mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 0, results: [] }));
+      // 2-5. Standard list mocks
+      setupListMocks();
+
+      await paperlessService.listDocuments(BASE_URL, TOKEN, {}, 'missing');
+
+      // Documents call is at index 1
+      const callUrl = (mockFetch.mock.calls[1] as [string, ...unknown[]])[0];
+      // No tags__id__all should be present
+      expect(callUrl).not.toContain('tags__id__all');
+    });
+  });
+});
+
+// ─── getDocument tests ────────────────────────────────────────────────────────
+
+describe('getDocument()', () => {
+  function setupGetDocMocks() {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_DOCUMENT_1));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+    // parallel: correspondent + document_type
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 3, name: 'Builder Co' }));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 7, name: 'Invoice' }));
+  }
+
+  it('returns document with full content included', async () => {
+    setupGetDocMocks();
+
+    const doc = await paperlessService.getDocument(BASE_URL, TOKEN, 42);
+
+    expect(doc.id).toBe(42);
+    expect(doc.title).toBe('Invoice from Builder Co');
+    expect(doc.content).toBe('Full text content here.'); // content included in detail
+    expect(doc.correspondent).toBe('Builder Co');
+    expect(doc.documentType).toBe('Invoice');
+  });
+
+  it('calls the correct Paperless-ngx document endpoint', async () => {
+    setupGetDocMocks();
+
+    await paperlessService.getDocument(BASE_URL, TOKEN, 42);
+
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE_URL}/api/documents/42/`);
+  });
+
+  it('throws NOT_FOUND (404) when Paperless returns 404', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ detail: 'Not found.' }, 404));
+
+    await expect(paperlessService.getDocument(BASE_URL, TOKEN, 999)).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+      statusCode: 404,
+    });
+  });
+
+  it('throws PAPERLESS_UNREACHABLE on network error', async () => {
+    mockFetch.mockRejectedValueOnce(new Error('Connection refused'));
+
+    await expect(paperlessService.getDocument(BASE_URL, TOKEN, 42)).rejects.toMatchObject({
+      code: 'PAPERLESS_UNREACHABLE',
+      statusCode: 502,
+    });
+  });
+
+  it('throws PAPERLESS_ERROR on upstream error', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ detail: 'Server Error' }, 500));
+
+    await expect(paperlessService.getDocument(BASE_URL, TOKEN, 42)).rejects.toMatchObject({
+      code: 'PAPERLESS_ERROR',
+      statusCode: 502,
+    });
+  });
+});
+
+// ─── fetchBinary tests ────────────────────────────────────────────────────────
+
+describe('fetchBinary()', () => {
+  it('returns raw Response on success', async () => {
+    const imageData = Buffer.from('fake-image-data');
+    mockFetch.mockResolvedValueOnce(mockBinaryResponse(imageData, 'image/webp'));
+
+    const response = await paperlessService.fetchBinary(
+      BASE_URL,
+      TOKEN,
+      '/api/documents/42/thumb/',
+    );
+
+    expect(response.ok).toBe(true);
+    expect(response.headers.get('content-type')).toBe('image/webp');
+  });
+
+  it('uses Authorization header only (no Accept header for binary)', async () => {
+    mockFetch.mockResolvedValueOnce(mockBinaryResponse(Buffer.from('data')));
+
+    await paperlessService.fetchBinary(BASE_URL, TOKEN, '/api/documents/42/thumb/');
+
+    const calledHeaders = (mockFetch.mock.calls[0] as [string, RequestInit])[1]?.headers as Record<
+      string,
+      string
+    >;
+    expect(calledHeaders['Authorization']).toBe(`Token ${TOKEN}`);
+    expect(calledHeaders['Accept']).toBeUndefined();
+  });
+
+  it('throws NOT_FOUND when Paperless returns 404', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      statusText: 'Not Found',
+      headers: { get: () => null },
+    } as unknown as Response);
+
+    await expect(
+      paperlessService.fetchBinary(BASE_URL, TOKEN, '/api/documents/999/thumb/'),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND', statusCode: 404 });
+  });
+
+  it('throws PAPERLESS_UNREACHABLE on network error', async () => {
+    mockFetch.mockRejectedValueOnce(new Error('Network failure'));
+
+    await expect(
+      paperlessService.fetchBinary(BASE_URL, TOKEN, '/api/documents/42/thumb/'),
+    ).rejects.toMatchObject({ code: 'PAPERLESS_UNREACHABLE', statusCode: 502 });
+  });
+
+  it('throws PAPERLESS_ERROR on non-ok non-404 response', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      statusText: 'Service Unavailable',
+      headers: { get: () => null },
+    } as unknown as Response);
+
+    await expect(
+      paperlessService.fetchBinary(BASE_URL, TOKEN, '/api/documents/42/preview/'),
+    ).rejects.toMatchObject({ code: 'PAPERLESS_ERROR', statusCode: 502 });
+  });
+});
+
+// ─── listTags tests ───────────────────────────────────────────────────────────
+
+describe('listTags()', () => {
+  it('sends Accept header with API version 10', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 0, results: [] }));
+
+    await paperlessService.listTags(BASE_URL, TOKEN);
+
+    const init = mockFetch.mock.calls[0]![1] as { headers: Record<string, string> };
+    expect(init.headers['Accept']).toBe('application/json; version=10');
+  });
+
+  it('returns tags sorted by ID ascending', async () => {
+    const rawTags = {
+      count: 3,
+      results: [
+        { id: 12, name: 'contract', color: '#1f78b4', document_count: 8 },
+        { id: 5, name: 'invoice', color: '#e31a1c', document_count: 15 },
+        { id: 20, name: 'misc', color: '#b2df8a', document_count: 2 },
+      ],
+    };
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(rawTags));
+
+    const result = await paperlessService.listTags(BASE_URL, TOKEN);
+
+    expect(result.tags).toHaveLength(3);
+    expect(result.tags[0]!.id).toBe(5);
+    expect(result.tags[1]!.id).toBe(12);
+    expect(result.tags[2]!.id).toBe(20);
+  });
+
+  it('maps tag fields correctly', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 1, results: [RAW_TAG_1] }));
+
+    const result = await paperlessService.listTags(BASE_URL, TOKEN);
+
+    expect(result.tags[0]).toEqual({
+      id: 5,
+      name: 'invoice',
+      color: '#e31a1c',
+      documentCount: 15,
+    });
+  });
+
+  it('returns empty array when no tags exist', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 0, results: [] }));
+
+    const result = await paperlessService.listTags(BASE_URL, TOKEN);
+
+    expect(result.tags).toEqual([]);
+  });
+
+  it('uses page_size=1000 to get all tags without pagination', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 0, results: [] }));
+
+    await paperlessService.listTags(BASE_URL, TOKEN);
+
+    const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+    expect(callUrl).toContain('page_size=1000');
+  });
+
+  it('throws PAPERLESS_UNREACHABLE on network error', async () => {
+    mockFetch.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+
+    await expect(paperlessService.listTags(BASE_URL, TOKEN)).rejects.toMatchObject({
+      code: 'PAPERLESS_UNREACHABLE',
+      statusCode: 502,
+    });
+  });
+
+  it('throws PAPERLESS_ERROR on upstream error', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ detail: 'Auth failed' }, 401));
+
+    await expect(paperlessService.listTags(BASE_URL, TOKEN)).rejects.toMatchObject({
+      code: 'PAPERLESS_ERROR',
+      statusCode: 502,
+    });
+  });
+});
+
+// ─── listCorrespondents tests (Story #1679) ───────────────────────────────────
+
+describe('listCorrespondents()', () => {
+  it('sends Accept header with API version 10', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 0, results: [] }));
+
+    await paperlessService.listCorrespondents(BASE_URL, TOKEN);
+
+    const init = mockFetch.mock.calls[0]![1] as { headers: Record<string, string> };
+    expect(init.headers['Accept']).toBe('application/json; version=10');
+  });
+
+  it('makes a single fetch to /api/correspondents/?page_size=1000', async () => {
+    mockFetch.mockResolvedValueOnce(
+      mockJsonResponse({
+        count: 2,
+        results: [
+          { id: 5, name: 'Smith GmbH' },
+          { id: 2, name: 'Acme Corp' },
+        ],
+      }),
+    );
+
+    await paperlessService.listCorrespondents(BASE_URL, TOKEN);
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const callUrl = (mockFetch.mock.calls[0] as [string, ...unknown[]])[0];
+    expect(callUrl).toContain('/api/correspondents/?page_size=1000');
+  });
+
+  it('returns correspondents sorted by id ascending', async () => {
+    mockFetch.mockResolvedValueOnce(
+      mockJsonResponse({
+        count: 2,
+        results: [
+          { id: 5, name: 'Smith GmbH' },
+          { id: 2, name: 'Acme Corp' },
+        ],
+      }),
+    );
+
+    const result = await paperlessService.listCorrespondents(BASE_URL, TOKEN);
+
+    expect(result.correspondents).toHaveLength(2);
+    expect(result.correspondents[0]).toEqual({ id: 2, name: 'Acme Corp' });
+    expect(result.correspondents[1]).toEqual({ id: 5, name: 'Smith GmbH' });
+  });
+
+  it('returns empty array when no correspondents exist', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 0, results: [] }));
+
+    const result = await paperlessService.listCorrespondents(BASE_URL, TOKEN);
+
+    expect(result.correspondents).toEqual([]);
+  });
+
+  it('maps only id and name fields from raw correspondent', async () => {
+    mockFetch.mockResolvedValueOnce(
+      mockJsonResponse({
+        count: 1,
+        results: [{ id: 7, name: 'Test Corp', document_count: 42, slug: 'test-corp' }],
+      }),
+    );
+
+    const result = await paperlessService.listCorrespondents(BASE_URL, TOKEN);
+
+    expect(result.correspondents[0]).toEqual({ id: 7, name: 'Test Corp' });
+    expect(Object.keys(result.correspondents[0]!)).toHaveLength(2);
+  });
+
+  it('throws PAPERLESS_UNREACHABLE on network error', async () => {
+    mockFetch.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+
+    await expect(paperlessService.listCorrespondents(BASE_URL, TOKEN)).rejects.toMatchObject({
+      code: 'PAPERLESS_UNREACHABLE',
+      statusCode: 502,
+    });
+  });
+
+  it('throws PAPERLESS_ERROR on non-ok response', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ detail: 'Forbidden' }, 403));
+
+    await expect(paperlessService.listCorrespondents(BASE_URL, TOKEN)).rejects.toMatchObject({
+      code: 'PAPERLESS_ERROR',
+      statusCode: 502,
+    });
+  });
+});
+
+// ─── getDocuments tests ───────────────────────────────────────────────────────
+
+describe('getDocuments()', () => {
+  /**
+   * Mock order for getDocuments: tags and docs are fetched in parallel via Promise.all,
+   * with fetchTagsMap listed first → tags call lands at index 0, docs list at index 1.
+   */
+  function setupGetDocsMocks(docResponse = { count: 1, results: [RAW_DOCUMENT_1] }) {
+    // Call 0: tags (first arg in Promise.all)
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+    // Call 1: documents list via id__in (second arg in Promise.all)
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(docResponse));
+    // Call 2: correspondent 3
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 3, name: 'Builder Co' }));
+    // Call 3: document_type 7
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 7, name: 'Invoice' }));
+  }
+
+  it('returns an empty Map without any fetch calls when ids is empty', async () => {
+    const result = await paperlessService.getDocuments(BASE_URL, TOKEN, []);
+
+    expect(result.size).toBe(0);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('uses id__in filter with comma-separated ids', async () => {
+    setupGetDocsMocks();
+
+    await paperlessService.getDocuments(BASE_URL, TOKEN, [42, 99, 7]);
+
+    const docsCallUrl = (mockFetch.mock.calls[1] as [string, ...unknown[]])[0];
+    expect(docsCallUrl).toContain('id__in=42%2C99%2C7');
+  });
+
+  it('sets page_size equal to the number of requested ids', async () => {
+    setupGetDocsMocks();
+
+    await paperlessService.getDocuments(BASE_URL, TOKEN, [42, 99, 7]);
+
+    const docsCallUrl = (mockFetch.mock.calls[1] as [string, ...unknown[]])[0];
+    expect(docsCallUrl).toContain('page_size=3');
+  });
+
+  it('makes exactly 2 fetch calls when documents have no correspondents or doc types', async () => {
+    const minimalDoc = {
+      ...RAW_DOCUMENT_1,
+      correspondent: null,
+      document_type: null,
+    };
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 1, results: [minimalDoc] }));
+
+    await paperlessService.getDocuments(BASE_URL, TOKEN, [42]);
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns a Map keyed by document id', async () => {
+    setupGetDocsMocks();
+
+    const result = await paperlessService.getDocuments(BASE_URL, TOKEN, [42]);
+
+    expect(result.has(42)).toBe(true);
+    expect(result.get(42)?.id).toBe(42);
+  });
+
+  it('returns null content (list view — detail endpoint provides full content)', async () => {
+    setupGetDocsMocks();
+
+    const result = await paperlessService.getDocuments(BASE_URL, TOKEN, [42]);
+
+    expect(result.get(42)?.content).toBeNull();
+  });
+
+  it('resolves document metadata correctly (tags, correspondent, documentType)', async () => {
+    setupGetDocsMocks();
+
+    const result = await paperlessService.getDocuments(BASE_URL, TOKEN, [42]);
+
+    const doc = result.get(42)!;
+    expect(doc.title).toBe('Invoice from Builder Co');
+    expect(doc.correspondent).toBe('Builder Co');
+    expect(doc.documentType).toBe('Invoice');
+    expect(doc.tags).toHaveLength(2);
+    expect(doc.tags[0]!.name).toBe('invoice');
+    expect(doc.tags[1]!.name).toBe('contract');
+    expect(doc.created).toBe('2026-01-15');
+    expect(doc.archiveSerialNumber).toBe(1042);
+    expect(doc.pageCount).toBe(2);
+  });
+
+  it('omits documents that are absent from the Paperless results (e.g. deleted)', async () => {
+    // Requested [42, 999] but Paperless only returns doc 42 (999 was deleted)
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 1, results: [RAW_DOCUMENT_1] }));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 3, name: 'Builder Co' }));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 7, name: 'Invoice' }));
+
+    const result = await paperlessService.getDocuments(BASE_URL, TOKEN, [42, 999]);
+
+    expect(result.has(42)).toBe(true);
+    expect(result.has(999)).toBe(false);
+    expect(result.size).toBe(1);
+  });
+
+  it('resolves each unique correspondent and document type only once across multiple docs', async () => {
+    const doc2 = { ...RAW_DOCUMENT_1, id: 43, correspondent: 3, document_type: 7 };
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+    mockFetch.mockResolvedValueOnce(
+      mockJsonResponse({ count: 2, results: [RAW_DOCUMENT_1, doc2] }),
+    );
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 3, name: 'Builder Co' }));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 7, name: 'Invoice' }));
+
+    const result = await paperlessService.getDocuments(BASE_URL, TOKEN, [42, 43]);
+
+    // 2 (tags + docs) + 1 correspondent + 1 doc type = 4 total, not 6
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    expect(result.get(42)!.correspondent).toBe('Builder Co');
+    expect(result.get(43)!.correspondent).toBe('Builder Co');
+  });
+
+  it('returns multiple documents in the map', async () => {
+    const doc2 = {
+      ...RAW_DOCUMENT_1,
+      id: 43,
+      title: 'Second Doc',
+      correspondent: null,
+      document_type: null,
+    };
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+    mockFetch.mockResolvedValueOnce(
+      mockJsonResponse({ count: 2, results: [RAW_DOCUMENT_1, doc2] }),
+    );
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 3, name: 'Builder Co' }));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ id: 7, name: 'Invoice' }));
+
+    const result = await paperlessService.getDocuments(BASE_URL, TOKEN, [42, 43]);
+
+    expect(result.size).toBe(2);
+    expect(result.get(42)!.title).toBe('Invoice from Builder Co');
+    expect(result.get(43)!.title).toBe('Second Doc');
+  });
+
+  it('throws PAPERLESS_UNREACHABLE when the bulk documents fetch fails with a network error', async () => {
+    // Tags resolve fine; docs call throws
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+    mockFetch.mockRejectedValueOnce(new Error('Connection refused'));
+
+    await expect(paperlessService.getDocuments(BASE_URL, TOKEN, [42])).rejects.toMatchObject({
+      code: 'PAPERLESS_UNREACHABLE',
+      statusCode: 502,
+    });
+  });
+
+  it('throws PAPERLESS_ERROR when the bulk documents fetch returns a non-ok status', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ detail: 'Forbidden' }, 403));
+
+    await expect(paperlessService.getDocuments(BASE_URL, TOKEN, [42])).rejects.toMatchObject({
+      code: 'PAPERLESS_ERROR',
+      statusCode: 502,
+    });
+  });
+});
+
+// ─── AppError correctness ─────────────────────────────────────────────────────
+
+describe('HTTP 406 (unsupported API version)', () => {
+  it('fetchPaperless path (getDocument) → PAPERLESS_ERROR 502 mentioning API version 10', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({}, 406));
+
+    await expect(paperlessService.getDocument(BASE_URL, TOKEN, 42)).rejects.toMatchObject({
+      code: 'PAPERLESS_ERROR',
+      statusCode: 502,
+      message: expect.stringContaining('API version 10'),
+    });
+  });
+
+  it('fetchBinary (sends no version header) → plain 406 message without API version hint', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({}, 406));
+
+    let caught: AppError | undefined;
+    try {
+      await paperlessService.fetchBinary(BASE_URL, TOKEN, '/api/documents/42/thumb/');
+    } catch (err) {
+      caught = err as AppError;
+    }
+    expect(caught?.code).toBe('PAPERLESS_ERROR');
+    expect(caught?.statusCode).toBe(502);
+    expect(caught?.message).toBe('Paperless-ngx returned 406: Not Acceptable');
+    expect(caught?.message).not.toContain('API version');
+  });
+
+  it('non-406 errors keep the plain message and do not mention API version', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({}, 500));
+
+    let caught: AppError | undefined;
+    try {
+      await paperlessService.getDocument(BASE_URL, TOKEN, 42);
+    } catch (err) {
+      caught = err as AppError;
+    }
+    expect(caught?.message).toBe('Paperless-ngx returned 500: Error');
+    expect(caught?.message).not.toContain('API version');
+  });
+});
+
+describe('Error codes and status codes', () => {
+  it('PAPERLESS_UNREACHABLE has statusCode 502', async () => {
+    mockFetch.mockRejectedValueOnce(new Error('Network failure'));
+
+    try {
+      await paperlessService.getDocument(BASE_URL, TOKEN, 1);
+      expect.assertions(2);
+    } catch (err) {
+      expect((err as AppError).statusCode).toBe(502);
+      expect((err as AppError).code).toBe('PAPERLESS_UNREACHABLE');
+    }
+  });
+
+  it('PAPERLESS_ERROR has statusCode 502', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ detail: 'Forbidden' }, 403));
+
+    try {
+      await paperlessService.getDocument(BASE_URL, TOKEN, 1);
+      expect.assertions(2);
+    } catch (err) {
+      expect((err as AppError).statusCode).toBe(502);
+      expect((err as AppError).code).toBe('PAPERLESS_ERROR');
+    }
+  });
+
+  it('NOT_FOUND has statusCode 404', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ detail: 'Not found.' }, 404));
+
+    try {
+      await paperlessService.getDocument(BASE_URL, TOKEN, 999);
+      expect.assertions(2);
+    } catch (err) {
+      expect((err as AppError).statusCode).toBe(404);
+      expect((err as AppError).code).toBe('NOT_FOUND');
+    }
+  });
+});
+
+// ─── uploadDocument() ──────────────────────────────────────────────────────────
+
+describe('uploadDocument()', () => {
+  const INPUT = {
+    buffer: Buffer.from('%PDF-1.4 fake pdf bytes'),
+    filename: 'invoice.pdf',
+    title: 'Invoice from Builder Co',
+  };
+
+  function lastFetchBody(): FormData {
+    const lastCall = mockFetch.mock.calls[mockFetch.mock.calls.length - 1]!;
+    return lastCall[1]!.body as FormData;
+  }
+
+  it('scenario 31: resolvable filter tag → tags field included in the multipart body, returns taskId', async () => {
+    // 1. resolveFilterTagId's tag lookup
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(RAW_TAGS_RESPONSE));
+    // 2. the upload itself — post_document returns the task UUID as a raw JSON string
+    mockFetch.mockResolvedValueOnce(mockJsonResponse('11111111-2222-3333-4444-555555555555'));
+
+    const result = await paperlessService.uploadDocument(BASE_URL, TOKEN, {
+      ...INPUT,
+      filterTagName: 'invoice',
+    });
+
+    expect(result).toEqual({ taskId: '11111111-2222-3333-4444-555555555555' });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+
+    const body = lastFetchBody();
+    expect(body.has('tags')).toBe(true);
+    expect(body.get('tags')).toBe(String(RAW_TAG_1.id));
+    expect(body.get('title')).toBe(INPUT.title);
+
+    const [uploadUrl, uploadInit] = mockFetch.mock.calls[1]!;
+    expect(String(uploadUrl)).toBe(`${BASE_URL}/api/documents/post_document/`);
+    expect(uploadInit!.method).toBe('POST');
+    expect((uploadInit!.headers as Record<string, string>)['Authorization']).toBe(`Token ${TOKEN}`);
+    expect((uploadInit!.headers as Record<string, string>)['Accept']).toBe(
+      'application/json; version=10',
+    );
+  });
+
+  it('upload on 406 → PAPERLESS_ERROR mentioning the required API version', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ detail: 'nope' }, 406));
+
+    await expect(paperlessService.uploadDocument(BASE_URL, TOKEN, INPUT)).rejects.toMatchObject({
+      code: 'PAPERLESS_ERROR',
+      statusCode: 502,
+      message: expect.stringContaining('API version 10'),
+    });
+  });
+
+  it('scenario 32: unresolvable filter tag → no tags field, upload still succeeds', async () => {
+    // 1. resolveFilterTagId's tag lookup returns no matching tag
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ count: 0, results: [] }));
+    // 2. the upload itself proceeds untagged
+    mockFetch.mockResolvedValueOnce(mockJsonResponse('task-untagged-id'));
+
+    const result = await paperlessService.uploadDocument(BASE_URL, TOKEN, {
+      ...INPUT,
+      filterTagName: 'does-not-exist',
+    });
+
+    expect(result).toEqual({ taskId: 'task-untagged-id' });
+    const body = lastFetchBody();
+    expect(body.has('tags')).toBe(false);
+  });
+
+  it('no filterTagName provided → skips tag resolution entirely (single fetch call, no tags field)', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse('task-no-tag'));
+
+    const result = await paperlessService.uploadDocument(BASE_URL, TOKEN, INPUT);
+
+    expect(result).toEqual({ taskId: 'task-no-tag' });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const body = lastFetchBody();
+    expect(body.has('tags')).toBe(false);
+    expect(body.get('title')).toBe(INPUT.title);
+  });
+
+  it('scenario 33: network failure during upload → PAPERLESS_UNREACHABLE 502', async () => {
+    mockFetch.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+
+    await expect(paperlessService.uploadDocument(BASE_URL, TOKEN, INPUT)).rejects.toMatchObject({
+      code: 'PAPERLESS_UNREACHABLE',
+      statusCode: 502,
+    });
+  });
+
+  it('scenario 34: non-2xx response from Paperless → PAPERLESS_ERROR 502', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse({ detail: 'Bad Request' }, 400));
+
+    await expect(paperlessService.uploadDocument(BASE_URL, TOKEN, INPUT)).rejects.toMatchObject({
+      code: 'PAPERLESS_ERROR',
+      statusCode: 502,
+    });
+  });
+});

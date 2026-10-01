@@ -1,0 +1,665 @@
+/**
+ * Paperless-ngx HTTP client service.
+ *
+ * EPIC-08: Paperless-ngx Document Integration
+ *
+ * This service proxies all requests to a Paperless-ngx instance, transforming
+ * raw API responses into Cornerstone's own response shapes. The Paperless-ngx
+ * API token is kept server-side and never exposed to the browser.
+ *
+ * JSON requests send `Accept: application/json; version=10` (ADR-015). Binary
+ * passthroughs (`fetchBinary`) send no Accept header.
+ */
+
+import type {
+  PaperlessDocument,
+  PaperlessTag,
+  PaperlessDocumentSearchResult,
+  PaperlessDocumentListResponse,
+  PaperlessDocumentListQuery,
+  PaperlessTagListResponse,
+  PaperlessCorrespondentListResponse,
+  PaperlessStatusResponse,
+  PaperlessUploadResponse,
+} from '@cornerstone/shared';
+import { AppError } from '../errors/AppError.js';
+
+const PAPERLESS_API_VERSION = 10;
+
+const HEX_COLOR_RE = /^#[0-9a-f]{6}$/i;
+
+// ─── Filter tag cache ────────────────────────────────────────────────────────
+
+let resolvedFilterTagId: number | null = null;
+let resolvedFilterTagName: string | null = null;
+
+export function _resetFilterTagCache(): void {
+  resolvedFilterTagId = null;
+  resolvedFilterTagName = null;
+}
+
+// ─── Raw Paperless-ngx API shapes ────────────────────────────────────────────
+
+interface RawPaperlessTag {
+  id: number;
+  name: string;
+  color?: string | null;
+  document_count: number;
+}
+
+interface RawSearchHit {
+  score: string | number;
+  highlights: string;
+  rank: number;
+}
+
+interface RawPaperlessDocument {
+  id: number;
+  title: string;
+  content: string;
+  tags: number[];
+  /** Date string (YYYY-MM-DD) in Paperless API v9+. */
+  created: string | null;
+  added: string | null;
+  modified: string | null;
+  correspondent: number | null;
+  document_type: number | null;
+  archive_serial_number: number | null;
+  original_file_name: string | null;
+  page_count: number | null;
+  __search_hit__?: RawSearchHit;
+}
+
+interface RawPaperlessListResponse {
+  count: number;
+  results: RawPaperlessDocument[];
+}
+
+// ─── Internal helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Build the standard Paperless-ngx JSON API request headers.
+ */
+function makeHeaders(token: string): Record<string, string> {
+  return {
+    Authorization: `Token ${token}`,
+    Accept: `application/json; version=${PAPERLESS_API_VERSION}`,
+  };
+}
+
+/**
+ * Build the error message for a non-OK upstream Paperless-ngx response.
+ */
+function upstreamErrorMessage(response: Response): string {
+  if (response.status === 406) {
+    return `Paperless-ngx returned 406: ${response.statusText} — the server does not support API version ${PAPERLESS_API_VERSION} (Cornerstone requires a Paperless-ngx release that accepts API version ${PAPERLESS_API_VERSION})`;
+  }
+  return `Paperless-ngx returned ${response.status}: ${response.statusText}`;
+}
+
+/**
+ * Perform an authenticated JSON request to Paperless-ngx.
+ * Throws AppError with appropriate codes on failure.
+ */
+async function fetchPaperless<T>(baseUrl: string, token: string, path: string): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}${path}`, { headers: makeHeaders(token) });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new AppError('PAPERLESS_UNREACHABLE', 502, `Cannot connect to Paperless-ngx: ${message}`);
+  }
+
+  if (response.status === 404) {
+    throw new AppError('NOT_FOUND', 404, 'Document not found in Paperless-ngx');
+  }
+
+  if (!response.ok) {
+    throw new AppError('PAPERLESS_ERROR', 502, upstreamErrorMessage(response));
+  }
+
+  return response.json() as Promise<T>;
+}
+
+/**
+ * Fetch binary content from Paperless-ngx (thumbnails, previews).
+ * Returns the raw Response so the caller can stream it to the client.
+ */
+export async function fetchBinary(baseUrl: string, token: string, path: string): Promise<Response> {
+  let response: Response;
+  try {
+    // Deliberately no Accept header: image/PDF endpoints; DRF falls back to DEFAULT_VERSION.
+    response = await fetch(`${baseUrl}${path}`, {
+      headers: { Authorization: `Token ${token}` },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new AppError('PAPERLESS_UNREACHABLE', 502, `Cannot connect to Paperless-ngx: ${message}`);
+  }
+
+  if (response.status === 404) {
+    throw new AppError('NOT_FOUND', 404, 'Document not found in Paperless-ngx');
+  }
+
+  if (!response.ok) {
+    // Plain message: no version is negotiated here, so a 406 is not an API-version mismatch.
+    throw new AppError(
+      'PAPERLESS_ERROR',
+      502,
+      `Paperless-ngx returned ${response.status}: ${response.statusText}`,
+    );
+  }
+
+  return response;
+}
+
+/**
+ * Map a raw Paperless-ngx tag to Cornerstone's PaperlessTag shape.
+ */
+function mapTag(raw: RawPaperlessTag): PaperlessTag {
+  return {
+    id: raw.id,
+    name: raw.name,
+    color: typeof raw.color === 'string' && HEX_COLOR_RE.test(raw.color) ? raw.color : null,
+    documentCount: raw.document_count,
+  };
+}
+
+/**
+ * Fetch all tags from Paperless-ngx and return them as a lookup map.
+ * Uses a large page_size to avoid pagination (instances typically have <100 tags).
+ */
+async function fetchTagsMap(baseUrl: string, token: string): Promise<Map<number, PaperlessTag>> {
+  const data = await fetchPaperless<{ count: number; results: RawPaperlessTag[] }>(
+    baseUrl,
+    token,
+    '/api/tags/?page_size=1000',
+  );
+  const map = new Map<number, PaperlessTag>();
+  for (const raw of data.results) {
+    map.set(raw.id, mapTag(raw));
+  }
+  return map;
+}
+
+/**
+ * Resolve a Paperless-ngx correspondent ID to its display name.
+ * Returns null if the ID is null or the correspondent cannot be fetched.
+ */
+async function resolveCorrespondentName(
+  baseUrl: string,
+  token: string,
+  id: number | null,
+): Promise<string | null> {
+  if (id === null) return null;
+  try {
+    const data = await fetchPaperless<{ id: number; name: string }>(
+      baseUrl,
+      token,
+      `/api/correspondents/${id}/`,
+    );
+    return data.name;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve a Paperless-ngx document type ID to its display name.
+ * Returns null if the ID is null or the document type cannot be fetched.
+ */
+async function resolveDocumentTypeName(
+  baseUrl: string,
+  token: string,
+  id: number | null,
+): Promise<string | null> {
+  if (id === null) return null;
+  try {
+    const data = await fetchPaperless<{ id: number; name: string }>(
+      baseUrl,
+      token,
+      `/api/document_types/${id}/`,
+    );
+    return data.name;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Map a raw Paperless-ngx document to Cornerstone's PaperlessDocument shape.
+ * Tag resolution uses the pre-fetched tagsMap. Content is included only for detail views.
+ */
+function mapDocument(
+  raw: RawPaperlessDocument,
+  tagsMap: Map<number, PaperlessTag>,
+  correspondentName: string | null,
+  documentTypeName: string | null,
+  includeContent: boolean,
+): PaperlessDocument {
+  const tags: PaperlessTag[] = raw.tags
+    .map((tagId) => tagsMap.get(tagId))
+    .filter((t): t is PaperlessTag => t !== undefined);
+
+  // Paperless API v9+ returns `created` as a date (YYYY-MM-DD); slice(0,10) is kept defensively in case a datetime is ever returned.
+  const created = raw.created ? raw.created.slice(0, 10) : null;
+
+  return {
+    id: raw.id,
+    title: raw.title,
+    content: includeContent ? raw.content : null,
+    tags,
+    created,
+    added: raw.added,
+    modified: raw.modified,
+    correspondent: correspondentName,
+    documentType: documentTypeName,
+    archiveSerialNumber: raw.archive_serial_number,
+    originalFileName: raw.original_file_name,
+    pageCount: raw.page_count,
+  };
+}
+
+// ─── Exported service functions ───────────────────────────────────────────────
+
+/**
+ * Sanitize an error message for use in status responses.
+ * Strips IP addresses and hostnames to avoid information disclosure.
+ * Preserves general error type information (e.g., "Connection failed", "HTTP 502").
+ */
+function sanitizeErrorMessage(message: string): string {
+  // Replace IPv4 addresses (e.g., 10.0.0.5:8000)
+  let sanitized = message.replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b/g, '<host>');
+  // Replace hostnames with port (e.g., paperless:8000, my-host.local:8080)
+  sanitized = sanitized.replace(
+    /\b[a-zA-Z0-9](?:[a-zA-Z0-9\-._]*[a-zA-Z0-9])?:\d{1,5}\b/g,
+    '<host>',
+  );
+  return sanitized;
+}
+
+/**
+ * Resolve a Paperless-ngx filter tag name to its ID.
+ * Results are cached module-level to avoid repeated lookups.
+ * Returns null if the tag is not found or if an error occurs.
+ */
+export async function resolveFilterTagId(
+  baseUrl: string,
+  token: string,
+  tagName: string,
+): Promise<number | null> {
+  if (resolvedFilterTagName === tagName && resolvedFilterTagId !== null) {
+    return resolvedFilterTagId;
+  }
+  try {
+    const data = await fetchPaperless<{ count: number; results: RawPaperlessTag[] }>(
+      baseUrl,
+      token,
+      '/api/tags/?page_size=1000',
+    );
+    const match = data.results.find((t) => t.name.toLowerCase() === tagName.toLowerCase());
+    if (!match) {
+      console.warn(
+        `[paperlessService] PAPERLESS_FILTER_TAG="${tagName}" not found in Paperless-ngx. All documents will be shown.`,
+      );
+      resolvedFilterTagId = null;
+      resolvedFilterTagName = tagName;
+      return null;
+    }
+    resolvedFilterTagId = match.id;
+    resolvedFilterTagName = tagName;
+    return match.id;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Check the connectivity status of the Paperless-ngx integration.
+ * Performs a lightweight probe request to verify reachability.
+ */
+export async function getStatus(
+  baseUrl: string,
+  token: string,
+  filterTagName?: string,
+): Promise<PaperlessStatusResponse> {
+  try {
+    await fetchPaperless<{ count: number }>(baseUrl, token, '/api/documents/?page_size=1');
+    // paperlessUrl is always overridden by the route handler with fastify.config.paperlessUrl
+    let filterTag: string | null = null;
+    if (filterTagName) {
+      const tagId = await resolveFilterTagId(baseUrl, token, filterTagName);
+      filterTag = tagId !== null ? filterTagName : null;
+    }
+    return { configured: true, reachable: true, error: null, paperlessUrl: null, filterTag };
+  } catch (err) {
+    const rawMessage = err instanceof Error ? err.message : String(err);
+    const message = sanitizeErrorMessage(rawMessage);
+    return {
+      configured: true,
+      reachable: false,
+      error: message,
+      paperlessUrl: null,
+      filterTag: null,
+    };
+  }
+}
+
+/**
+ * List or search documents in Paperless-ngx with pagination, filtering, and sorting.
+ * Tag, correspondent, and document type names are resolved server-side.
+ */
+export async function listDocuments(
+  baseUrl: string,
+  token: string,
+  query: PaperlessDocumentListQuery,
+  filterTagName?: string | null,
+): Promise<PaperlessDocumentListResponse> {
+  const page = Math.max(1, query.page ?? 1);
+  const pageSize = Math.min(100, Math.max(1, query.pageSize ?? 25));
+
+  // Build Paperless-ngx query string
+  const params = new URLSearchParams();
+  params.set('page', String(page));
+  params.set('page_size', String(pageSize));
+
+  if (query.query) {
+    params.set('query', query.query);
+  }
+
+  // Handle tag filtering: merge filter tag with client-specified tags
+  if (filterTagName) {
+    const filterTagId = await resolveFilterTagId(baseUrl, token, filterTagName);
+    if (filterTagId != null) {
+      const clientTagIds = query.tags ? query.tags.split(',').map((s) => s.trim()) : [];
+      const allTagIds = Array.from(new Set([...clientTagIds, String(filterTagId)]));
+      params.set('tags__id__all', allTagIds.join(','));
+    } else if (query.tags) {
+      params.set('tags__id__all', query.tags);
+    }
+  } else if (query.tags) {
+    params.set('tags__id__all', query.tags);
+  }
+  if (query.correspondent !== undefined) {
+    params.set('correspondent__id', String(query.correspondent));
+  }
+  if (query.documentType !== undefined) {
+    params.set('document_type__id', String(query.documentType));
+  }
+
+  // Build ordering param
+  const sortFieldMap: Record<string, string> = {
+    created: 'created',
+    added: 'added',
+    modified: 'modified',
+    title: 'title',
+    archive_serial_number: 'archive_serial_number',
+  };
+  const paperlessSortField = sortFieldMap[query.sortBy ?? ''] ?? 'created';
+  const direction = query.sortOrder === 'asc' ? '' : '-';
+  // Unique tiebreaker: `created` is date-only since API v9, so ties are common and
+  // LIMIT/OFFSET paging over a non-unique key duplicates/skips documents across pages (#2101).
+  // Full-text queries (Whoosh) accept only a single sort field, so no tiebreaker there.
+  const ordering = query.query
+    ? `${direction}${paperlessSortField}`
+    : `${direction}${paperlessSortField},${direction}id`;
+  params.set('ordering', ordering);
+
+  const path = `/api/documents/?${params.toString()}`;
+  const raw = await fetchPaperless<RawPaperlessListResponse>(baseUrl, token, path);
+
+  // Fetch tags once for the whole result set
+  const tagsMap = await fetchTagsMap(baseUrl, token);
+
+  // Collect unique correspondent and document type IDs to avoid N+1 calls
+  const correspondentIds = new Set<number>();
+  const documentTypeIds = new Set<number>();
+  for (const doc of raw.results) {
+    if (doc.correspondent !== null) correspondentIds.add(doc.correspondent);
+    if (doc.document_type !== null) documentTypeIds.add(doc.document_type);
+  }
+
+  // Resolve all unique correspondents and document types in parallel
+  const [correspondentNames, documentTypeNames] = await Promise.all([
+    Promise.all(
+      [...correspondentIds].map(async (id) => {
+        const name = await resolveCorrespondentName(baseUrl, token, id);
+        return [id, name] as [number, string | null];
+      }),
+    ),
+    Promise.all(
+      [...documentTypeIds].map(async (id) => {
+        const name = await resolveDocumentTypeName(baseUrl, token, id);
+        return [id, name] as [number, string | null];
+      }),
+    ),
+  ]);
+
+  const correspondentMap = new Map<number, string | null>(correspondentNames);
+  const documentTypeMap = new Map<number, string | null>(documentTypeNames);
+
+  // Map documents
+  const documents: PaperlessDocumentSearchResult[] = raw.results.map((rawDoc) => {
+    const correspondentName =
+      rawDoc.correspondent !== null ? (correspondentMap.get(rawDoc.correspondent) ?? null) : null;
+    const documentTypeName =
+      rawDoc.document_type !== null ? (documentTypeMap.get(rawDoc.document_type) ?? null) : null;
+
+    const doc = mapDocument(rawDoc, tagsMap, correspondentName, documentTypeName, false);
+
+    const searchHit = rawDoc.__search_hit__
+      ? {
+          score:
+            typeof rawDoc.__search_hit__.score === 'number'
+              ? rawDoc.__search_hit__.score
+              : parseFloat(rawDoc.__search_hit__.score),
+          highlights: rawDoc.__search_hit__.highlights,
+          rank: rawDoc.__search_hit__.rank,
+        }
+      : null;
+
+    return { ...doc, searchHit };
+  });
+
+  return {
+    documents,
+    pagination: {
+      page,
+      pageSize,
+      totalItems: raw.count,
+      totalPages: Math.ceil(raw.count / pageSize),
+    },
+  };
+}
+
+/**
+ * Fetch metadata for a single Paperless-ngx document (includes full text content).
+ * @throws AppError('NOT_FOUND') if the document does not exist in Paperless-ngx
+ */
+export async function getDocument(
+  baseUrl: string,
+  token: string,
+  id: number,
+): Promise<PaperlessDocument> {
+  const rawDoc = await fetchPaperless<RawPaperlessDocument>(
+    baseUrl,
+    token,
+    `/api/documents/${id}/`,
+  );
+
+  const tagsMap = await fetchTagsMap(baseUrl, token);
+  const [correspondentName, documentTypeName] = await Promise.all([
+    resolveCorrespondentName(baseUrl, token, rawDoc.correspondent),
+    resolveDocumentTypeName(baseUrl, token, rawDoc.document_type),
+  ]);
+
+  return mapDocument(rawDoc, tagsMap, correspondentName, documentTypeName, true);
+}
+
+/**
+ * Fetch metadata for multiple Paperless-ngx documents in two API calls.
+ *
+ * Uses the `id__in` filter (supported by Paperless-ngx's DocumentFilterSet — see
+ * src/documents/filters.py: `"id": ["in", "exact"]`) to fetch all documents in one
+ * request, combined with a single tag-list fetch. Unique correspondents and document
+ * types are resolved once per batch.
+ *
+ * Documents that no longer exist in Paperless-ngx are simply absent from the returned map.
+ *
+ * @returns A map of paperless document ID → PaperlessDocument (content is null — list view)
+ */
+export async function getDocuments(
+  baseUrl: string,
+  token: string,
+  ids: number[],
+): Promise<Map<number, PaperlessDocument>> {
+  if (ids.length === 0) return new Map();
+
+  const params = new URLSearchParams();
+  params.set('id__in', ids.join(','));
+  params.set('page_size', String(ids.length));
+
+  // Fetch tags and all documents in parallel — just 2 API calls regardless of N
+  const [tagsMap, raw] = await Promise.all([
+    fetchTagsMap(baseUrl, token),
+    fetchPaperless<RawPaperlessListResponse>(
+      baseUrl,
+      token,
+      `/api/documents/?${params.toString()}`,
+    ),
+  ]);
+
+  const presentDocs = raw.results;
+
+  // Resolve unique correspondents and document types in one pass
+  const correspondentIds = new Set<number>();
+  const documentTypeIds = new Set<number>();
+  for (const doc of presentDocs) {
+    if (doc.correspondent !== null) correspondentIds.add(doc.correspondent);
+    if (doc.document_type !== null) documentTypeIds.add(doc.document_type);
+  }
+
+  const [correspondentEntries, documentTypeEntries] = await Promise.all([
+    Promise.all(
+      [...correspondentIds].map(async (id) => {
+        const name = await resolveCorrespondentName(baseUrl, token, id);
+        return [id, name] as [number, string | null];
+      }),
+    ),
+    Promise.all(
+      [...documentTypeIds].map(async (id) => {
+        const name = await resolveDocumentTypeName(baseUrl, token, id);
+        return [id, name] as [number, string | null];
+      }),
+    ),
+  ]);
+
+  const correspondentMap = new Map<number, string | null>(correspondentEntries);
+  const documentTypeMap = new Map<number, string | null>(documentTypeEntries);
+
+  const result = new Map<number, PaperlessDocument>();
+  for (const rawDoc of presentDocs) {
+    const correspondentName =
+      rawDoc.correspondent !== null ? (correspondentMap.get(rawDoc.correspondent) ?? null) : null;
+    const documentTypeName =
+      rawDoc.document_type !== null ? (documentTypeMap.get(rawDoc.document_type) ?? null) : null;
+    const doc = mapDocument(rawDoc, tagsMap, correspondentName, documentTypeName, false);
+    result.set(doc.id, doc);
+  }
+
+  return result;
+}
+
+export interface UploadDocumentInput {
+  buffer: Buffer;
+  filename: string;
+  title: string;
+  filterTagName?: string;
+}
+
+/**
+ * Upload a PDF to Paperless-ngx's consumption pipeline.
+ * Returns the consumption task UUID (post_document does NOT return a document ID —
+ * uploads process asynchronously; no document_link is created — Paperless is the archive of record).
+ */
+export async function uploadDocument(
+  baseUrl: string,
+  token: string,
+  input: UploadDocumentInput,
+): Promise<PaperlessUploadResponse> {
+  let tagId: number | null = null;
+  if (input.filterTagName) {
+    tagId = await resolveFilterTagId(baseUrl, token, input.filterTagName);
+    // resolveFilterTagId already warns+returns null on failure — upload proceeds untagged.
+  }
+
+  const form = new FormData();
+  form.append(
+    'document',
+    new Blob([new Uint8Array(input.buffer)], { type: 'application/pdf' }),
+    input.filename,
+  );
+  form.append('title', input.title);
+  if (tagId !== null) {
+    form.append('tags', String(tagId));
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}/api/documents/post_document/`, {
+      method: 'POST',
+      headers: makeHeaders(token),
+      body: form,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new AppError('PAPERLESS_UNREACHABLE', 502, `Cannot connect to Paperless-ngx: ${message}`);
+  }
+
+  if (!response.ok) {
+    throw new AppError('PAPERLESS_ERROR', 502, upstreamErrorMessage(response));
+  }
+
+  const taskId = await response.json();
+  if (typeof taskId !== 'string') {
+    throw new AppError(
+      'PAPERLESS_ERROR',
+      502,
+      'Unexpected response from Paperless-ngx: taskId is not a string',
+    );
+  }
+  return { taskId };
+}
+
+/**
+ * List all tags available in Paperless-ngx, sorted by ID ascending.
+ */
+export async function listTags(baseUrl: string, token: string): Promise<PaperlessTagListResponse> {
+  const tagsMap = await fetchTagsMap(baseUrl, token);
+  const tags = [...tagsMap.values()].sort((a, b) => a.id - b.id);
+  return { tags };
+}
+
+/**
+ * List all correspondents available in Paperless-ngx, sorted by ID ascending.
+ * EPIC-18 Story #1679: Added for Paperless-first invoice creation workflow.
+ */
+export async function listCorrespondents(
+  baseUrl: string,
+  token: string,
+): Promise<PaperlessCorrespondentListResponse> {
+  interface RawPaperlessCorrespondent {
+    id: number;
+    name: string;
+  }
+
+  const data = await fetchPaperless<{ count: number; results: RawPaperlessCorrespondent[] }>(
+    baseUrl,
+    token,
+    '/api/correspondents/?page_size=1000',
+  );
+  const correspondents = data.results
+    .map((r) => ({ id: r.id, name: r.name }))
+    .sort((a, b) => a.id - b.id);
+  return { correspondents };
+}

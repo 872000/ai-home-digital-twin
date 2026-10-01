@@ -1,0 +1,543 @@
+/**
+ * @jest-environment jsdom
+ */
+import { jest, describe, it, expect, beforeEach } from '@jest/globals';
+import { render, screen, waitFor } from '@testing-library/react';
+import type * as AuthApiTypes from './lib/authApi.js';
+import type * as BudgetCategoriesApiTypes from './lib/budgetCategoriesApi.js';
+import type * as MilestonesApiTypes from './lib/milestonesApi.js';
+import type * as TimelineApiTypes from './lib/timelineApi.js';
+import type * as WorkItemsApiTypes from './lib/workItemsApi.js';
+import type * as HouseholdItemsApiTypes from './lib/householdItemsApi.js';
+import type * as VendorsApiTypes from './lib/vendorsApi.js';
+import type * as UsersApiTypes from './lib/usersApi.js';
+import type * as InvoicesApiTypes from './lib/invoicesApi.js';
+import type * as WorkItemBudgetsApiTypes from './lib/workItemBudgetsApi.js';
+import type * as HouseholdItemBudgetsApiTypes from './lib/householdItemBudgetsApi.js';
+import type * as HouseholdItemCategoriesApiTypes from './lib/householdItemCategoriesApi.js';
+import type * as BudgetOverviewApiTypes from './lib/budgetOverviewApi.js';
+import type * as BudgetSourcesApiTypes from './lib/budgetSourcesApi.js';
+import type * as SubsidyProgramsApiTypes from './lib/subsidyProgramsApi.js';
+import type * as PreferencesApiTypes from './lib/preferencesApi.js';
+import type * as DiaryApiTypes from './lib/diaryApi.js';
+import type * as AppTypes from './App.js';
+
+const mockGetAuthMe = jest.fn<typeof AuthApiTypes.getAuthMe>();
+const mockLogin = jest.fn<typeof AuthApiTypes.login>();
+const mockLogout = jest.fn<typeof AuthApiTypes.logout>();
+
+const mockFetchBudgetCategories = jest.fn<typeof BudgetCategoriesApiTypes.fetchBudgetCategories>();
+const mockCreateBudgetCategory = jest.fn<typeof BudgetCategoriesApiTypes.createBudgetCategory>();
+const mockUpdateBudgetCategory = jest.fn<typeof BudgetCategoriesApiTypes.updateBudgetCategory>();
+const mockDeleteBudgetCategory = jest.fn<typeof BudgetCategoriesApiTypes.deleteBudgetCategory>();
+
+const mockListMilestones = jest.fn<typeof MilestonesApiTypes.listMilestones>();
+const mockGetTimeline = jest.fn<typeof TimelineApiTypes.getTimeline>();
+
+// Must mock BEFORE importing the component
+jest.unstable_mockModule('./lib/authApi.js', () => ({
+  getAuthMe: mockGetAuthMe,
+  login: mockLogin,
+  logout: mockLogout,
+}));
+
+jest.unstable_mockModule('./lib/budgetCategoriesApi.js', () => ({
+  fetchBudgetCategories: mockFetchBudgetCategories,
+  createBudgetCategory: mockCreateBudgetCategory,
+  updateBudgetCategory: mockUpdateBudgetCategory,
+  deleteBudgetCategory: mockDeleteBudgetCategory,
+}));
+
+// TimelinePage uses useMilestones which calls listMilestones on mount.
+// Without this mock, the test environment (no fetch) throws and the Timeline
+// test case times out waiting for the heading to appear.
+jest.unstable_mockModule('./lib/milestonesApi.js', () => ({
+  listMilestones: mockListMilestones,
+  getMilestone: jest.fn<typeof MilestonesApiTypes.getMilestone>(),
+  createMilestone: jest.fn<typeof MilestonesApiTypes.createMilestone>(),
+  updateMilestone: jest.fn<typeof MilestonesApiTypes.updateMilestone>(),
+  deleteMilestone: jest.fn<typeof MilestonesApiTypes.deleteMilestone>(),
+  linkWorkItem: jest.fn<typeof MilestonesApiTypes.linkWorkItem>(),
+  unlinkWorkItem: jest.fn<typeof MilestonesApiTypes.unlinkWorkItem>(),
+  addDependentWorkItem: jest.fn<typeof MilestonesApiTypes.addDependentWorkItem>(),
+  removeDependentWorkItem: jest.fn<typeof MilestonesApiTypes.removeDependentWorkItem>(),
+}));
+
+// TimelinePage uses useTimeline which calls getTimeline on mount.
+// Mock this to prevent fetch calls in the jsdom test environment.
+jest.unstable_mockModule('./lib/timelineApi.js', () => ({
+  getTimeline: mockGetTimeline,
+}));
+
+// WorkItemsPage (and transitively MilestoneWorkItemLinker) imports workItemsApi.
+// Mock to prevent fetch calls in the jsdom test environment.
+// listWorkItems default value is set in beforeEach.
+const mockListWorkItems = jest.fn<typeof WorkItemsApiTypes.listWorkItems>();
+jest.unstable_mockModule('./lib/workItemsApi.js', () => ({
+  listWorkItems: mockListWorkItems,
+  getWorkItem: jest.fn<typeof WorkItemsApiTypes.getWorkItem>(),
+  createWorkItem: jest.fn<typeof WorkItemsApiTypes.createWorkItem>(),
+  updateWorkItem: jest.fn<typeof WorkItemsApiTypes.updateWorkItem>(),
+  deleteWorkItem: jest.fn<typeof WorkItemsApiTypes.deleteWorkItem>(),
+  fetchWorkItemSubsidies: jest.fn<typeof WorkItemsApiTypes.fetchWorkItemSubsidies>(),
+  linkWorkItemSubsidy: jest.fn<typeof WorkItemsApiTypes.linkWorkItemSubsidy>(),
+  unlinkWorkItemSubsidy: jest.fn<typeof WorkItemsApiTypes.unlinkWorkItemSubsidy>(),
+}));
+
+// HouseholdItemsPage calls listHouseholdItems and fetchVendors on mount.
+// Mock to prevent fetch calls in the jsdom test environment.
+const mockListHouseholdItems = jest.fn<typeof HouseholdItemsApiTypes.listHouseholdItems>();
+jest.unstable_mockModule('./lib/householdItemsApi.js', () => ({
+  listHouseholdItems: mockListHouseholdItems,
+  getHouseholdItem: jest.fn<typeof HouseholdItemsApiTypes.getHouseholdItem>(),
+  createHouseholdItem: jest.fn<typeof HouseholdItemsApiTypes.createHouseholdItem>(),
+  updateHouseholdItem: jest.fn<typeof HouseholdItemsApiTypes.updateHouseholdItem>(),
+  deleteHouseholdItem: jest.fn<typeof HouseholdItemsApiTypes.deleteHouseholdItem>(),
+}));
+
+const mockFetchVendors = jest.fn<typeof VendorsApiTypes.fetchVendors>();
+const mockFetchVendor = jest.fn<typeof VendorsApiTypes.fetchVendor>();
+jest.unstable_mockModule('./lib/vendorsApi.js', () => ({
+  fetchVendors: mockFetchVendors,
+  fetchVendor: mockFetchVendor,
+  createVendor: jest.fn<typeof VendorsApiTypes.createVendor>(),
+  updateVendor: jest.fn<typeof VendorsApiTypes.updateVendor>(),
+  deleteVendor: jest.fn<typeof VendorsApiTypes.deleteVendor>(),
+}));
+
+// WorkItemsPage calls listUsers on mount for the assigned-to filter dropdown.
+// Mock to prevent fetch calls in the jsdom test environment.
+const mockListUsers = jest.fn<typeof UsersApiTypes.listUsers>();
+jest.unstable_mockModule('./lib/usersApi.js', () => ({
+  listUsers: mockListUsers,
+  getProfile: jest.fn<typeof UsersApiTypes.getProfile>(),
+  updateProfile: jest.fn<typeof UsersApiTypes.updateProfile>(),
+  changePassword: jest.fn<typeof UsersApiTypes.changePassword>(),
+  adminUpdateUser: jest.fn<typeof UsersApiTypes.adminUpdateUser>(),
+  deactivateUser: jest.fn<typeof UsersApiTypes.deactivateUser>(),
+}));
+
+// InvoicesPage calls fetchAllInvoices and createInvoice on mount.
+const mockFetchAllInvoices = jest.fn<typeof InvoicesApiTypes.fetchAllInvoices>();
+jest.unstable_mockModule('./lib/invoicesApi.js', () => ({
+  fetchAllInvoices: mockFetchAllInvoices,
+  createInvoice: jest.fn<typeof InvoicesApiTypes.createInvoice>(),
+  fetchInvoices: jest.fn<typeof InvoicesApiTypes.fetchInvoices>(),
+  updateInvoice: jest.fn<typeof InvoicesApiTypes.updateInvoice>(),
+  deleteInvoice: jest.fn<typeof InvoicesApiTypes.deleteInvoice>(),
+  fetchInvoiceById: jest.fn<typeof InvoicesApiTypes.fetchInvoiceById>(),
+}));
+
+const mockFetchWorkItemBudgets = jest.fn<typeof WorkItemBudgetsApiTypes.fetchWorkItemBudgets>();
+jest.unstable_mockModule('./lib/workItemBudgetsApi.js', () => ({
+  fetchWorkItemBudgets: mockFetchWorkItemBudgets,
+  createWorkItemBudget: jest.fn<typeof WorkItemBudgetsApiTypes.createWorkItemBudget>(),
+  updateWorkItemBudget: jest.fn<typeof WorkItemBudgetsApiTypes.updateWorkItemBudget>(),
+  deleteWorkItemBudget: jest.fn<typeof WorkItemBudgetsApiTypes.deleteWorkItemBudget>(),
+}));
+
+const mockFetchHouseholdItemBudgets =
+  jest.fn<typeof HouseholdItemBudgetsApiTypes.fetchHouseholdItemBudgets>();
+jest.unstable_mockModule('./lib/householdItemBudgetsApi.js', () => ({
+  fetchHouseholdItemBudgets: mockFetchHouseholdItemBudgets,
+  createHouseholdItemBudget:
+    jest.fn<typeof HouseholdItemBudgetsApiTypes.createHouseholdItemBudget>(),
+  updateHouseholdItemBudget:
+    jest.fn<typeof HouseholdItemBudgetsApiTypes.updateHouseholdItemBudget>(),
+  deleteHouseholdItemBudget:
+    jest.fn<typeof HouseholdItemBudgetsApiTypes.deleteHouseholdItemBudget>(),
+}));
+
+// ManagePage calls fetchHouseholdItemCategories on mount.
+// Mock to prevent fetch calls in the jsdom test environment.
+const mockFetchHouseholdItemCategories =
+  jest.fn<typeof HouseholdItemCategoriesApiTypes.fetchHouseholdItemCategories>();
+jest.unstable_mockModule('./lib/householdItemCategoriesApi.js', () => ({
+  fetchHouseholdItemCategories: mockFetchHouseholdItemCategories,
+  createHouseholdItemCategory:
+    jest.fn<typeof HouseholdItemCategoriesApiTypes.createHouseholdItemCategory>(),
+  updateHouseholdItemCategory:
+    jest.fn<typeof HouseholdItemCategoriesApiTypes.updateHouseholdItemCategory>(),
+  deleteHouseholdItemCategory:
+    jest.fn<typeof HouseholdItemCategoriesApiTypes.deleteHouseholdItemCategory>(),
+}));
+
+// DashboardPage calls fetchBudgetOverview on mount.
+const mockFetchBudgetOverview = jest.fn<typeof BudgetOverviewApiTypes.fetchBudgetOverview>();
+jest.unstable_mockModule('./lib/budgetOverviewApi.js', () => ({
+  fetchBudgetOverview: mockFetchBudgetOverview,
+  fetchBudgetBreakdown: jest.fn<typeof BudgetOverviewApiTypes.fetchBudgetBreakdown>(),
+}));
+
+// DashboardPage calls fetchBudgetSources on mount.
+const mockFetchBudgetSources = jest.fn<typeof BudgetSourcesApiTypes.fetchBudgetSources>();
+jest.unstable_mockModule('./lib/budgetSourcesApi.js', () => ({
+  fetchBudgetSources: mockFetchBudgetSources,
+  fetchBudgetSource: jest.fn<typeof BudgetSourcesApiTypes.fetchBudgetSource>(),
+  createBudgetSource: jest.fn<typeof BudgetSourcesApiTypes.createBudgetSource>(),
+  updateBudgetSource: jest.fn<typeof BudgetSourcesApiTypes.updateBudgetSource>(),
+  deleteBudgetSource: jest.fn<typeof BudgetSourcesApiTypes.deleteBudgetSource>(),
+}));
+
+// DashboardPage calls fetchSubsidyPrograms on mount.
+const mockFetchSubsidyPrograms = jest.fn<typeof SubsidyProgramsApiTypes.fetchSubsidyPrograms>();
+jest.unstable_mockModule('./lib/subsidyProgramsApi.js', () => ({
+  fetchSubsidyPrograms: mockFetchSubsidyPrograms,
+  fetchSubsidyProgram: jest.fn<typeof SubsidyProgramsApiTypes.fetchSubsidyProgram>(),
+  createSubsidyProgram: jest.fn<typeof SubsidyProgramsApiTypes.createSubsidyProgram>(),
+  updateSubsidyProgram: jest.fn<typeof SubsidyProgramsApiTypes.updateSubsidyProgram>(),
+  deleteSubsidyProgram: jest.fn<typeof SubsidyProgramsApiTypes.deleteSubsidyProgram>(),
+}));
+
+// DashboardPage uses usePreferences which calls listPreferences on mount.
+const mockListPreferences = jest.fn<typeof PreferencesApiTypes.listPreferences>();
+jest.unstable_mockModule('./lib/preferencesApi.js', () => ({
+  listPreferences: mockListPreferences,
+  upsertPreference: jest.fn<typeof PreferencesApiTypes.upsertPreference>(),
+  deletePreference: jest.fn<typeof PreferencesApiTypes.deletePreference>(),
+}));
+
+// DashboardPage calls listDiaryEntries on mount (RecentDiaryCard).
+const mockListDiaryEntries = jest.fn<typeof DiaryApiTypes.listDiaryEntries>();
+jest.unstable_mockModule('./lib/diaryApi.js', () => ({
+  listDiaryEntries: mockListDiaryEntries,
+  createDiaryEntry: jest.fn<typeof DiaryApiTypes.createDiaryEntry>(),
+  updateDiaryEntry: jest.fn<typeof DiaryApiTypes.updateDiaryEntry>(),
+  deleteDiaryEntry: jest.fn<typeof DiaryApiTypes.deleteDiaryEntry>(),
+  getDiaryEntry: jest.fn<typeof DiaryApiTypes.getDiaryEntry>(),
+}));
+
+describe('App', () => {
+  // Dynamic imports
+  let App: typeof AppTypes.App;
+
+  beforeEach(async () => {
+    // Dynamic import modules (only once)
+    if (!App) {
+      const appModule = await import('./App.js');
+      App = appModule.App;
+
+      // Pre-resolve lazy-loaded route components so the redirect test does not race
+      // their dynamic import under CPU pressure (#1438).
+      // The root path / redirects to /project which redirects to /project/overview,
+      // which renders DashboardPage (lazy). Pre-importing here warms the module cache
+      // before any test rendering starts, making the 5s waitFor timeout safe to keep.
+      await import('./pages/DashboardPage/DashboardPage.js');
+    }
+
+    // Reset mocks
+    mockGetAuthMe.mockReset();
+    mockLogin.mockReset();
+    mockLogout.mockReset();
+    mockFetchBudgetCategories.mockReset();
+    mockCreateBudgetCategory.mockReset();
+    mockUpdateBudgetCategory.mockReset();
+    mockDeleteBudgetCategory.mockReset();
+    mockListMilestones.mockReset();
+    mockGetTimeline.mockReset();
+    mockListWorkItems.mockReset();
+    mockListHouseholdItems.mockReset();
+    mockFetchVendors.mockReset();
+    mockFetchVendor.mockReset();
+    mockListUsers.mockReset();
+    mockFetchAllInvoices.mockReset();
+    mockFetchWorkItemBudgets.mockReset();
+    mockFetchHouseholdItemBudgets.mockReset();
+    mockFetchHouseholdItemCategories.mockReset();
+    mockFetchBudgetOverview.mockReset();
+    mockFetchBudgetSources.mockReset();
+    mockFetchSubsidyPrograms.mockReset();
+    mockListPreferences.mockReset();
+    mockListDiaryEntries.mockReset();
+
+    // Default: DashboardPage data sources
+    mockFetchBudgetOverview.mockResolvedValue({
+      availableFunds: 0,
+      sourceCount: 0,
+      minPlanned: 0,
+      maxPlanned: 0,
+      actualCost: 0,
+      actualCostPaid: 0,
+      actualCostClaimed: 0,
+      remainingVsMinPlanned: 0,
+      remainingVsMaxPlanned: 0,
+      remainingVsActualCost: 0,
+      remainingVsActualPaid: 0,
+      remainingVsActualClaimed: 0,
+      remainingVsMinPlannedWithPayback: 0,
+      remainingVsMaxPlannedWithPayback: 0,
+      subsidySummary: {
+        totalReductions: 0,
+        activeSubsidyCount: 0,
+        minTotalPayback: 0,
+        maxTotalPayback: 0,
+        oversubscribedSubsidies: [],
+      },
+    });
+    mockFetchBudgetSources.mockResolvedValue({ budgetSources: [] });
+    mockFetchSubsidyPrograms.mockResolvedValue({ subsidyPrograms: [] });
+    mockListPreferences.mockResolvedValue([]);
+    mockListDiaryEntries.mockResolvedValue({
+      items: [],
+      pagination: { page: 1, pageSize: 5, totalItems: 0, totalPages: 0 },
+    });
+
+    // Default: budget categories returns empty list
+    mockFetchBudgetCategories.mockResolvedValue({ categories: [] });
+
+    // Default: milestones returns empty list (used by TimelinePage via useMilestones)
+    mockListMilestones.mockResolvedValue([]);
+
+    // Default: timeline returns empty data (used by TimelinePage via useTimeline)
+    mockGetTimeline.mockResolvedValue({
+      workItems: [],
+      dependencies: [],
+      milestones: [],
+      householdItems: [],
+      criticalPath: [],
+      dateRange: null,
+    });
+
+    // Default: work items returns empty paginated list (used by WorkItemsPage and
+    // MilestoneWorkItemLinker via listWorkItems)
+    mockListWorkItems.mockResolvedValue({
+      items: [],
+      pagination: { page: 1, pageSize: 20, totalItems: 0, totalPages: 0 },
+    });
+
+    // Default: household items returns empty paginated list (used by HouseholdItemsPage)
+    mockListHouseholdItems.mockResolvedValue({
+      items: [],
+      pagination: { page: 1, pageSize: 25, totalItems: 0, totalPages: 0 },
+    });
+
+    // Default: fetchVendor stays pending — keeps VendorDetailPage in loading state
+    // when the /settings/vendors/:id route is tested via App.test.tsx
+    mockFetchVendor.mockReturnValue(new Promise(() => {}));
+
+    // Default: vendors returns empty list (used by HouseholdItemsPage vendor filter)
+    mockFetchVendors.mockResolvedValue({
+      vendors: [],
+      pagination: { page: 1, pageSize: 25, totalItems: 0, totalPages: 0 },
+    });
+
+    // Default: users returns empty list (used by WorkItemsPage assigned-to filter)
+    mockListUsers.mockResolvedValue({ users: [] });
+
+    // Default: invoices returns empty data (used by InvoicesPage)
+    mockFetchAllInvoices.mockResolvedValue({
+      invoices: [],
+      pagination: { page: 1, pageSize: 25, totalItems: 0, totalPages: 0 },
+      summary: {
+        pending: { count: 0, totalAmount: 0 },
+        paid: { count: 0, totalAmount: 0 },
+        claimed: { count: 0, totalAmount: 0 },
+        quotation: { count: 0, totalAmount: 0 },
+        overdue: { count: 0, totalAmount: 0 },
+        claimable: { count: 0, totalAmount: 0 },
+        quotationCoveredByDeposits: 0,
+        openPayable: { count: 0, totalAmount: 0 },
+        refundsDue: { count: 0, totalAmount: 0 },
+      },
+    });
+    mockFetchWorkItemBudgets.mockResolvedValue([]);
+    mockFetchHouseholdItemBudgets.mockResolvedValue([]);
+    mockFetchHouseholdItemCategories.mockResolvedValue({ categories: [] });
+
+    // Default: authenticated user (no setup required)
+    mockGetAuthMe.mockResolvedValue({
+      user: {
+        id: 'test-user-123',
+        email: 'test@example.com',
+        displayName: 'Test User',
+        role: 'member',
+        authProvider: 'local',
+        createdAt: '2024-01-01T00:00:00.000Z',
+        updatedAt: '2024-01-01T00:00:00.000Z',
+        deactivatedAt: null,
+      },
+      setupRequired: false,
+      oidcEnabled: false,
+    });
+  });
+
+  it('renders without crashing', async () => {
+    render(<App />);
+    expect(document.body).toBeInTheDocument();
+    // Wait for auth check and lazy-loaded component to resolve
+    await waitFor(() => expect(screen.queryByText('Loading...')).not.toBeInTheDocument(), {
+      timeout: 5000,
+    });
+  });
+
+  it('renders the AppShell layout with sidebar and floating menu button', async () => {
+    render(<App />);
+
+    // Wait for auth loading to complete
+    await waitFor(() => expect(screen.queryByText('Loading...')).not.toBeInTheDocument(), {
+      timeout: 5000,
+    });
+
+    // Sidebar should be present
+    const sidebar = screen.getByRole('complementary');
+    expect(sidebar).toBeInTheDocument();
+
+    // Floating menu button (FAB) should be present
+    const fab = screen.getByTestId('menu-fab');
+    expect(fab).toBeInTheDocument();
+
+    // Main content area should be present
+    const main = screen.getByRole('main');
+    expect(main).toBeInTheDocument();
+  });
+
+  // NOTE: bumped to 15000ms; underlying lazy-import flake tracked in #1438.
+  it('shows Project page at root path / (redirects to /project/overview)', async () => {
+    render(<App />);
+
+    // Wait for lazy-loaded DashboardPage component to resolve
+    // Root redirects to /project which redirects to /project/overview
+    const heading = await screen.findByRole('heading', { name: /^project$/i }, { timeout: 5000 });
+    expect(heading).toBeInTheDocument();
+  }, 15000);
+
+  it('navigates to Work Items page when /project/work-items path is accessed', async () => {
+    window.history.pushState({}, 'Work Items', '/project/work-items');
+    render(<App />);
+
+    // Wait for lazy-loaded WorkItems component to resolve
+    // The WorkItemsPage h1 now reads "Project" (shared sub-nav heading)
+    const heading = await screen.findByRole(
+      'heading',
+      { name: /^project$/i, level: 1 },
+      { timeout: 5000 },
+    );
+    expect(heading).toBeInTheDocument();
+  });
+
+  it('navigates to Manage page when /budget/categories path is accessed (redirect)', async () => {
+    window.history.pushState({}, 'Budget Categories', '/budget/categories');
+    render(<App />);
+
+    // /budget/categories now redirects to /settings/manage?tab=budget-categories
+    // ManagePage no longer renders an h1 heading — verify by the presence of the tab buttons
+    // Extended timeout: requires lazy-load of ManagePage after redirect from /budget/categories
+    const tab = await screen.findByRole('tab', { name: 'Budget Categories' }, { timeout: 5000 });
+    expect(tab).toBeInTheDocument();
+  });
+
+  it('navigates to Schedule page when /schedule/gantt path is accessed', async () => {
+    window.history.pushState({}, 'Schedule', '/schedule/gantt');
+    render(<App />);
+
+    // Wait for lazy-loaded TimelinePage component to resolve.
+    // Use an extended timeout because TimelinePage has more static imports
+    // (useMilestones, MilestonePanel) which makes the lazy load slower in CI.
+    const heading = await screen.findByRole('heading', { name: /schedule/i }, { timeout: 10000 });
+    expect(heading).toBeInTheDocument();
+  }, 15000);
+
+  it('navigates to Household Items page when /project/household-items path is accessed', async () => {
+    window.history.pushState({}, 'Household Items', '/project/household-items');
+    render(<App />);
+
+    // Wait for lazy-loaded HouseholdItems component to resolve.
+    // The HouseholdItemsPage h1 now reads "Project" (shared sub-nav heading).
+    // Use level: 1 to match the page title h1 (not the h2 empty state "No household items yet").
+    const heading = await screen.findByRole(
+      'heading',
+      { name: /^project$/i, level: 1 },
+      { timeout: 5000 },
+    );
+    expect(heading).toBeInTheDocument();
+  });
+
+  it('navigates to Invoices page when /budget/invoices path is accessed', async () => {
+    window.history.pushState({}, 'Invoices', '/budget/invoices');
+    render(<App />);
+
+    // Wait for lazy-loaded Invoices component to resolve
+    // The InvoicesPage h1 now reads "Budget" (shared sub-nav heading)
+    const heading = await screen.findByRole(
+      'heading',
+      { name: /^budget$/i, level: 1 },
+      { timeout: 5000 },
+    );
+    expect(heading).toBeInTheDocument();
+  });
+
+  it('shows NotFoundPage for unrecognized routes', async () => {
+    window.history.pushState({}, 'Unknown', '/unknown-route');
+    render(<App />);
+
+    // Wait for lazy-loaded NotFound component to resolve
+    const heading = await screen.findByRole(
+      'heading',
+      { name: /404.*not found/i },
+      { timeout: 5000 },
+    );
+    expect(heading).toBeInTheDocument();
+  });
+
+  it('navigates to VendorsPage at /settings/vendors', async () => {
+    window.history.pushState({}, 'Vendors', '/settings/vendors');
+    render(<App />);
+
+    // VendorsPage shows a Settings SubNav — the nav aria-label is "Settings section navigation"
+    // Wait for lazy-loaded VendorsPage to resolve and render the SubNav
+    const nav = await screen.findByRole(
+      'navigation',
+      { name: /settings section navigation/i },
+      { timeout: 5000 },
+    );
+    expect(nav).toBeInTheDocument();
+  });
+
+  it('navigates to VendorDetailPage at /settings/vendors/:id', async () => {
+    window.history.pushState({}, 'Vendor Detail', '/settings/vendors/vendor-1');
+    render(<App />);
+
+    // VendorDetailPage shows a "loading vendor" text immediately and then the
+    // "Back to Vendors" button once the loading state settles.
+    // Since the API is mocked to never resolve (no fetchVendor mock), we check
+    // that the page renders without crashing by verifying the loading indicator.
+    await waitFor(
+      () => {
+        expect(screen.queryByText('Loading...')).not.toBeInTheDocument();
+      },
+      { timeout: 5000 },
+    );
+    // VendorDetailPage is the active route — the loading vendor text appears
+    // from the page itself (before the API call settles)
+    // The page title is set dynamically; confirm the route rendered (no 404)
+    expect(screen.queryByRole('heading', { name: /404.*not found/i })).not.toBeInTheDocument();
+  });
+
+  it('redirects /budget/vendors to /settings/vendors', async () => {
+    window.history.pushState({}, 'Budget Vendors', '/budget/vendors');
+    render(<App />);
+
+    // After redirect, VendorsPage at /settings/vendors renders the Settings SubNav
+    const nav = await screen.findByRole(
+      'navigation',
+      { name: /settings section navigation/i },
+      { timeout: 5000 },
+    );
+    expect(nav).toBeInTheDocument();
+  });
+
+  it('redirects /budget/vendors/:id to /settings/vendors/:id (preserves id param)', async () => {
+    window.history.pushState({}, 'Budget Vendor Detail', '/budget/vendors/vendor-42');
+    render(<App />);
+
+    // After ParamRedirect, VendorDetailPage at /settings/vendors/vendor-42 renders
+    // without crashing and without showing a 404
+    await waitFor(
+      () => {
+        expect(screen.queryByText('Loading...')).not.toBeInTheDocument();
+      },
+      { timeout: 5000 },
+    );
+    expect(screen.queryByRole('heading', { name: /404.*not found/i })).not.toBeInTheDocument();
+  });
+});

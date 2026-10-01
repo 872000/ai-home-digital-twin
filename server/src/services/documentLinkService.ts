@@ -1,0 +1,281 @@
+/**
+ * Document link service — CRUD for linking Paperless-ngx documents to Cornerstone entities.
+ *
+ * EPIC-08: Paperless-ngx Document Integration
+ *
+ * Manages the polymorphic `document_links` table. Referential integrity on the entity
+ * side is enforced at the application layer (entity existence check on insert;
+ * cascade-delete of links when an entity is deleted).
+ *
+ * See ADR-015 for design rationale.
+ */
+
+import { randomUUID } from 'node:crypto';
+import { eq, and } from 'drizzle-orm';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import type * as schemaTypes from '../db/schema.js';
+import {
+  documentLinks,
+  users,
+  workItems,
+  invoices,
+  householdItems,
+  budgetSources,
+  subsidyPrograms,
+} from '../db/schema.js';
+import { AppError, NotFoundError } from '../errors/AppError.js';
+import type {
+  DocumentLink,
+  DocumentLinkWithMetadata,
+  DocumentLinkEntityType,
+  PaperlessDocument,
+  AttachmentType,
+} from '@cornerstone/shared';
+import * as paperlessService from './paperlessService.js';
+
+type DbType = BetterSQLite3Database<typeof schemaTypes>;
+
+/**
+ * Paperless-ngx configuration needed for metadata enrichment.
+ */
+interface PaperlessConfig {
+  paperlessEnabled: boolean;
+  paperlessUrl?: string | null;
+  paperlessApiToken?: string | null;
+}
+
+/**
+ * Map a document_links row + resolved user to a DocumentLink shape.
+ */
+function toDocumentLink(
+  row: typeof documentLinks.$inferSelect,
+  user: typeof users.$inferSelect | null | undefined,
+): DocumentLink {
+  return {
+    id: row.id,
+    entityType: row.entityType as DocumentLinkEntityType,
+    entityId: row.entityId,
+    paperlessDocumentId: row.paperlessDocumentId,
+    attachmentType: (row.attachmentType as AttachmentType | null) ?? null,
+    createdBy: user ? { id: user.id, displayName: user.displayName } : null,
+    createdAt: row.createdAt,
+  };
+}
+
+/**
+ * Resolve the user who created a document link.
+ */
+function resolveCreatedBy(db: DbType, createdBy: string | null): typeof users.$inferSelect | null {
+  if (!createdBy) return null;
+  return db.select().from(users).where(eq(users.id, createdBy)).get() ?? null;
+}
+
+/**
+ * Create a link between a Cornerstone entity and a Paperless-ngx document.
+ *
+ * Validates that the entity exists at the application layer (no FK constraint
+ * on entity_id since it references different tables depending on entity_type).
+ *
+ * AttachmentType is meaningful only for entityType='invoice'; it is silently
+ * normalized to null for all other entity types (application-layer enforcement
+ * since the database CHECK allows null).
+ *
+ * @throws NotFoundError if the referenced entity does not exist
+ * @throws AppError(VALIDATION_ERROR) if entity type is not yet implemented
+ * @throws AppError(DUPLICATE_DOCUMENT_LINK) if this exact link already exists
+ */
+export function createLink(
+  db: DbType,
+  entityType: DocumentLinkEntityType,
+  entityId: string,
+  paperlessDocumentId: number,
+  userId: string,
+  attachmentType: AttachmentType | null = null,
+): DocumentLink {
+  // Validate entity exists (application-layer FK enforcement)
+  if (entityType === 'work_item') {
+    const item = db.select().from(workItems).where(eq(workItems.id, entityId)).get();
+    if (!item) {
+      throw new NotFoundError('Work item not found');
+    }
+  } else if (entityType === 'invoice') {
+    const invoice = db.select().from(invoices).where(eq(invoices.id, entityId)).get();
+    if (!invoice) {
+      throw new NotFoundError('Invoice not found');
+    }
+  } else if (entityType === 'household_item') {
+    const item = db.select().from(householdItems).where(eq(householdItems.id, entityId)).get();
+    if (!item) {
+      throw new NotFoundError('Household item not found');
+    }
+  } else if (entityType === 'budget_source') {
+    const source = db.select().from(budgetSources).where(eq(budgetSources.id, entityId)).get();
+    if (!source) {
+      throw new NotFoundError('Budget source not found');
+    }
+  } else if (entityType === 'subsidy_program') {
+    const program = db.select().from(subsidyPrograms).where(eq(subsidyPrograms.id, entityId)).get();
+    if (!program) {
+      throw new NotFoundError('Subsidy program not found');
+    }
+  }
+
+  const id = randomUUID();
+  const createdAt = new Date().toISOString();
+
+  // Resolve userId to null if user no longer exists (FK is nullable with ON DELETE SET NULL)
+  const userExists = resolveCreatedBy(db, userId) !== null;
+  const createdBy = userExists ? userId : null;
+
+  // Normalize attachmentType: only meaningful for invoice entity type
+  const resolvedAttachmentType = entityType === 'invoice' ? attachmentType : null;
+
+  try {
+    db.insert(documentLinks)
+      .values({
+        id,
+        entityType,
+        entityId,
+        paperlessDocumentId,
+        attachmentType: resolvedAttachmentType,
+        createdBy,
+        createdAt,
+      })
+      .run();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('UNIQUE constraint failed')) {
+      throw new AppError(
+        'DUPLICATE_DOCUMENT_LINK',
+        409,
+        'This document is already linked to this entity',
+      );
+    }
+    throw err;
+  }
+
+  const row = db.select().from(documentLinks).where(eq(documentLinks.id, id)).get()!;
+  const user = resolveCreatedBy(db, row.createdBy);
+  return toDocumentLink(row, user);
+}
+
+/**
+ * Get all document links for an entity, enriched with Paperless-ngx document metadata.
+ *
+ * If Paperless-ngx is not configured or a document has been deleted from Paperless-ngx,
+ * the `document` field will be `null` for that link.
+ * The `content` field is set to `null` on all documents (list view — use detail endpoint for content).
+ */
+export async function getLinksForEntity(
+  db: DbType,
+  entityType: DocumentLinkEntityType,
+  entityId: string,
+  config: PaperlessConfig,
+): Promise<DocumentLinkWithMetadata[]> {
+  const rows = db
+    .select()
+    .from(documentLinks)
+    .where(and(eq(documentLinks.entityType, entityType), eq(documentLinks.entityId, entityId)))
+    .all();
+
+  if (rows.length === 0) return [];
+
+  // Resolve user for each link (most links will share the same creator)
+  const userCache = new Map<string, typeof users.$inferSelect | null>();
+  const resolveUser = (createdBy: string | null) => {
+    if (!createdBy) return null;
+    if (!userCache.has(createdBy)) {
+      userCache.set(createdBy, resolveCreatedBy(db, createdBy));
+    }
+    return userCache.get(createdBy) ?? null;
+  };
+
+  // Bulk-fetch all Paperless-ngx document metadata in a single API call
+  // (avoids N×4 sequential requests that the old per-document approach required)
+  let docsBulk: Map<number, PaperlessDocument> = new Map();
+  if (config.paperlessEnabled && config.paperlessUrl && config.paperlessApiToken) {
+    try {
+      docsBulk = await paperlessService.getDocuments(
+        config.paperlessUrl,
+        config.paperlessApiToken,
+        rows.map((r) => r.paperlessDocumentId),
+      );
+    } catch {
+      // Paperless-ngx unreachable — all documents will appear as null
+    }
+  }
+
+  const enriched: DocumentLinkWithMetadata[] = rows.map((row) => {
+    const user = resolveUser(row.createdBy);
+    const base = toDocumentLink(row, user);
+    const doc = docsBulk.get(row.paperlessDocumentId) ?? null;
+    // content is already null in bulk results (list view — use GET /api/paperless/documents/:id for full content)
+    return { ...base, document: doc };
+  });
+
+  return enriched;
+}
+
+/**
+ * Delete a document link by ID.
+ *
+ * @returns true if the link was found and deleted, false if not found
+ */
+export function deleteLink(db: DbType, id: string): boolean {
+  const existing = db.select().from(documentLinks).where(eq(documentLinks.id, id)).get();
+  if (!existing) return false;
+  db.delete(documentLinks).where(eq(documentLinks.id, id)).run();
+  return true;
+}
+
+/**
+ * Delete all document links for a given entity.
+ * Used for cascade deletion when an entity (work item, invoice) is deleted.
+ *
+ * This is required because entity_id has no FK constraint in the database
+ * (polymorphic pattern — referential integrity is enforced at the application layer).
+ */
+export function deleteLinksForEntity(
+  db: DbType,
+  entityType: DocumentLinkEntityType,
+  entityId: string,
+): void {
+  db.delete(documentLinks)
+    .where(and(eq(documentLinks.entityType, entityType), eq(documentLinks.entityId, entityId)))
+    .run();
+}
+
+/**
+ * Return the distinct set of Paperless-ngx document IDs linked to any entity in the system.
+ * Used by the frontend to implement system-wide "hide already-linked" filtering.
+ */
+export function getAllLinkedDocumentIds(db: DbType): number[] {
+  const rows = db
+    .selectDistinct({ paperlessDocumentId: documentLinks.paperlessDocumentId })
+    .from(documentLinks)
+    .all();
+  return rows.map((r) => r.paperlessDocumentId);
+}
+
+/**
+ * Update (or clear) the attachment type tag on a document link.
+ * Non-invoice links are normalized to null regardless of the requested value —
+ * attachment typing is only meaningful for entityType='invoice'.
+ *
+ * @throws NotFoundError if the link does not exist
+ */
+export function updateAttachmentType(
+  db: DbType,
+  id: string,
+  attachmentType: AttachmentType | null,
+): DocumentLink {
+  const existing = db.select().from(documentLinks).where(eq(documentLinks.id, id)).get();
+  if (!existing) {
+    throw new NotFoundError('Document link not found');
+  }
+  const resolved = existing.entityType === 'invoice' ? attachmentType : null;
+  db.update(documentLinks).set({ attachmentType: resolved }).where(eq(documentLinks.id, id)).run();
+  const row = db.select().from(documentLinks).where(eq(documentLinks.id, id)).get()!;
+  const user = resolveCreatedBy(db, row.createdBy);
+  return toDocumentLink(row, user);
+}

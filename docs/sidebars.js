@@ -1,0 +1,122 @@
+// @ts-check
+
+/** @type {import('@docusaurus/plugin-content-docs').SidebarsConfig} */
+const sidebars = {
+  guides: [
+    'intro',
+    {
+      type: 'category',
+      label: 'Getting Started',
+      link: { type: 'doc', id: 'getting-started/index' },
+      items: [
+        'getting-started/docker-setup',
+        'getting-started/first-login',
+        'getting-started/configuration',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Work Items',
+      link: { type: 'doc', id: 'guides/work-items/index' },
+      items: [
+        'guides/work-items/creating-work-items',
+        'guides/work-items/areas-and-trades',
+        'guides/work-items/notes-and-subtasks',
+        'guides/work-items/dependencies',
+        'guides/work-items/keyboard-shortcuts',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Users & Authentication',
+      link: { type: 'doc', id: 'guides/users/index' },
+      items: ['guides/users/oidc-setup', 'guides/users/admin-panel'],
+    },
+    {
+      type: 'category',
+      label: 'Budget',
+      link: { type: 'doc', id: 'guides/budget/index' },
+      items: [
+        'guides/budget/categories',
+        'guides/budget/financing-sources',
+        'guides/budget/work-item-budgets',
+        'guides/budget/vendors-and-invoices',
+        'guides/budget/invoice-deposits',
+        'guides/budget/auto-itemize',
+        'guides/budget/subsidies',
+        'guides/budget/budget-overview',
+        'guides/budget/bank-reports',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Timeline',
+      link: { type: 'doc', id: 'guides/timeline/index' },
+      items: [
+        'guides/timeline/gantt-chart',
+        'guides/timeline/milestones',
+        'guides/timeline/calendar-view',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Documents',
+      link: { type: 'doc', id: 'guides/documents/index' },
+      items: [
+        'guides/documents/setup',
+        'guides/documents/browsing-documents',
+        'guides/documents/linking-documents',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Household Items',
+      link: { type: 'doc', id: 'guides/household-items/index' },
+      items: [
+        'guides/household-items/creating-editing-items',
+        'guides/household-items/budget-and-invoices',
+        'guides/household-items/work-item-linking',
+        'guides/household-items/delivery-and-dependencies',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Diary',
+      link: { type: 'doc', id: 'guides/diary/index' },
+      items: [
+        'guides/diary/manual-entries',
+        'guides/diary/automatic-events',
+        'guides/diary/photo-capture',
+        'guides/diary/photo-annotation',
+        'guides/diary/signatures',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Calendar & Contact Feeds',
+      link: { type: 'doc', id: 'guides/feeds/index' },
+      items: ['guides/feeds/subscribing'],
+    },
+    'guides/dashboard/index',
+    'guides/backup/index',
+    'guides/appearance/dark-mode',
+    'roadmap',
+  ],
+
+  development: [
+    'development/index',
+    {
+      type: 'category',
+      label: 'Agentic Development',
+      link: { type: 'doc', id: 'development/agentic/overview' },
+      items: [
+        'development/agentic/agent-team',
+        'development/agentic/workflow',
+        'development/agentic/setup',
+      ],
+    },
+    'development/tech-stack',
+  ],
+};
+
+export default sidebars;
