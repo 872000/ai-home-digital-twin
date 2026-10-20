@@ -69,8 +69,21 @@ def test_natural_language_queries():
     store.close()
 
 
+def test_total_spend_by_year():
+    store, assets, maint, q = fresh()
+    fid = assets.add_asset("Furnace", category="system", trade="hvac")
+    maint.log("Annual service", "2025-10-01", asset_id=fid, cost=180.0)
+    maint.log("Filter change", "2026-06-01", asset_id=fid, cost=25.0)
+    assert maint.total_spend(year=2026) == 25.0
+    assert maint.total_spend(year=2025) == 180.0
+    assert maint.total_spend(year=2024) == 0.0
+    assert maint.total_spend() == 205.0
+    store.close()
+
+
 if __name__ == "__main__":
     test_assets_and_warranty_expiry()
     test_maintenance_log_and_due()
     test_natural_language_queries()
+    test_total_spend_by_year()
     print("all twin smoke tests passed")
