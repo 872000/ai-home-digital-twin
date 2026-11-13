@@ -69,6 +69,25 @@ def test_natural_language_queries():
     store.close()
 
 
+def test_due_soon_includes_overdue_and_history_filters_by_asset():
+    store, assets, maint, q = fresh()
+    fid = assets.add_asset("Furnace", category="system", trade="hvac")
+    other = assets.add_asset("Sump Pump", category="system", trade="plumbing")
+    maint.log("Annual service", "2025-10-01", asset_id=fid, cost=180.0,
+              next_due="2026-09-15")  # overdue as of 2026-10-01
+    maint.log("Filter change", "2026-06-01", asset_id=fid, cost=25.0,
+              next_due="2026-12-01")
+    maint.log("Pump check", "2026-05-01", asset_id=other, cost=40.0,
+              next_due="2026-10-20")
+    due = maint.due_soon(within_days=60, today="2026-10-01")
+    tasks = [d["task"] for d in due]
+    assert "Annual service" in tasks, due  # overdue services stay listed
+    assert "Filter change" not in tasks, due  # due after the window
+    assert len(maint.history(asset_id=fid)) == 2
+    assert len(maint.history(asset_id=other)) == 1
+    store.close()
+
+
 def test_total_spend_by_year():
     store, assets, maint, q = fresh()
     fid = assets.add_asset("Furnace", category="system", trade="hvac")
@@ -85,5 +104,6 @@ if __name__ == "__main__":
     test_assets_and_warranty_expiry()
     test_maintenance_log_and_due()
     test_natural_language_queries()
+    test_due_soon_includes_overdue_and_history_filters_by_asset()
     test_total_spend_by_year()
     print("all twin smoke tests passed")
